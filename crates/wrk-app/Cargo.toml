@@ -29,6 +29,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+# Windows device-change notifications (WM_DEVICECHANGE) for instant serial PnP detection. We
+# subclass Tauri's own window; off Windows the watcher falls back to timer polling and this
+# dependency is not compiled.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+] }
+
 [features]
 # Enabled by Tauri's build tooling (and our standalone build) so the webview serves the
 # bundled web/dist assets instead of the dev URL. Mirrors the Keyer-Router app.

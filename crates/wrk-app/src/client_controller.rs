@@ -9,25 +9,35 @@
 //! The WAN/LAN choice and the pairing token flow through [`crate::pairing::build_config`], so
 //! the controller does not care which relay introduced the peer; it just connects, opens the
 //! keying edge over the resulting tunnel, and keys.
+//!
+//! Type-ahead and macros are keyed by a single **send-worker** thread draining a shared
+//! [`SendBuffer`] as a continuous CW element stream (one character at a time, managing the
+//! inter-character / word gaps itself), ported from the standalone W1VE Keyer. Each element
+//! edge fans out through [`drive_edge`] so paired keying, local sidetone, the local key line,
+//! and the UI KEY indicator all stay in lock-step.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use rwk_core::config::{Config, Role};
 use rwk_core::engine::audio::SidetoneEngine;
 use rwk_core::engine::debounce::ContactDebouncer;
 use rwk_core::engine::edge_sender::EdgeSender;
-use rwk_core::engine::keying::{EdgeEvent, EdgeSchedule, EdgeScheduleBuilder};
+use rwk_core::engine::keying::{EdgeEvent, KeyerElement, KeyerElementTiming};
 use rwk_core::engine::lan_discovery::{Beacon, LanAdvertiser};
 use rwk_core::engine::network::EdgeTransport;
 use rwk_core::engine::paddle::PaddleKeyer;
 use rwk_core::engine::paddle_input::PaddleInputPort;
-use rwk_core::engine::serial::{enumerate_ports, KeyingOutputConfig, SerialKeyingOutput};
+use rwk_core::engine::serial::{
+    enumerate_ports, natural_port_key, KeyingOutputConfig, SerialKeyingOutput,
+};
 use rwk_core::engine::session::Session;
 use rwk_core::engine::tunnel;
 use rwk_core::platform::{ThreadPriorityGuard, TimerResolutionGuard};
 use rwk_core::primitives::{EdgeSource, KeyerMode, KeyingLine};
+use rwk_core::protocol::morse::MorseTable;
 use rwk_core::timing::{Clock, HybridWaiter, MonotonicClock};
 
 use crate::app_paths;
@@ -35,6 +45,13 @@ use crate::pairing::{self, Transport};
 
 /// The inner UDP port the keying edge rides over the tunnel, matching the Server.
 const EDGE_PORT: u16 = 5555;
+
+/// Control identifiers for inline error messages in the UI.
+mod control {
+    pub const KEYING: &str = "keying";
+    pub const PADDLE: &str = "paddle";
+    pub const AUDIO: &str = "audio";
+}
 
 /// An event the Client controller emits for the UI.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -50,6 +67,7 @@ pub enum ClientEvent {
         paddle_reverse: bool,
         tone_hz: i32,
         tone_volume: u32,
+        audio_device: Option<String>,
         transport: String,
         relay: String,
         callsign: String,
@@ -57,6 +75,22 @@ pub enum ClientEvent {
     },
     /// Whether the LAN discovery beacon is currently being advertised.
     Advertising { active: bool },
+    /// The type-ahead / macro send buffer is actively keying.
+    Sending { active: bool },
+    /// The current serial-port inventory.
+    Ports { available: Vec<String> },
+    /// The current audio output device inventory (for the sidetone device picker).
+    AudioDevices { available: Vec<AudioDeviceView> },
+    /// A short, per-control error (empty `message` clears it). Full detail is also logged.
+    Error { control: String, message: String },
+}
+
+/// One audio output device for the UI picker: its name and whether it is the system default.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioDeviceView {
+    pub name: String,
+    pub is_default: bool,
 }
 
 /// A sink the host (Tauri) registers for [`ClientEvent`]s.
@@ -70,6 +104,8 @@ struct Settings {
     paddle_reverse: bool,
     tone_hz: i32,
     tone_volume: u32,
+    /// `None` = default output device; `Some("")` = sidetone off; `Some(name)` = that device.
+    audio_device: Option<String>,
     keying_port: Option<String>,
     paddle_port: Option<String>,
     transport: Transport,
@@ -87,6 +123,7 @@ impl Default for Settings {
             paddle_reverse: false,
             tone_hz: 600,
             tone_volume: 70,
+            audio_device: None,
             keying_port: None,
             paddle_port: None,
             transport: Transport::Wan,
@@ -97,11 +134,31 @@ impl Default for Settings {
     }
 }
 
+/// How the sidetone device is configured: off, the system default, or a named device.
+#[derive(Debug, Clone)]
+enum ToneDevice {
+    Off,
+    Default,
+    Named(String),
+}
+
+impl ToneDevice {
+    /// Interprets the `audio_device` setting: `None` = default, `Some("")` = off,
+    /// `Some(name)` = that device.
+    fn from_setting(setting: &Option<String>) -> Self {
+        match setting {
+            None => Self::Default,
+            Some(s) if s.is_empty() => Self::Off,
+            Some(name) => Self::Named(name.clone()),
+        }
+    }
+}
+
 // ─── Sidetone thread (cpal is not Send; owns its own thread) ───────────────────
 
 enum ToneCmd {
     Key(bool),
-    Reconfigure { hz: i32, volume: u32 },
+    Reconfigure { hz: i32, volume: u32, device: ToneDevice },
 }
 
 #[derive(Clone)]
@@ -110,12 +167,12 @@ struct Sidetone {
 }
 
 impl Sidetone {
-    fn spawn(hz: i32, volume: u32, shared: Arc<Shared>) -> Self {
+    fn spawn(hz: i32, volume: u32, device: ToneDevice, shared: Arc<Shared>) -> Self {
         let (tx, rx) = mpsc::channel::<ToneCmd>();
         std::thread::Builder::new()
             .name("wrk-sidetone".into())
             .spawn(move || {
-                let mut engine = build_engine(hz, volume, &shared);
+                let mut engine = build_engine(hz, volume, &device, &shared);
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         ToneCmd::Key(true) => {
@@ -128,8 +185,8 @@ impl Sidetone {
                                 e.key_up();
                             }
                         }
-                        ToneCmd::Reconfigure { hz, volume } => {
-                            engine = build_engine(hz, volume, &shared);
+                        ToneCmd::Reconfigure { hz, volume, device } => {
+                            engine = build_engine(hz, volume, &device, &shared);
                         }
                     }
                 }
@@ -142,22 +199,90 @@ impl Sidetone {
         let _ = self.tx.send(ToneCmd::Key(down));
     }
 
-    fn reconfigure(&self, hz: i32, volume: u32) {
-        let _ = self.tx.send(ToneCmd::Reconfigure { hz, volume });
+    fn reconfigure(&self, hz: i32, volume: u32, device: ToneDevice) {
+        let _ = self.tx.send(ToneCmd::Reconfigure { hz, volume, device });
     }
 }
 
-fn build_engine(hz: i32, volume: u32, shared: &Arc<Shared>) -> Option<SidetoneEngine> {
-    match SidetoneEngine::new(hz, volume as f64 / 100.0).and_then(|mut e| e.start().map(|()| e)) {
+/// Builds a started sidetone engine for the requested device, or `None` when the device is
+/// `Off` or the audio stream could not be opened (the error is logged and surfaced).
+fn build_engine(
+    hz: i32,
+    volume: u32,
+    device: &ToneDevice,
+    shared: &Arc<Shared>,
+) -> Option<SidetoneEngine> {
+    if matches!(device, ToneDevice::Off) {
+        shared.clear_error(control::AUDIO);
+        shared.log("info", "Sidetone off (device set to None).");
+        return None;
+    }
+    let named = match device {
+        ToneDevice::Named(n) => Some(n.as_str()),
+        _ => None,
+    };
+    let engine =
+        SidetoneEngine::new(hz, volume as f64 / 100.0).and_then(|mut e| e.start_on(named).map(|()| e));
+    match engine {
         Ok(engine) => {
             let name = engine.device_name().unwrap_or("output").to_string();
+            shared.clear_error(control::AUDIO);
             shared.log("info", format!("Sidetone on {name}."));
             Some(engine)
         }
         Err(e) => {
-            shared.log("warn", format!("Sidetone unavailable: {e}"));
+            let short = match device {
+                ToneDevice::Named(n) => format!("{n} unavailable"),
+                _ => "no audio output".to_string(),
+            };
+            shared.fail(control::AUDIO, short, format!("Sidetone unavailable: {e}"));
             None
         }
+    }
+}
+
+// ─── Send buffer (type-ahead + macros) ─────────────────────────────────────────
+
+/// The character queue + control flags shared with the send-worker thread.
+#[derive(Default)]
+struct SendState {
+    /// Characters waiting to be keyed, in order.
+    queue: VecDeque<char>,
+    /// Set by [`ClientController::abort_send`]; the worker drops the queue and the current
+    /// schedule immediately when it sees this, then clears it.
+    abort: bool,
+    /// Set once at shutdown so the worker thread exits.
+    shutdown: bool,
+}
+
+/// A thread-safe send buffer: a lock plus a condvar the worker waits on.
+#[derive(Default)]
+struct SendBuffer {
+    state: Mutex<SendState>,
+    cv: Condvar,
+}
+
+impl SendBuffer {
+    /// Appends `text` to the queue and wakes the worker.
+    fn push(&self, text: &str) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.queue.extend(text.chars());
+        self.cv.notify_all();
+    }
+
+    /// Flushes the queue and signals the worker to drop the in-progress schedule now.
+    fn abort(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.queue.clear();
+        st.abort = true;
+        self.cv.notify_all();
+    }
+
+    /// Signals the worker to exit.
+    fn shutdown(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.shutdown = true;
+        self.cv.notify_all();
     }
 }
 
@@ -168,6 +293,8 @@ struct Shared {
     transport: Mutex<Option<Arc<EdgeTransport>>>,
     epoch: Mutex<u16>,
     paddle: Mutex<Option<PaddlePollerHandle>>,
+    /// The type-ahead / macro send buffer, drained by the single send-worker thread.
+    send: SendBuffer,
     session: tokio::sync::Mutex<Option<Session>>,
     /// The running LAN advertiser task (operating-position side), present while advertising.
     advertise: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -185,6 +312,17 @@ impl Shared {
         self.emit(ClientEvent::Log { level: level.into(), message: message.into() });
     }
 
+    /// Logs the full detail and shows a short red message under `control`.
+    fn fail(&self, control: &str, short: impl Into<String>, detail: impl Into<String>) {
+        self.log("warn", detail);
+        self.emit(ClientEvent::Error { control: control.into(), message: short.into() });
+    }
+
+    /// Clears any red message under `control`.
+    fn clear_error(&self, control: &str) {
+        self.emit(ClientEvent::Error { control: control.into(), message: String::new() });
+    }
+
     fn emit_settings(&self) {
         let s = self.settings.lock().unwrap();
         self.emit(ClientEvent::Settings {
@@ -194,11 +332,16 @@ impl Shared {
             paddle_reverse: s.paddle_reverse,
             tone_hz: s.tone_hz,
             tone_volume: s.tone_volume,
+            audio_device: s.audio_device.clone(),
             transport: s.transport.as_str().into(),
             relay: s.relay.clone(),
             callsign: s.callsign.clone(),
             keyer_id: s.keyer_id.clone(),
         });
+    }
+
+    fn tone_device(&self) -> ToneDevice {
+        ToneDevice::from_setting(&self.settings.lock().unwrap().audio_device)
     }
 
     fn persist(&self) {
@@ -250,6 +393,7 @@ impl ClientController {
             transport: Mutex::new(None),
             epoch: Mutex::new(1),
             paddle: Mutex::new(None),
+            send: SendBuffer::default(),
             session: tokio::sync::Mutex::new(None),
             advertise: tokio::sync::Mutex::new(None),
             config: Mutex::new(config),
@@ -257,8 +401,14 @@ impl ClientController {
             sink,
         });
 
-        let sidetone = Sidetone::spawn(settings.tone_hz, settings.tone_volume, Arc::clone(&shared));
+        let device = ToneDevice::from_setting(&settings.audio_device);
+        let sidetone =
+            Sidetone::spawn(settings.tone_hz, settings.tone_volume, device, Arc::clone(&shared));
         *shared.sidetone.lock().unwrap() = Some(sidetone);
+
+        // The single send-worker thread drains the type-ahead / macro buffer with real CW
+        // timing. Spawned once for the controller's life.
+        spawn_send_worker(Arc::clone(&shared));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -266,8 +416,19 @@ impl ClientController {
             .expect("tokio runtime");
 
         let controller = Self { shared, runtime, _clock: Arc::new(MonotonicClock) };
+        // Open whatever persisted ports are present right now.
+        controller.open_paddle_port(settings.paddle_port.clone());
         controller.shared.emit_settings();
         controller
+    }
+
+    /// Re-emits settings, ports, and audio devices. The UI calls this once it has subscribed
+    /// to the event channel, because the startup emit in [`Self::start`] races the webview and
+    /// is otherwise lost — the webview does not exist yet when `start` runs in Tauri's setup.
+    pub fn request_state(&self) {
+        self.shared.emit_settings();
+        self.emit_ports();
+        self.emit_audio_devices();
     }
 
     // ─── Keyer settings ────────────────────────────────────────────────────────
@@ -365,19 +526,41 @@ impl ClientController {
         self.restart_sidetone();
     }
 
+    /// Selects the sidetone output device. `None` (JS `null`) = system default; an empty
+    /// string = "(None)" = sidetone off; any other string = that device by name.
+    pub fn select_audio_device(&self, device: Option<String>) {
+        self.shared.settings.lock().unwrap().audio_device = device;
+        self.shared.persist();
+        self.restart_sidetone();
+        self.shared.emit_settings();
+    }
+
     fn restart_sidetone(&self) {
         let (hz, vol) = {
             let s = self.shared.settings.lock().unwrap();
             (s.tone_hz, s.tone_volume)
         };
+        let device = self.shared.tone_device();
         if let Some(tone) = self.shared.sidetone.lock().unwrap().as_ref() {
-            tone.reconfigure(hz, vol);
+            tone.reconfigure(hz, vol, device);
         }
     }
 
     #[must_use]
-    pub fn audio_devices() -> Vec<String> {
-        SidetoneEngine::output_devices()
+    pub fn audio_devices() -> Vec<AudioDeviceView> {
+        SidetoneEngine::output_devices_marked()
+            .into_iter()
+            .map(|(name, is_default)| AudioDeviceView { name, is_default })
+            .collect()
+    }
+
+    fn emit_audio_devices(&self) {
+        self.shared.emit(ClientEvent::AudioDevices { available: Self::audio_devices() });
+    }
+
+    /// Re-enumerates audio devices and pushes the list (for the UI refresh button / PnP).
+    pub fn refresh_audio_devices(&self) {
+        self.emit_audio_devices();
     }
 
     // ─── Ports ───────────────────────────────────────────────────────────────
@@ -389,57 +572,158 @@ impl ClientController {
             .unwrap_or_default()
     }
 
-    pub fn select_keying_port(&self, port: Option<String>) {
-        self.shared.settings.lock().unwrap().keying_port = port.clone();
-        let mut guard = self.shared.keying.lock().unwrap();
-        *guard = None;
-        if let Some(name) = port {
-            let cfg = KeyingOutputConfig {
-                port_name: name.clone(),
-                key_line: KeyingLine::Dtr,
-                ..Default::default()
-            };
-            match SerialKeyingOutput::open(cfg) {
-                Ok(out) => {
-                    *guard = Some(out);
-                    self.shared.log("info", format!("Keying output on {name}."));
-                }
-                Err(e) => self.shared.log("warn", format!("Keying port {name} failed: {e}")),
+    fn emit_ports(&self) {
+        self.shared.emit(ClientEvent::Ports { available: Self::serial_ports() });
+    }
+
+    /// The serial ports we currently hold open (paddle poller running, keying output open).
+    /// Used so reconciliation does not drop a working, in-use port the OS hides from
+    /// enumeration while it is busy.
+    fn held_ports(&self) -> Vec<String> {
+        let s = self.shared.settings.lock().unwrap();
+        let mut held = Vec::new();
+        if self.shared.paddle.lock().unwrap().is_some() {
+            if let Some(p) = &s.paddle_port {
+                held.push(p.clone());
             }
         }
+        if self.shared.keying.lock().unwrap().is_some() {
+            if let Some(p) = &s.keying_port {
+                held.push(p.clone());
+            }
+        }
+        held
+    }
+
+    pub fn select_keying_port(&self, port: Option<String>) {
+        self.shared.settings.lock().unwrap().keying_port = port.clone();
+        self.open_keying_port(port);
+        self.shared.emit_settings();
     }
 
     pub fn select_paddle_port(&self, port: Option<String>) {
         self.shared.settings.lock().unwrap().paddle_port = port.clone();
-        *self.shared.paddle.lock().unwrap() = None;
-        match port {
-            Some(name) => match PaddleInputPort::open(&name) {
-                Ok(input) => {
-                    let handle = PaddlePollerHandle::spawn(
-                        input,
-                        Arc::clone(&self.shared),
-                        self.runtime.handle().clone(),
-                    );
-                    *self.shared.paddle.lock().unwrap() = Some(handle);
-                    self.shared.log("info", format!("Paddle input on {name}."));
-                }
-                Err(e) => self.shared.log("warn", format!("Paddle port {name} failed: {e}")),
-            },
-            None => self.shared.log("info", "Paddle input cleared."),
+        self.open_paddle_port(port);
+        self.shared.emit_settings();
+    }
+
+    fn open_keying_port(&self, port: Option<String>) {
+        let mut guard = self.shared.keying.lock().unwrap();
+        *guard = None;
+        let Some(name) = port else {
+            self.shared.clear_error(control::KEYING);
+            self.shared.log("info", "Local key line cleared.");
+            return;
+        };
+        let cfg = KeyingOutputConfig {
+            port_name: name.clone(),
+            key_line: KeyingLine::Dtr,
+            ..Default::default()
+        };
+        match SerialKeyingOutput::open(cfg) {
+            Ok(out) => {
+                *guard = Some(out);
+                self.shared.clear_error(control::KEYING);
+                self.shared.log("info", format!("Keying output on {name}."));
+            }
+            Err(e) => {
+                self.shared.fail(
+                    control::KEYING,
+                    format!("{name} not available"),
+                    format!("Keying port {name} failed: {e}"),
+                );
+            }
         }
     }
 
-    // ─── Keying ──────────────────────────────────────────────────────────────
+    fn open_paddle_port(&self, port: Option<String>) {
+        *self.shared.paddle.lock().unwrap() = None;
+        let Some(name) = port else {
+            self.shared.clear_error(control::PADDLE);
+            self.shared.log("info", "Paddle input cleared.");
+            return;
+        };
+        match PaddleInputPort::open(&name) {
+            Ok(input) => {
+                let handle = PaddlePollerHandle::spawn(
+                    input,
+                    Arc::clone(&self.shared),
+                    self.runtime.handle().clone(),
+                );
+                *self.shared.paddle.lock().unwrap() = Some(handle);
+                self.shared.clear_error(control::PADDLE);
+                self.shared.log("info", format!("Paddle input on {name}."));
+            }
+            Err(e) => {
+                self.shared.fail(
+                    control::PADDLE,
+                    format!("{name} not available"),
+                    format!("Paddle port {name} failed: {e}"),
+                );
+            }
+        }
+    }
 
+    /// Re-enumerates serial ports and reconciles the two selections (paddle, keying): any
+    /// selected port no longer present is dropped to `None` and its handle released, without
+    /// disturbing the other. Always emits the fresh port list; also refreshes audio devices.
+    ///
+    /// A port we currently hold open is never treated as missing even if absent from the
+    /// enumeration: on Windows an exclusively-opened COM port is commonly hidden from
+    /// `available_ports()` while in use, and dropping a working, in-use selection would be a
+    /// bug (it caused selections to snap back to `(None)`).
+    pub fn reconcile_ports(&self) {
+        let mut present = Self::serial_ports();
+        for held in self.held_ports() {
+            if !present.contains(&held) {
+                present.push(held);
+            }
+        }
+        present.sort_by(|a, b| natural_port_key(a).cmp(&natural_port_key(b)));
+        self.shared.emit(ClientEvent::Ports { available: present.clone() });
+        self.emit_audio_devices();
+
+        let (paddle_gone, keying_gone) = {
+            let s = self.shared.settings.lock().unwrap();
+            (port_missing(&s.paddle_port, &present), port_missing(&s.keying_port, &present))
+        };
+        if !(paddle_gone || keying_gone) {
+            return;
+        }
+
+        if paddle_gone {
+            let name = self.shared.settings.lock().unwrap().paddle_port.take();
+            if let Some(n) = name {
+                self.shared.log("warn", format!("Paddle port {n} removed; set to (None)."));
+            }
+            self.open_paddle_port(None);
+        }
+        if keying_gone {
+            let name = self.shared.settings.lock().unwrap().keying_port.take();
+            if let Some(n) = name {
+                self.shared.log("warn", format!("Keying port {n} removed; set to (None)."));
+            }
+            self.open_keying_port(None);
+        }
+        self.shared.emit_settings();
+    }
+
+    // ─── Keying (type-ahead / macros) ──────────────────────────────────────────
+
+    /// Appends text (a typed character or a macro) to the send buffer. It is keyed with proper
+    /// CW spacing by the send worker, after whatever is already queued.
     pub fn send_cw(&self, text: &str) {
-        let text = text.to_string();
-        let shared = Arc::clone(&self.shared);
-        let handle = self.runtime.handle().clone();
-        std::thread::spawn(move || play_cw(&shared, &handle, &text));
+        self.shared.send.push(text);
     }
 
     pub fn test_tx(&self) {
         self.send_cw("VVV TEST");
+    }
+
+    /// Immediately stops sending: flushes the buffer and drops the in-progress character
+    /// (ESC / WinKeyer "clear buffer"). The key is forced up.
+    pub fn abort_send(&self) {
+        self.shared.send.abort();
     }
 
     // ─── Pairing ──────────────────────────────────────────────────────────────
@@ -503,8 +787,7 @@ async fn lan_advertise_and_await(shared: Arc<Shared>, callsign: String, keyer_id
         Err(e) => return fail(&shared, format!("identity error: {e}")),
     };
 
-    // 2. Broadcast the beacon until a picker connects. The advertiser runs on its own task so
-    //    the await below can proceed concurrently.
+    // 2. Broadcast the beacon until a picker connects.
     let beacon = Beacon {
         callsign,
         keyer_id,
@@ -536,7 +819,6 @@ async fn lan_advertise_and_await(shared: Arc<Shared>, callsign: String, keyer_id
 /// over the tunnel, install it, and report connected.
 async fn bring_up_keying(shared: &Arc<Shared>, connected: tunnel::Connected) {
     let path = format!("{:?}", connected.path).to_lowercase();
-    // The config only supplies the role here (no forward rules on the Remote Keyer).
     let config = shared.config.lock().unwrap().clone();
     let session = match Session::start(connected, &config) {
         Ok(s) => s,
@@ -566,6 +848,7 @@ async fn bring_up_keying(shared: &Arc<Shared>, connected: tunnel::Connected) {
 
 impl Drop for ClientController {
     fn drop(&mut self) {
+        self.shared.send.shutdown();
         self.disconnect();
     }
 }
@@ -617,29 +900,162 @@ fn drive_edge(
     }
 }
 
-fn play_cw(shared: &Arc<Shared>, rt: &tokio::runtime::Handle, text: &str) {
+// ─── Send worker: drains the type-ahead / macro buffer with real CW timing ─────
+
+/// Spawns the single send-worker thread. It waits for buffered characters and keys them as a
+/// continuous CW element stream through [`drive_edge`] (sidetone + local key line + UI + the
+/// tunnel) with correct element/character/word spacing. An abort (ESC) drops the queue and the
+/// in-progress schedule immediately; characters typed during a send chain on seamlessly.
+fn spawn_send_worker(shared: Arc<Shared>) {
+    std::thread::Builder::new()
+        .name("wrk-sender".into())
+        .spawn(move || {
+            // The runtime handle is created after the controller spawns this thread, so the
+            // worker uses its own current-thread handle for the (rare) tunnel send: we instead
+            // use a dedicated single-thread runtime so `drive_edge`'s block_on works off the
+            // UI/tokio threads.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("send-worker runtime");
+            send_worker(&shared, rt.handle());
+        })
+        .expect("spawn send worker");
+}
+
+/// The send worker keys the buffer as a continuous element stream, one character at a time,
+/// managing the inter-character and word gaps itself. Characters typed while sending chain on
+/// with correct spacing because the running `position` stays ahead of real time whenever the
+/// buffer is non-empty.
+fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
+    // Element timing is sub-element-critical: without a raised priority and a 1 ms timer the
+    // OS scheduler can overshoot a ~17 ms inter-character gap by a whole quantum and smear the
+    // spacing. Match the paddle loop's scheduling protection.
+    let _priority = ThreadPriorityGuard::raise_time_critical();
+    let _timer = TimerResolutionGuard::raise(1);
     let clock = MonotonicClock;
-    let (wpm, weight) = {
-        let s = shared.settings.lock().unwrap();
-        (s.wpm, s.weight)
-    };
-    let start = clock.now();
-    let schedule: EdgeSchedule =
-        match EdgeScheduleBuilder::build(text, wpm, weight, start, clock.frequency()) {
-            Ok(s) => s,
-            Err(e) => {
-                shared.log("warn", format!("CW build failed: {e}"));
-                return;
+    let hz = clock.frequency();
+
+    let mut position = clock.now();
+    let mut prev_emitted = false;
+    let mut sending = false;
+    // The edge-sender epoch is sampled fresh for each character run so a reconnection (which
+    // bumps the epoch) is reflected.
+    let mut sender = EdgeSender::new(*shared.epoch.lock().unwrap(), hz, position);
+
+    let aborting = || shared.send.state.lock().unwrap_or_else(|e| e.into_inner()).abort;
+
+    loop {
+        // Pop the next character, blocking until one is available.
+        let next: Option<char> = {
+            let mut st = shared.send.state.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if st.shutdown {
+                    return;
+                }
+                if st.abort {
+                    st.abort = false;
+                    st.queue.clear();
+                    drop(st);
+                    position = clock.now();
+                    prev_emitted = false;
+                    if sending {
+                        let tone = shared.sidetone.lock().unwrap().clone();
+                        drive_edge(shared, rt, tone.as_ref(), &mut sender, false, clock.now());
+                        shared.emit(ClientEvent::Sending { active: false });
+                        sending = false;
+                    }
+                    st = shared.send.state.lock().unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
+                if let Some(ch) = st.queue.pop_front() {
+                    break Some(ch);
+                }
+                // Nothing queued: drop the SEND indicator and wait for more input.
+                if sending {
+                    drop(st);
+                    shared.emit(ClientEvent::Sending { active: false });
+                    sending = false;
+                    st = shared.send.state.lock().unwrap_or_else(|e| e.into_inner());
+                }
+                st = shared.send.cv.wait(st).unwrap_or_else(|e| e.into_inner());
             }
         };
-    let epoch = *shared.epoch.lock().unwrap();
-    let mut sender = EdgeSender::new(epoch, clock.frequency(), start);
-    let tone = shared.sidetone.lock().unwrap().clone();
-    for edge in &schedule.edges {
-        HybridWaiter::wait_until_ticks(&clock, edge.timestamp_ticks, &|| false);
-        drive_edge(shared, rt, tone.as_ref(), &mut sender, edge.key_down, edge.timestamp_ticks);
+        let Some(ch) = next else { continue };
+
+        let (wpm, weight) = {
+            let s = shared.settings.lock().unwrap();
+            (s.wpm, s.weight)
+        };
+        let timing = match KeyerElementTiming::from_speed(wpm, weight, hz) {
+            Ok(t) => t,
+            Err(e) => {
+                shared.log("warn", format!("CW timing error: {e}"));
+                continue;
+            }
+        };
+
+        // Re-anchor the schedule cursor to "now" whenever it has fallen behind real time
+        // (after any idle, and under scheduler slop). We do NOT clear `prev_emitted` here so a
+        // character typed a moment after the previous one still gets its inter-character gap.
+        let now = clock.now();
+        if position < now {
+            position = now;
+        }
+
+        if !sending {
+            // Fresh send span: resample the epoch so a reconnection is picked up.
+            sender = EdgeSender::new(*shared.epoch.lock().unwrap(), hz, position);
+            shared.emit(ClientEvent::Sending { active: true });
+            sending = true;
+        }
+
+        // Word separator: advance by a word gap (only between words) and reset.
+        if MorseTable::is_word_separator(ch) {
+            if prev_emitted {
+                position += timing.word_gap_ticks();
+            }
+            prev_emitted = false;
+            continue;
+        }
+
+        let Some(pattern) = MorseTable::pattern(ch) else {
+            continue; // unkeyable character: skip
+        };
+
+        if prev_emitted {
+            position += timing.inter_character_gap_ticks();
+        }
+
+        let tone = shared.sidetone.lock().unwrap().clone();
+
+        // Key each element of the character with intra-element gaps.
+        let mut first_element = true;
+        for symbol in pattern.chars() {
+            if !first_element {
+                position += timing.gap_ticks;
+            }
+            first_element = false;
+
+            let element = if symbol == '-' { KeyerElement::Dah } else { KeyerElement::Dit };
+            let duration = timing.ticks_for(element);
+
+            HybridWaiter::wait_until_ticks(&clock, position, &aborting);
+            if aborting() {
+                break;
+            }
+            drive_edge(shared, rt, tone.as_ref(), &mut sender, true, position);
+
+            HybridWaiter::wait_until_ticks(&clock, position + duration, &aborting);
+            drive_edge(shared, rt, tone.as_ref(), &mut sender, false, position + duration);
+            position += duration;
+
+            if aborting() {
+                break;
+            }
+        }
+        prev_emitted = true;
     }
-    drive_edge(shared, rt, tone.as_ref(), &mut sender, false, clock.now());
 }
 
 // ─── Serial paddle poller (same hardware approach as the Keyer-Router) ──────────
@@ -701,7 +1117,11 @@ fn paddle_loop(
         let raw = match input.read() {
             Ok(s) => s,
             Err(e) => {
-                shared.log("warn", format!("Paddle port read error: {e}. Input stopped."));
+                shared.fail(
+                    control::PADDLE,
+                    "paddle read error",
+                    format!("Paddle port read error: {e}. Input stopped."),
+                );
                 break;
             }
         };
@@ -761,4 +1181,9 @@ fn mode_name(mode: KeyerMode) -> &'static str {
         KeyerMode::Bug => "bug",
         KeyerMode::Straight => "straight",
     }
+}
+
+/// Whether `selected` names a port that is not in `present` (and is `Some`).
+fn port_missing(selected: &Option<String>, present: &[String]) -> bool {
+    matches!(selected, Some(name) if !present.iter().any(|p| p == name))
 }

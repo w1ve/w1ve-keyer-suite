@@ -20,6 +20,7 @@ export default function ServerApp() {
   const [lastFailSafe, setLastFailSafe] = useState(null);
   const [log, setLog] = useState([]);
   const [ports, setPorts] = useState([]);
+  const [errors, setErrors] = useState({}); // control -> short red message
   const [lanPeers, setLanPeers] = useState([]);
   const [pickedKey, setPickedKey] = useState("");
 
@@ -52,6 +53,12 @@ export default function ServerApp() {
         case "lanPeers":
           setLanPeers(ev.peers || []);
           break;
+        case "ports":
+          setPorts(ev.available || []);
+          break;
+        case "error":
+          setErrors((e) => ({ ...e, [ev.control]: ev.message || undefined }));
+          break;
         case "log":
           setLog((p) => [...p.slice(-400), { level: ev.level, message: ev.message, t: new Date() }]);
           break;
@@ -59,7 +66,8 @@ export default function ServerApp() {
           break;
       }
     });
-    api.serialPorts().then(setPorts).catch(() => {});
+    // Pull current state once subscribed (startup push races the webview and is otherwise lost).
+    unlisten.then(() => api.requestState().catch(() => {}));
     return () => unlisten.then((f) => f());
   }, []);
 
@@ -127,12 +135,20 @@ export default function ServerApp() {
                   onChange={(e) => api.selectKeyingPort(e.target.value || null)}
                 >
                   <option value="">(None)</option>
-                  {ports.map((p) => (
+                  {(settings.keyingPort && !ports.includes(settings.keyingPort)
+                    ? [...ports, settings.keyingPort]
+                    : ports
+                  ).map((p) => (
                     <option key={p} value={p}>
                       {p}
                     </option>
                   ))}
                 </select>
+                {errors.keying && (
+                  <div style={{ color: "var(--bad, #e06c6c)", fontSize: 12, marginTop: 4 }}>
+                    {errors.keying}
+                  </div>
+                )}
               </div>
               <div className="row" style={{ gap: 10 }}>
                 <div className="field" style={{ flex: 1, marginBottom: 0 }}>

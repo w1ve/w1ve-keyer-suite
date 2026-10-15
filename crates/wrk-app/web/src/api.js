@@ -5,6 +5,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export const clientApi = {
+  // Pull the current settings + ports + audio devices (called once the UI has subscribed,
+  // since the backend's startup push races the webview and would otherwise be missed).
+  requestState: () => invoke("c_request_state"),
   setSpeed: (wpm) => invoke("c_set_speed", { wpm }),
   setWeight: (weight) => invoke("c_set_weight", { weight }),
   setMode: (mode) => invoke("c_set_mode", { mode }),
@@ -13,12 +16,15 @@ export const clientApi = {
   setRelay: (relay) => invoke("c_set_relay", { relay }),
   setToneFrequency: (hz) => invoke("c_set_tone_frequency", { hz }),
   setToneVolume: (percent) => invoke("c_set_tone_volume", { percent }),
+  selectAudioDevice: (device) => invoke("c_select_audio_device", { device }),
   audioDevices: () => invoke("c_audio_devices"),
+  refreshAudioDevices: () => invoke("c_refresh_audio_devices"),
   serialPorts: () => invoke("c_serial_ports"),
   selectKeyingPort: (port) => invoke("c_select_keying_port", { port }),
   selectPaddlePort: (port) => invoke("c_select_paddle_port", { port }),
   sendCw: (text) => invoke("c_send_cw", { text }),
   testTx: () => invoke("c_test_tx"),
+  abortSend: () => invoke("c_abort_send"),
   connect: (token) => invoke("c_connect", { token }),
   disconnect: () => invoke("c_disconnect"),
   // LAN (operating-position advertises itself)
@@ -28,6 +34,8 @@ export const clientApi = {
 };
 
 export const serverApi = {
+  // Pull the current settings + ports once the UI has subscribed (startup push races it).
+  requestState: () => invoke("s_request_state"),
   serialPorts: () => invoke("s_serial_ports"),
   selectKeyingPort: (port) => invoke("s_select_keying_port", { port }),
   setKeyLine: (line) => invoke("s_set_key_line", { line }),

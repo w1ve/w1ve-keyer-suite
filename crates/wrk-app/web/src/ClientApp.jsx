@@ -2,6 +2,11 @@ import { useEffect, useState } from "react";
 import { clientApi as api, onEvent } from "./api.js";
 import TransportSlider from "./TransportSlider.jsx";
 
+// Is this platform event-driven for device changes? On Windows the backend pushes updated
+// device/port lists on WM_DEVICECHANGE, so no manual refresh is needed. Elsewhere we expose a
+// Refresh button. navigator.userAgent carries the OS in the webview.
+const IS_WINDOWS = /windows/i.test(navigator.userAgent);
+
 const MODES = [
   ["iambicB", "Iambic B"],
   ["iambicA", "Iambic A"],
@@ -20,6 +25,7 @@ export default function ClientApp() {
     paddleReverse: false,
     toneHz: 600,
     toneVolume: 70,
+    audioDevice: null,
     transport: "wan",
     relay: "",
     callsign: "",
@@ -27,13 +33,17 @@ export default function ClientApp() {
   });
   const [connection, setConnection] = useState({ state: "disconnected", path: "none" });
   const [keyDown, setKeyDown] = useState(false);
+  const [sending, setSending] = useState(false);
   const [advertising, setAdvertising] = useState(false);
   const [log, setLog] = useState([]);
 
   const [ports, setPorts] = useState([]);
+  const [audioDevices, setAudioDevices] = useState([]);
+  const [errors, setErrors] = useState({}); // control -> short red message
   const [keyingPort, setKeyingPort] = useState("");
   const [paddlePort, setPaddlePort] = useState("");
   const [token, setToken] = useState("");
+  const [typeAhead, setTypeAhead] = useState("");
 
   useEffect(() => {
     const unlisten = onEvent((ev) => {
@@ -46,6 +56,7 @@ export default function ClientApp() {
             paddleReverse: ev.paddle_reverse,
             toneHz: ev.tone_hz,
             toneVolume: ev.tone_volume,
+            audioDevice: ev.audio_device ?? null,
             transport: ev.transport,
             relay: ev.relay,
             callsign: ev.callsign ?? "",
@@ -58,8 +69,21 @@ export default function ClientApp() {
         case "keyState":
           setKeyDown(ev.down);
           break;
+        case "sending":
+          setSending(ev.active);
+          break;
         case "advertising":
           setAdvertising(ev.active);
+          break;
+        case "ports":
+          setPorts(ev.available || []);
+          break;
+        case "audioDevices":
+          // Each entry: { name, isDefault }.
+          setAudioDevices(ev.available || []);
+          break;
+        case "error":
+          setErrors((e) => ({ ...e, [ev.control]: ev.message || undefined }));
           break;
         case "log":
           setLog((p) => [...p.slice(-400), { level: ev.level, message: ev.message, t: new Date() }]);
@@ -68,15 +92,57 @@ export default function ClientApp() {
           break;
       }
     });
-    api.serialPorts().then(setPorts).catch(() => {});
+    // Pull current state once subscribed (startup push races the webview and is otherwise lost).
+    unlisten.then(() => api.requestState().catch(() => {}));
     return () => unlisten.then((f) => f());
   }, []);
+
+  // Global ESC: abort sending from anywhere in the window (e.g. while a macro plays and the
+  // type-ahead box is not focused). The type-ahead box also handles ESC to clear itself.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape") {
+        api.abortSend();
+        setTypeAhead("");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Type-ahead: any text added to the box — typed OR pasted — is appended to the send buffer
+  // and keyed with proper CW spacing. We diff against what we have already sent so a paste of a
+  // whole sentence enqueues the whole sentence (not just one key). ESC aborts + clears.
+  function onTypeAheadChange(e) {
+    const next = e.target.value;
+    if (next.length > typeAhead.length && next.startsWith(typeAhead)) {
+      const added = next.slice(typeAhead.length);
+      api.sendCw(added.toUpperCase());
+    } else if (next.length > typeAhead.length) {
+      api.sendCw(next.toUpperCase());
+    }
+    setTypeAhead(next);
+  }
+
+  function onTypeAheadKey(e) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      api.abortSend();
+      setTypeAhead("");
+    }
+  }
 
   const paired = connection.state === "connected";
   const connecting = connection.state === "connecting";
   const pathText =
     paired ? (connection.path === "relay" ? "Relay" : "Direct") : connecting ? "Pairing…" : "Disconnected";
   const linkColor = paired ? "var(--good)" : connecting ? "var(--warn)" : "var(--text-dim)";
+
+  // Audio selection model: settings.audioDevice is null (follow system default), "" (off), or a
+  // device name. When null, show the actual default device by name so the user sees what they
+  // are hearing through. "(None)" = off = "".
+  const defaultDevice = audioDevices.find((d) => d.isDefault)?.name || "";
+  const audioValue = settings.audioDevice == null ? defaultDevice : settings.audioDevice;
 
   return (
     <div className="app">
@@ -150,10 +216,10 @@ export default function ClientApp() {
               <div className="row" style={{ marginTop: 10, gap: 6 }}>
                 <input
                   type="text"
-                  placeholder="Type CW…"
-                  onKeyPress={(e) => {
-                    if (e.key.length === 1) api.sendCw(e.key.toUpperCase());
-                  }}
+                  placeholder="Type or paste CW (sent as entered) — ESC to stop…"
+                  value={typeAhead}
+                  onChange={onTypeAheadChange}
+                  onKeyDown={onTypeAheadKey}
                   style={{ flex: 1 }}
                 />
                 <button onClick={() => api.testTx()}>Test TX</button>
@@ -162,6 +228,39 @@ export default function ClientApp() {
 
             <div className="panel">
               <h3>Sidetone & Inputs</h3>
+              <div className="field">
+                <label className="row spread">
+                  <span>Sidetone device</span>
+                  {!IS_WINDOWS && (
+                    <button className="mini" onClick={() => api.refreshAudioDevices()}>
+                      Refresh
+                    </button>
+                  )}
+                </label>
+                <select
+                  value={audioValue}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    // "" -> off; the default device name -> null (follow default); else that name.
+                    const device = v === "" ? "" : v === defaultDevice ? null : v;
+                    setSettings((s) => ({ ...s, audioDevice: device }));
+                    api.selectAudioDevice(device);
+                  }}
+                >
+                  <option value="">(None — sidetone off)</option>
+                  {audioDevices.map((d) => (
+                    <option key={d.name} value={d.name}>
+                      {d.isDefault ? `${d.name} (default)` : d.name}
+                    </option>
+                  ))}
+                  {/* keep a stale named selection visible until the next refresh */}
+                  {settings.audioDevice &&
+                    !audioDevices.some((d) => d.name === settings.audioDevice) && (
+                      <option value={settings.audioDevice}>{settings.audioDevice}</option>
+                    )}
+                </select>
+                <ErrorLine msg={errors.audio} />
+              </div>
               <div className="field">
                 <label>Frequency: {settings.toneHz} Hz</label>
                 <input
@@ -195,6 +294,7 @@ export default function ClientApp() {
                 label="Paddle input (serial)"
                 value={paddlePort}
                 ports={ports}
+                error={errors.paddle}
                 onChange={(p) => {
                   setPaddlePort(p);
                   api.selectPaddlePort(p || null);
@@ -204,6 +304,7 @@ export default function ClientApp() {
                 label="Local key line (optional)"
                 value={keyingPort}
                 ports={ports}
+                error={errors.keying}
                 onChange={(p) => {
                   setKeyingPort(p);
                   api.selectKeyingPort(p || null);
@@ -321,6 +422,9 @@ export default function ClientApp() {
 
       <div className="statusbar">
         <span className="spring" />
+        <span style={{ color: sending ? "var(--accent)" : "var(--text-dim)" }}>
+          {sending ? "Sending" : "Idle"}
+        </span>
         <span style={{ color: keyDown ? "var(--key-on)" : "var(--text-dim)" }}>
           Key: {keyDown ? "Down" : "Up"}
         </span>
@@ -337,19 +441,29 @@ function lanName(settings) {
   return c || id || "(unnamed)";
 }
 
-function PortSelect({ label, value, ports, onChange }) {
+function PortSelect({ label, value, ports, error, onChange }) {
+  // Keep the current value visible even if it is not in the live list (busy/hidden port).
+  const list = value && !ports.includes(value) ? [...ports, value] : ports;
   return (
     <div className="field">
       <label>{label}</label>
       <select value={value} onChange={(e) => onChange(e.target.value)}>
         <option value="">(None)</option>
-        {ports.map((p) => (
+        {list.map((p) => (
           <option key={p} value={p}>
             {p}
           </option>
         ))}
       </select>
+      <ErrorLine msg={error} />
     </div>
+  );
+}
+
+function ErrorLine({ msg }) {
+  if (!msg) return null;
+  return (
+    <div style={{ color: "var(--bad, #e06c6c)", fontSize: 12, marginTop: 4 }}>{msg}</div>
   );
 }
 

@@ -15,7 +15,9 @@ use rwk_core::engine::bus::{CoreEvent, EventBus};
 use rwk_core::engine::edge_station::{pump_edges, tunnel_replayer};
 use rwk_core::engine::network::EdgeTransport;
 use rwk_core::engine::replay::{spawn_driver, EdgeJitterProfile, KeyingOutput, SerialKeyingAdapter};
-use rwk_core::engine::serial::{enumerate_ports, KeyingOutputConfig, SerialKeyingOutput};
+use rwk_core::engine::serial::{
+    enumerate_ports, natural_port_key, KeyingOutputConfig, SerialKeyingOutput,
+};
 use rwk_core::engine::session::Session;
 use rwk_core::engine::tunnel;
 use rwk_core::primitives::KeyingLine;
@@ -25,6 +27,11 @@ use crate::app_paths;
 use crate::pairing::{self, Transport};
 
 const EDGE_PORT: u16 = 5555;
+
+/// Control identifiers for inline error messages in the UI.
+mod control {
+    pub const KEYING: &str = "keying";
+}
 
 /// An event the Server controller emits for the UI.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -45,6 +52,10 @@ pub enum ServerEvent {
     },
     /// The live list of LAN keyers available to connect to (for the dropdown).
     LanPeers { peers: Vec<LanPeerView> },
+    /// The current serial-port inventory.
+    Ports { available: Vec<String> },
+    /// A short, per-control error (empty `message` clears it). Full detail is also logged.
+    Error { control: String, message: String },
 }
 
 /// A LAN keyer as the Server UI shows it in the dropdown.
@@ -114,6 +125,17 @@ impl Shared {
 
     fn log(&self, level: &str, message: impl Into<String>) {
         self.emit(ServerEvent::Log { level: level.into(), message: message.into() });
+    }
+
+    /// Logs the full detail and shows a short red message under `control`.
+    fn fail(&self, control: &str, short: impl Into<String>, detail: impl Into<String>) {
+        self.log("warn", detail);
+        self.emit(ServerEvent::Error { control: control.into(), message: short.into() });
+    }
+
+    /// Clears any red message under `control`.
+    fn clear_error(&self, control: &str) {
+        self.emit(ServerEvent::Error { control: control.into(), message: String::new() });
     }
 
     fn emit_settings(&self) {
@@ -201,8 +223,61 @@ impl ServerController {
             .unwrap_or_default()
     }
 
+    /// Re-emits settings and the port list. The UI calls this once it has subscribed to the
+    /// event channel, because the startup emit races the webview and is otherwise lost.
+    pub fn request_state(&self) {
+        self.shared.emit_settings();
+        self.emit_ports();
+    }
+
+    fn emit_ports(&self) {
+        self.shared.emit(ServerEvent::Ports { available: Self::serial_ports() });
+    }
+
+    /// Whether the Server currently holds the keying port open (i.e. is paired). The keying
+    /// output is opened at pairing in [`bring_up_replay`], so a selection is only "held" while
+    /// an active session exists.
+    fn is_paired(&self) -> bool {
+        self.active.lock().unwrap().is_some()
+    }
+
+    /// Re-enumerates serial ports and reconciles the keying selection. While **not** paired, a
+    /// vanished keying port drops to `None`. While **paired** the port is held open by the
+    /// replay path and must not be disturbed, so it is folded back into the list even if the
+    /// OS hides the busy port from enumeration. Always emits the fresh port list.
+    pub fn reconcile_ports(&self) {
+        let paired = self.is_paired();
+        let mut present = Self::serial_ports();
+        if paired {
+            if let Some(p) = self.shared.settings.lock().unwrap().keying_port.clone() {
+                if !present.contains(&p) {
+                    present.push(p);
+                }
+            }
+        }
+        present.sort_by(|a, b| natural_port_key(a).cmp(&natural_port_key(b)));
+        self.shared.emit(ServerEvent::Ports { available: present.clone() });
+
+        if paired {
+            return;
+        }
+        let keying_gone = {
+            let s = self.shared.settings.lock().unwrap();
+            matches!(&s.keying_port, Some(name) if !present.iter().any(|p| p == name))
+        };
+        if keying_gone {
+            let name = self.shared.settings.lock().unwrap().keying_port.take();
+            if let Some(n) = name {
+                self.shared.log("warn", format!("Keying port {n} removed; set to (None)."));
+            }
+            self.shared.clear_error(control::KEYING);
+            self.shared.emit_settings();
+        }
+    }
+
     pub fn select_keying_port(&self, port: Option<String>) {
         self.shared.settings.lock().unwrap().keying_port = port;
+        self.shared.clear_error(control::KEYING);
         self.shared.emit_settings();
     }
 
@@ -242,11 +317,16 @@ impl ServerController {
             (s.transport, s.relay.clone(), s.token.clone(), s.keying_port.clone(), s.key_line, s.ptt_line)
         };
         if keying_port.is_none() {
-            self.shared.log("warn", "Select a keying output port before starting.");
+            self.shared.fail(
+                control::KEYING,
+                "select a port",
+                "Select a keying output port before starting.",
+            );
             self.shared
                 .emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
             return;
         }
+        self.shared.clear_error(control::KEYING);
         self.disconnect();
 
         let shared = Arc::clone(&self.shared);
@@ -328,9 +408,14 @@ impl ServerController {
             (s.keying_port.clone(), s.key_line, s.ptt_line)
         };
         if keying_port.is_none() {
-            self.shared.log("warn", "Select a keying output port before connecting.");
+            self.shared.fail(
+                control::KEYING,
+                "select a port",
+                "Select a keying output port before connecting.",
+            );
             return;
         }
+        self.shared.clear_error(control::KEYING);
         let peer_key = match rwk_core::config::base64_decode(peer_key_b64)
             .ok()
             .and_then(|b| <[u8; 32]>::try_from(b).ok())
@@ -438,8 +523,17 @@ async fn bring_up_replay(
     };
     let serial = match SerialKeyingOutput::open(cfg) {
         Ok(out) => out,
-        Err(e) => return fail(shared, format!("keying port {port_name} failed: {e}")),
+        Err(e) => {
+            shared.fail(
+                control::KEYING,
+                format!("{port_name} not available"),
+                format!("keying port {port_name} failed: {e}"),
+            );
+            shared.emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
+            return;
+        }
     };
+    shared.clear_error(control::KEYING);
     shared.log("info", format!("Keying output open on {port_name}."));
 
     let clock: Arc<dyn Clock> = Arc::new(MonotonicClock);

@@ -14,14 +14,31 @@
 
 mod app_paths;
 mod client_controller;
+mod device_watch;
 mod pairing;
 mod server_controller;
 
 use std::sync::Arc;
 
 use client_controller::{ClientController, ClientEvent};
+use device_watch::DeviceChangeWatcher;
 use server_controller::{ServerController, ServerEvent};
 use tauri::{Emitter, Manager, State};
+
+/// Extracts the native window handle as an `isize` for the device watcher.
+///
+/// Returns `None` off Windows (the watcher then polls) or if the handle is unavailable.
+#[allow(unused_variables)]
+fn window_handle_isize(window: &tauri::WebviewWindow) -> Option<isize> {
+    #[cfg(windows)]
+    {
+        return window.hwnd().ok().map(|h| h.0 as isize);
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Client application (`wrk-client`)
@@ -29,6 +46,8 @@ use tauri::{Emitter, Manager, State};
 
 struct ClientState {
     controller: ClientController,
+    /// The PnP watcher lives for the whole app; kept here so it is not dropped.
+    _watcher: DeviceChangeWatcher,
 }
 
 /// Launches the Client (operating-position) application.
@@ -41,14 +60,30 @@ pub fn run_client() {
                 let _ = handle.emit("rwk://event", &event);
             });
             let controller = ClientController::start(sink);
-            app.manage(ClientState { controller });
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_title("W1VE Remote Keyer — Client");
-            }
+
+            // Install the serial PnP watcher. On Windows it subclasses this window for
+            // WM_DEVICECHANGE; elsewhere it polls. Either way it fires the controller's port
+            // reconciliation.
+            let raw_window = match app.get_webview_window("main") {
+                Some(window) => {
+                    let _ = window.set_title("W1VE Remote Keyer — Client");
+                    window_handle_isize(&window)
+                }
+                None => None,
+            };
+            let app_handle = app.handle().clone();
+            let on_change: device_watch::OnChange = Arc::new(move || {
+                if let Some(state) = app_handle.try_state::<ClientState>() {
+                    state.controller.reconcile_ports();
+                }
+            });
+            let watcher = DeviceChangeWatcher::start(raw_window, on_change);
+            app.manage(ClientState { controller, _watcher: watcher });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_role,
+            c_request_state,
             c_set_speed,
             c_set_weight,
             c_set_mode,
@@ -60,12 +95,15 @@ pub fn run_client() {
             c_lan_advertise,
             c_set_tone_frequency,
             c_set_tone_volume,
+            c_select_audio_device,
             c_audio_devices,
+            c_refresh_audio_devices,
             c_serial_ports,
             c_select_keying_port,
             c_select_paddle_port,
             c_send_cw,
             c_test_tx,
+            c_abort_send,
             c_connect,
             c_disconnect,
         ])
@@ -79,6 +117,10 @@ fn app_role() -> String {
     "client".to_string()
 }
 
+#[tauri::command]
+fn c_request_state(state: State<'_, ClientState>) {
+    state.controller.request_state();
+}
 #[tauri::command]
 fn c_set_speed(state: State<'_, ClientState>, wpm: u32) {
     state.controller.set_speed(wpm);
@@ -124,8 +166,16 @@ fn c_set_tone_volume(state: State<'_, ClientState>, percent: u32) {
     state.controller.set_tone_volume(percent);
 }
 #[tauri::command]
-fn c_audio_devices() -> Vec<String> {
+fn c_select_audio_device(state: State<'_, ClientState>, device: Option<String>) {
+    state.controller.select_audio_device(device);
+}
+#[tauri::command]
+fn c_audio_devices() -> Vec<client_controller::AudioDeviceView> {
     ClientController::audio_devices()
+}
+#[tauri::command]
+fn c_refresh_audio_devices(state: State<'_, ClientState>) {
+    state.controller.refresh_audio_devices();
 }
 #[tauri::command]
 fn c_serial_ports() -> Vec<String> {
@@ -148,6 +198,10 @@ fn c_test_tx(state: State<'_, ClientState>) {
     state.controller.test_tx();
 }
 #[tauri::command]
+fn c_abort_send(state: State<'_, ClientState>) {
+    state.controller.abort_send();
+}
+#[tauri::command]
 fn c_connect(state: State<'_, ClientState>, token: String) {
     state.controller.connect(&token);
 }
@@ -162,6 +216,8 @@ fn c_disconnect(state: State<'_, ClientState>) {
 
 struct ServerState {
     controller: ServerController,
+    /// The PnP watcher lives for the whole app; kept here so it is not dropped.
+    _watcher: DeviceChangeWatcher,
 }
 
 /// Launches the Server (remote radio site) application.
@@ -174,14 +230,29 @@ pub fn run_server() {
                 let _ = handle.emit("rwk://event", &event);
             });
             let controller = ServerController::start(sink);
-            app.manage(ServerState { controller });
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_title("W1VE Remote Keyer — Server");
-            }
+
+            // Install the serial PnP watcher (WM_DEVICECHANGE on Windows, polling elsewhere),
+            // firing the controller's port reconciliation.
+            let raw_window = match app.get_webview_window("main") {
+                Some(window) => {
+                    let _ = window.set_title("W1VE Remote Keyer — Server");
+                    window_handle_isize(&window)
+                }
+                None => None,
+            };
+            let app_handle = app.handle().clone();
+            let on_change: device_watch::OnChange = Arc::new(move || {
+                if let Some(state) = app_handle.try_state::<ServerState>() {
+                    state.controller.reconcile_ports();
+                }
+            });
+            let watcher = DeviceChangeWatcher::start(raw_window, on_change);
+            app.manage(ServerState { controller, _watcher: watcher });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             server_app_role,
+            s_request_state,
             s_serial_ports,
             s_select_keying_port,
             s_set_key_line,
@@ -204,6 +275,10 @@ fn server_app_role() -> String {
     "server".to_string()
 }
 
+#[tauri::command]
+fn s_request_state(state: State<'_, ServerState>) {
+    state.controller.request_state();
+}
 #[tauri::command]
 fn s_serial_ports() -> Vec<String> {
     ServerController::serial_ports()
