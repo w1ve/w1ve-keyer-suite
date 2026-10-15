@@ -1,0 +1,23 @@
+# ─── Build output ────────────────────────────────────────────────
+/target
+**/target
+**/node_modules
+**/web/dist
+**/gen/schemas
+Cargo.lock
+
+# ─── Developer planning notes — NOT for the public repo ──────────
+# These are internal working documents (e.g. the macOS build/rent plan and its provisioning
+# scripts). They live in the private engine project; keep them out of the public suite repo.
+docs/mac/
+**/docs/mac/
+*.plan.md
+PLAN-*.md
+*-PLAN.md
+
+# ─── Editor / OS cruft ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
