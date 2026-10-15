@@ -20,10 +20,10 @@
       {
         "label": "main",
         "title": "W1VE Keyer",
-        "width": 560,
-        "height": 620,
-        "minWidth": 520,
-        "minHeight": 560,
+        "width": 580,
+        "height": 760,
+        "minWidth": 540,
+        "minHeight": 620,
         "resizable": true
       }
     ],

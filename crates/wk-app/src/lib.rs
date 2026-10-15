@@ -66,6 +66,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            request_state,
             set_speed,
             set_weight,
             set_mode,
@@ -74,14 +75,16 @@ pub fn run() {
             set_ptt_line,
             set_tone_frequency,
             set_tone_volume,
+            select_audio_device,
             audio_devices,
+            refresh_audio_devices,
             serial_ports,
             select_keying_port,
             select_paddle_port,
             select_logger_port,
-            set_logger_enabled,
             send_cw,
             test_tx,
+            abort_send,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the W1VE Keyer");
@@ -104,6 +107,10 @@ fn window_handle_isize(window: &tauri::WebviewWindow) -> Option<isize> {
 
 // ─── Tauri commands ─────────────────────────────────────────────────────────────
 
+#[tauri::command]
+fn request_state(state: State<'_, AppState>) {
+    state.controller.request_state();
+}
 #[tauri::command]
 fn set_speed(state: State<'_, AppState>, wpm: u32) {
     state.controller.set_speed(wpm);
@@ -137,8 +144,16 @@ fn set_tone_volume(state: State<'_, AppState>, percent: u32) {
     state.controller.set_tone_volume(percent);
 }
 #[tauri::command]
-fn audio_devices() -> Vec<String> {
+fn select_audio_device(state: State<'_, AppState>, device: Option<String>) {
+    state.controller.select_audio_device(device);
+}
+#[tauri::command]
+fn audio_devices() -> Vec<keyer_controller::AudioDeviceView> {
     KeyerController::audio_devices()
+}
+#[tauri::command]
+fn refresh_audio_devices(state: State<'_, AppState>) {
+    state.controller.refresh_audio_devices();
 }
 #[tauri::command]
 fn serial_ports() -> Vec<String> {
@@ -157,14 +172,14 @@ fn select_logger_port(state: State<'_, AppState>, port: Option<String>) {
     state.controller.select_logger_port(port);
 }
 #[tauri::command]
-fn set_logger_enabled(state: State<'_, AppState>, enabled: bool) {
-    state.controller.set_logger_enabled(enabled);
-}
-#[tauri::command]
 fn send_cw(state: State<'_, AppState>, text: String) {
     state.controller.send_cw(&text);
 }
 #[tauri::command]
 fn test_tx(state: State<'_, AppState>) {
     state.controller.test_tx();
+}
+#[tauri::command]
+fn abort_send(state: State<'_, AppState>) {
+    state.controller.abort_send();
 }

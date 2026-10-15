@@ -30,20 +30,26 @@ function loadMacros() {
   return DEFAULT_MACROS;
 }
 
+// Is this platform event-driven for device changes? On Windows the backend pushes updated
+// device/port lists on WM_DEVICECHANGE, so no manual refresh is needed. Elsewhere we expose a
+// Refresh button. navigator.userAgent carries the OS in the webview.
+const IS_WINDOWS = /windows/i.test(navigator.userAgent);
+
 // The whole W1VE Keyer UI: one compact window. Keyer + Sidetone across the top, the three
-// serial ports and keyer macros/type-ahead below, and a KEY/PTT/SENDING status strip.
+// serial ports and keyer macros/type-ahead below, and a KEY/PTT/SEND status strip.
 export default function App() {
-  // Settings mirror the backend echo (single source of truth for ports + keyer config).
   const [settings, setSettings] = useState(null);
   const [ports, setPorts] = useState([]);
+  const [audioDevices, setAudioDevices] = useState([]);
+  const [errors, setErrors] = useState({}); // control -> short red message
   const [keyDown, setKeyDown] = useState(false);
   const [pttOn, setPttOn] = useState(false);
   const [sending, setSending] = useState(false);
   const [log, setLog] = useState([]);
-  const [showLog, setShowLog] = useState(false);
 
   const [macros, setMacros] = useState(loadMacros);
   const [editing, setEditing] = useState(false);
+  const [typeAhead, setTypeAhead] = useState("");
   const unlisten = useRef(null);
 
   useEffect(() => {
@@ -55,6 +61,13 @@ export default function App() {
         case "ports":
           setPorts(ev.available || []);
           break;
+        case "audioDevices":
+          // Each entry: { name, isDefault }.
+          setAudioDevices(ev.available || []);
+          break;
+        case "error":
+          setErrors((e) => ({ ...e, [ev.control]: ev.message || undefined }));
+          break;
         case "keyState":
           setKeyDown(ev.down);
           break;
@@ -65,19 +78,31 @@ export default function App() {
           setSending(ev.active);
           break;
         case "log":
-          setLog((l) => [`${ev.level.toUpperCase()}  ${ev.message}`, ...l].slice(0, 200));
+          setLog((l) => [...l, `${ev.level.toUpperCase()}  ${ev.message}`].slice(-500));
           break;
         default:
           break;
       }
     }).then((fn) => {
       unlisten.current = fn;
+      api.requestState().catch(() => {});
     });
-    // Prime the port list immediately (the backend also pushes it).
-    api.serialPorts().then(setPorts).catch(() => {});
     return () => {
       if (unlisten.current) unlisten.current();
     };
+  }, []);
+
+  // Global ESC: abort sending from anywhere in the window (e.g. while a macro is playing and
+  // the type-ahead box is not focused). The type-ahead box also handles ESC to clear itself.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape") {
+        api.abortSend();
+        setTypeAhead("");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   function saveMacros(next) {
@@ -85,20 +110,46 @@ export default function App() {
     localStorage.setItem("wk.macros", JSON.stringify(next));
   }
 
+  // Type-ahead: any text added to the box — typed OR pasted — is appended to the send buffer
+  // and keyed with proper CW spacing. We diff against what we have already sent so a paste of
+  // a whole sentence enqueues the whole sentence (not just one key). ESC aborts + clears.
+  function onTypeAheadChange(e) {
+    const next = e.target.value;
+    // Characters appended since last time: send them. (If the user edits earlier text we only
+    // act on a growing tail, which is the normal type/paste case.)
+    if (next.length > typeAhead.length && next.startsWith(typeAhead)) {
+      const added = next.slice(typeAhead.length);
+      api.sendCw(added.toUpperCase());
+    } else if (next.length > typeAhead.length) {
+      // Non-append edit (rare): send the whole new value's added remainder conservatively.
+      api.sendCw(next.toUpperCase());
+    }
+    setTypeAhead(next);
+  }
+
   function onTypeAheadKey(e) {
-    const ch = e.key;
-    if (ch.length === 1 && ch >= " " && ch <= "~") {
-      api.sendCw(ch.toUpperCase());
+    if (e.key === "Escape") {
+      e.preventDefault();
+      api.abortSend();
+      setTypeAhead("");
     }
   }
 
-  if (!settings) {
-    return (
-      <div className="app loading">
-        Starting…
-      </div>
-    );
+  // A controlled numeric setting: render from `settings` but allow immediate local override so
+  // the slider + readout move instantly, before the next backend echo.
+  function patch(field, value) {
+    setSettings((s) => (s ? { ...s, [field]: value } : s));
   }
+
+  if (!settings) {
+    return <div className="app loading">Starting…</div>;
+  }
+
+  // Audio selection model: settings.audioDevice is null (follow system default), "" (off), or
+  // a device name. When null, show the actual default device by name so the user sees what
+  // they are hearing through. "(None)" = off = "".
+  const defaultDevice = audioDevices.find((d) => d.isDefault)?.name || "";
+  const audioValue = settings.audioDevice == null ? defaultDevice : settings.audioDevice;
 
   return (
     <div className="app">
@@ -117,7 +168,11 @@ export default function App() {
               min={5}
               max={60}
               value={settings.wpm}
-              onChange={(e) => api.setSpeed(Number(e.target.value))}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                patch("wpm", v);
+                api.setSpeed(v);
+              }}
             />
             <div className="field" style={{ marginTop: 8, marginBottom: 8 }}>
               <label>Weight: {settings.weight}%</label>
@@ -126,16 +181,17 @@ export default function App() {
                 min={25}
                 max={75}
                 value={settings.weight}
-                onChange={(e) => api.setWeight(Number(e.target.value))}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  patch("weight", v);
+                  api.setWeight(v);
+                }}
               />
             </div>
             <div className="row" style={{ gap: 8 }}>
               <div className="field" style={{ flex: 1, marginBottom: 0 }}>
                 <label>Mode</label>
-                <select
-                  value={settings.mode}
-                  onChange={(e) => api.setMode(e.target.value)}
-                >
+                <select value={settings.mode} onChange={(e) => { patch("mode", e.target.value); api.setMode(e.target.value); }}>
                   {MODES.map(([val, label]) => (
                     <option key={val} value={val}>
                       {label}
@@ -147,7 +203,7 @@ export default function App() {
                 <input
                   type="checkbox"
                   checked={settings.paddleReverse}
-                  onChange={(e) => api.setPaddleReverse(e.target.checked)}
+                  onChange={(e) => { patch("paddleReverse", e.target.checked); api.setPaddleReverse(e.target.checked); }}
                 />
                 Reverse
               </label>
@@ -158,6 +214,40 @@ export default function App() {
           <div className="panel">
             <h3>Sidetone</h3>
             <div className="field" style={{ marginBottom: 8 }}>
+              <label className="row spread">
+                <span>Device</span>
+                {!IS_WINDOWS && (
+                  <button className="mini" onClick={() => api.refreshAudioDevices()}>
+                    Refresh
+                  </button>
+                )}
+              </label>
+              <select
+                value={audioValue}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  // "" -> off; a name equal to the default device -> null (follow default);
+                  // any other name -> that device.
+                  const device = v === "" ? "" : v === defaultDevice ? null : v;
+                  patch("audioDevice", device);
+                  api.selectAudioDevice(device);
+                }}
+              >
+                <option value="">(None — sidetone off)</option>
+                {audioDevices.map((d) => (
+                  <option key={d.name} value={d.name}>
+                    {d.isDefault ? `${d.name} (default)` : d.name}
+                  </option>
+                ))}
+                {/* keep a stale named selection visible until the next refresh */}
+                {settings.audioDevice &&
+                  !audioDevices.some((d) => d.name === settings.audioDevice) && (
+                    <option value={settings.audioDevice}>{settings.audioDevice}</option>
+                  )}
+              </select>
+              <ErrorLine msg={errors.audio} />
+            </div>
+            <div className="field" style={{ marginBottom: 8 }}>
               <label>Frequency: {settings.toneHz} Hz</label>
               <input
                 type="range"
@@ -165,7 +255,11 @@ export default function App() {
                 max={1200}
                 step={10}
                 value={settings.toneHz}
-                onChange={(e) => api.setToneFrequency(Number(e.target.value))}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  patch("toneHz", v);
+                  api.setToneFrequency(v);
+                }}
               />
             </div>
             <div className="field" style={{ marginBottom: 0 }}>
@@ -175,7 +269,11 @@ export default function App() {
                 min={0}
                 max={100}
                 value={settings.toneVolume}
-                onChange={(e) => api.setToneVolume(Number(e.target.value))}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  patch("toneVolume", v);
+                  api.setToneVolume(v);
+                }}
               />
             </div>
           </div>
@@ -183,53 +281,50 @@ export default function App() {
 
         {/* ─── Serial ports (the three I/O legs) ───────── */}
         <div className="panel">
-          <h3>Serial Ports</h3>
+          <div className="row spread" style={{ marginBottom: 8 }}>
+            <h3 style={{ margin: 0 }}>Serial Ports</h3>
+            {!IS_WINDOWS && (
+              <button className="mini" onClick={() => api.serialPorts().then(setPorts)}>
+                Refresh
+              </button>
+            )}
+          </div>
           <div className="ports">
             <PortSelect
               label="Paddle input"
               value={settings.paddlePort}
               ports={ports}
-              onChange={(p) => api.selectPaddlePort(p)}
+              error={errors.paddle}
+              exclude={[settings.loggerPort, settings.keyingPort]}
+              onChange={(p) => { patch("paddlePort", p); api.selectPaddlePort(p); }}
             />
-            <div className="field" style={{ marginBottom: 0 }}>
-              <label className="row spread">
-                <span>Logger (WinKeyer)</span>
-                <label className="row toggle" style={{ gap: 4 }}>
-                  <input
-                    type="checkbox"
-                    checked={settings.loggerEnabled}
-                    onChange={(e) => api.setLoggerEnabled(e.target.checked)}
-                  />
-                  on
-                </label>
-              </label>
-              <select
-                value={settings.loggerPort || ""}
-                disabled={!settings.loggerEnabled}
-                onChange={(e) => api.selectLoggerPort(e.target.value || null)}
-              >
-                <option value="">(None)</option>
-                {portOptions(ports, settings.loggerPort, [settings.paddlePort, settings.keyingPort])}
-              </select>
-            </div>
+            <PortSelect
+              label="Logger Input (WinKeyer)"
+              value={settings.loggerPort}
+              ports={ports}
+              error={errors.logger}
+              exclude={[settings.paddlePort, settings.keyingPort]}
+              onChange={(p) => { patch("loggerPort", p); api.selectLoggerPort(p); }}
+            />
             <PortSelect
               label="Keying output"
               value={settings.keyingPort}
               ports={ports}
+              error={errors.keying}
               exclude={[settings.paddlePort, settings.loggerPort]}
-              onChange={(p) => api.selectKeyingPort(p)}
+              onChange={(p) => { patch("keyingPort", p); api.selectKeyingPort(p); }}
             />
             <div className="row" style={{ gap: 8 }}>
               <div className="field" style={{ flex: 1, marginBottom: 0 }}>
                 <label>Key line</label>
-                <select value={settings.keyLine} onChange={(e) => api.setKeyLine(e.target.value)}>
+                <select value={settings.keyLine} onChange={(e) => { patch("keyLine", e.target.value); api.setKeyLine(e.target.value); }}>
                   <option value="dtr">DTR</option>
                   <option value="rts">RTS</option>
                 </select>
               </div>
               <div className="field" style={{ flex: 1, marginBottom: 0 }}>
                 <label>PTT line</label>
-                <select value={settings.pttLine} onChange={(e) => api.setPttLine(e.target.value)}>
+                <select value={settings.pttLine} onChange={(e) => { patch("pttLine", e.target.value); api.setPttLine(e.target.value); }}>
                   <option value="none">None</option>
                   <option value="rts">RTS</option>
                   <option value="dtr">DTR</option>
@@ -257,19 +352,26 @@ export default function App() {
           <div className="row" style={{ marginTop: 8, gap: 6 }}>
             <input
               type="text"
-              placeholder="Type CW (sent as you type)…"
-              onKeyPress={onTypeAheadKey}
+              placeholder="Type or paste CW (sent as entered) — ESC to stop…"
+              value={typeAhead}
+              onChange={onTypeAheadChange}
+              onKeyDown={onTypeAheadKey}
               style={{ flex: 1 }}
             />
             <button onClick={() => api.testTx()}>Test</button>
           </div>
         </div>
 
-        {showLog && (
-          <div className="panel log">
-            {log.length === 0 ? "(no messages yet)" : log.join("\n")}
+        {/* ─── Log (10-line scrollable) ────────────────── */}
+        <div className="panel">
+          <div className="row spread" style={{ marginBottom: 6 }}>
+            <h3 style={{ margin: 0 }}>Log</h3>
+            <button className="mini" onClick={() => setLog([])}>
+              Clear
+            </button>
           </div>
-        )}
+          <LogView lines={log} />
+        </div>
       </div>
 
       {/* ─── Status strip ──────────────────────────────── */}
@@ -278,9 +380,6 @@ export default function App() {
         <Led label="PTT" on={pttOn} color="var(--ptt-on)" />
         <Led label="SEND" on={sending} color="var(--accent)" />
         <span className="spring" />
-        <button className="linklike" onClick={() => setShowLog((v) => !v)}>
-          {showLog ? "Hide log" : "Log"}
-        </button>
       </div>
 
       {editing && (
@@ -297,9 +396,25 @@ export default function App() {
   );
 }
 
-// Renders <option>s for a port <select>: always (None), the live ports, plus the current
-// value if it is somehow absent (so a mid-removal render never loses the label). `exclude`
-// hides ports already chosen for another leg, but never hides the current value.
+// A scrolling, read-only 10-line log. Auto-sticks to the bottom as new lines arrive.
+function LogView({ lines }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [lines]);
+  return (
+    <textarea className="log" ref={ref} readOnly rows={10} value={lines.join("\n")} />
+  );
+}
+
+function ErrorLine({ msg }) {
+  if (!msg) return null;
+  return <div className="err">{msg}</div>;
+}
+
+// Renders <option>s for a port <select>: always (None), the live ports, minus any excluded
+// (chosen for another leg), plus the current value if absent so it never loses the label.
 function portOptions(ports, value, exclude = []) {
   const ex = exclude.filter((p) => p && p !== value);
   const list = ports.filter((p) => !ex.includes(p));
@@ -311,7 +426,7 @@ function portOptions(ports, value, exclude = []) {
   ));
 }
 
-function PortSelect({ label, value, ports, exclude = [], onChange }) {
+function PortSelect({ label, value, ports, exclude = [], error, onChange }) {
   return (
     <div className="field" style={{ marginBottom: 0 }}>
       <label>{label}</label>
@@ -319,6 +434,7 @@ function PortSelect({ label, value, ports, exclude = [], onChange }) {
         <option value="">(None)</option>
         {portOptions(ports, value, exclude)}
       </select>
+      <ErrorLine msg={error} />
     </div>
   );
 }
