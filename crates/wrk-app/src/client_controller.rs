@@ -406,14 +406,15 @@ impl ClientController {
             Sidetone::spawn(settings.tone_hz, settings.tone_volume, device, Arc::clone(&shared));
         *shared.sidetone.lock().unwrap() = Some(sidetone);
 
-        // The single send-worker thread drains the type-ahead / macro buffer with real CW
-        // timing. Spawned once for the controller's life.
-        spawn_send_worker(Arc::clone(&shared));
-
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
+
+        // The single send-worker thread drains the type-ahead / macro buffer with real CW
+        // timing. It uses the controller's multi-thread runtime handle so the fire-and-forget
+        // tunnel sends in `drive_edge` run on a real worker thread — never blocking the keyer.
+        spawn_send_worker(Arc::clone(&shared), runtime.handle().clone());
 
         let controller = Self { shared, runtime, _clock: Arc::new(MonotonicClock) };
         // Open whatever persisted ports are present right now.
@@ -773,46 +774,63 @@ impl ClientController {
     }
 }
 
-/// The operating-position LAN flow: bind the WireGuard socket, broadcast the beacon with that
-/// port, and wait for a radio site to initiate. On success, bring the keying edge up over the
-/// resulting tunnel. Runs as one task; aborting it (unpair) stops both the beacon and the wait.
+/// The operating-position LAN flow: a **persistent responder**. The operator arms it once
+/// (Advertise); it then keeps answering radio sites until unpaired. Each cycle binds a fresh
+/// WireGuard socket, broadcasts the beacon with that port, waits for a picker to initiate, and
+/// brings the keying edge up. When that session is superseded by the next picker (or the link
+/// is retried), the loop re-binds and re-advertises — so the keyer reconnects without the
+/// operator touching Advertise again. The radio site resolves the keyer's *current* port from
+/// the live beacon at connect time, so the re-bound port is never stale.
+///
+/// Runs as one task; aborting it (unpair) stops the beacon and the wait. The beacon stops only
+/// while a handshake is being completed, then resumes for the next picker.
 async fn lan_advertise_and_await(shared: Arc<Shared>, callsign: String, keyer_id: String) {
-    // 1. Bind the WireGuard socket up front so the beacon can advertise its port.
-    let (socket, wg_port) = match tunnel::lan_bind().await {
-        Ok(pair) => pair,
-        Err(e) => return fail(&shared, format!("LAN bind failed: {e}")),
-    };
     let identity = match shared.config.lock().unwrap().identity.to_identity() {
         Ok(id) => id,
         Err(e) => return fail(&shared, format!("identity error: {e}")),
     };
 
-    // 2. Broadcast the beacon until a picker connects.
-    let beacon = Beacon {
-        callsign,
-        keyer_id,
-        public_key: identity.public_bytes(),
-        wg_port,
-    };
-    let advertiser = match LanAdvertiser::new(beacon) {
-        Ok(a) => a,
-        Err(e) => return fail(&shared, format!("LAN advertise failed: {e}")),
-    };
-    let beacon_task = tokio::spawn(advertiser.run());
+    loop {
+        // 1. Bind a fresh WireGuard socket for this cycle so the beacon advertises a live port.
+        let (socket, wg_port) = match tunnel::lan_bind().await {
+            Ok(pair) => pair,
+            Err(e) => return fail(&shared, format!("LAN bind failed: {e}")),
+        };
 
-    // 3. Wait for a radio site to pick us and complete the handshake (we are the responder).
-    let connected = match tunnel::lan_await_initiator(socket, &identity).await {
-        Ok(c) => c,
-        Err(e) => {
-            beacon_task.abort();
-            return fail(&shared, format!("LAN pairing failed: {e}"));
-        }
-    };
-    // Paired: stop advertising so we drop off other radio sites' lists.
-    beacon_task.abort();
-    shared.emit(ClientEvent::Advertising { active: false });
+        // 2. Broadcast the beacon until a picker connects.
+        let beacon = Beacon {
+            callsign: callsign.clone(),
+            keyer_id: keyer_id.clone(),
+            public_key: identity.public_bytes(),
+            wg_port,
+        };
+        let advertiser = match LanAdvertiser::new(beacon) {
+            Ok(a) => a,
+            Err(e) => return fail(&shared, format!("LAN advertise failed: {e}")),
+        };
+        let beacon_task = tokio::spawn(advertiser.run());
+        shared.emit(ClientEvent::Advertising { active: true });
 
-    bring_up_keying(&shared, connected).await;
+        // 3. Wait for a radio site to pick us and complete the handshake (we are the responder).
+        let connected = match tunnel::lan_await_initiator(socket, &identity).await {
+            Ok(c) => c,
+            Err(e) => {
+                beacon_task.abort();
+                // A timeout or socket error on this cycle: log and re-arm rather than giving
+                // up, so a transient hiccup does not silently stop the keyer responding.
+                shared.log("warn", format!("LAN listen cycle ended: {e}; re-advertising."));
+                continue;
+            }
+        };
+        // Handshaking: stop this cycle's beacon so we are not picked twice mid-handshake.
+        beacon_task.abort();
+        shared.emit(ClientEvent::Advertising { active: false });
+
+        // 4. Bring the keying edge up. This installs the session (replacing any prior one,
+        //    which is dropped and torn down), then returns; we loop to re-advertise so the
+        //    next reconnect from the radio site is answered.
+        bring_up_keying(&shared, connected).await;
+    }
 }
 
 /// Shared tail of both the WAN and LAN connect paths: start the session, open the keying edge
@@ -838,10 +856,11 @@ async fn bring_up_keying(shared: &Arc<Shared>, connected: tunnel::Connected) {
 
     *shared.transport.lock().unwrap() = Some(edge);
     *shared.session.lock().await = Some(session);
-    {
-        let mut epoch = shared.epoch.lock().unwrap();
-        *epoch = epoch.wrapping_add(1);
-    }
+    // The epoch is intentionally NOT bumped here. Both edge sources (the paddle poller and
+    // the type-ahead send worker) sample `shared.epoch` independently, so a bump would make
+    // them disagree and the Server would F4 whichever source sent second. The server adopts
+    // the first frame's epoch of each fresh session and re-anchors on reconnect, so a stable
+    // epoch is both correct and necessary.
     shared.emit(ClientEvent::Connection { state: "connected".into(), path: path.clone() });
     shared.log("info", format!("Paired with the Server over the {path} path."));
 }
@@ -885,6 +904,9 @@ fn drive_edge(
     key_down: bool,
     timestamp_ticks: u64,
 ) {
+    // Local keying — sidetone, the UI indicator, and the local key line — happens
+    // immediately and NEVER waits on the network, so the operator always hears clean CW even
+    // if the tunnel stalls.
     if let Some(tone) = tone {
         tone.key(key_down);
     }
@@ -892,11 +914,19 @@ fn drive_edge(
         let _ = out.apply(key_down, false);
     }
     shared.emit(ClientEvent::KeyState { down: key_down });
+
+    // The tunnel send is fire-and-forget: spawn it on the controller's multi-thread runtime
+    // and move on. Blocking the keyer thread on the send (as a `block_on` did) would couple
+    // CW timing to the tunnel and — on a stalled/backed-up link — leave the key latched down
+    // between the key-down edge and its key-up. The edge frame already carries its own
+    // timestamp, so the Station reconstructs spacing regardless of send-path jitter.
     let transport = shared.transport.lock().unwrap().clone();
     if let Some(transport) = transport {
         let event = EdgeEvent { timestamp_ticks, key_down, source: EdgeSource::Paddle };
         let frame = sender.frame_for(event);
-        let _ = rt.block_on(async { transport.send_frame(&frame).await });
+        rt.spawn(async move {
+            let _ = transport.send_frame(&frame).await;
+        });
     }
 }
 
@@ -906,20 +936,10 @@ fn drive_edge(
 /// continuous CW element stream through [`drive_edge`] (sidetone + local key line + UI + the
 /// tunnel) with correct element/character/word spacing. An abort (ESC) drops the queue and the
 /// in-progress schedule immediately; characters typed during a send chain on seamlessly.
-fn spawn_send_worker(shared: Arc<Shared>) {
+fn spawn_send_worker(shared: Arc<Shared>, rt: tokio::runtime::Handle) {
     std::thread::Builder::new()
         .name("wrk-sender".into())
-        .spawn(move || {
-            // The runtime handle is created after the controller spawns this thread, so the
-            // worker uses its own current-thread handle for the (rare) tunnel send: we instead
-            // use a dedicated single-thread runtime so `drive_edge`'s block_on works off the
-            // UI/tokio threads.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("send-worker runtime");
-            send_worker(&shared, rt.handle());
-        })
+        .spawn(move || send_worker(&shared, &rt))
         .expect("spawn send worker");
 }
 
