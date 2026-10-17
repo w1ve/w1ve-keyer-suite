@@ -291,6 +291,14 @@ struct Shared {
     sidetone: Mutex<Option<Sidetone>>,
     keying: Mutex<Option<SerialKeyingOutput>>,
     transport: Mutex<Option<Arc<EdgeTransport>>>,
+    /// Ordered, non-blocking outbound frame queue to the tunnel. `drive_edge` pushes finished
+    /// frames here; a single drain task (spawned per session in `bring_up_keying`) sends them
+    /// over the transport **in order**. This replaces a spawn-per-edge send, which did not
+    /// preserve order: at high WPM (~30ms elements) concurrent send tasks could reorder
+    /// datagrams, and the Station's sequence tracker then discarded the "old" sequence as a
+    /// duplicate — so keying stopped above ~39 WPM. One FIFO channel keeps edges ordered and
+    /// never blocks the time-critical keyer thread.
+    frame_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<rwk_core::protocol::edge::RwkPaddleFrame>>>,
     epoch: Mutex<u16>,
     paddle: Mutex<Option<PaddlePollerHandle>>,
     /// The type-ahead / macro send buffer, drained by the single send-worker thread.
@@ -391,6 +399,7 @@ impl ClientController {
             sidetone: Mutex::new(None),
             keying: Mutex::new(None),
             transport: Mutex::new(None),
+            frame_tx: Mutex::new(None),
             epoch: Mutex::new(1),
             paddle: Mutex::new(None),
             send: SendBuffer::default(),
@@ -758,6 +767,9 @@ impl ClientController {
 
     pub fn disconnect(&self) {
         *self.shared.transport.lock().unwrap() = None;
+        // Drop the outbound frame sender so the per-session drain task sees the channel close
+        // and exits; the next pairing installs a fresh channel + drain task.
+        *self.shared.frame_tx.lock().unwrap() = None;
         let shared = Arc::clone(&self.shared);
         self.runtime.block_on(async move {
             if let Some(task) = shared.advertise.lock().await.take() {
@@ -854,7 +866,21 @@ async fn bring_up_keying(shared: &Arc<Shared>, connected: tunnel::Connected) {
     );
     edge.set_peer(peer).await;
 
-    *shared.transport.lock().unwrap() = Some(edge);
+    *shared.transport.lock().unwrap() = Some(Arc::clone(&edge));
+
+    // Spawn the ordered outbound drain task: it owns the receive half of the frame queue and
+    // sends each frame over the tunnel in FIFO order. drive_edge only ever pushes into the
+    // sender half, so the time-critical keyer thread never touches the network and datagrams
+    // leave in the exact order they were keyed.
+    let (frame_tx, mut frame_rx) =
+        tokio::sync::mpsc::unbounded_channel::<rwk_core::protocol::edge::RwkPaddleFrame>();
+    *shared.frame_tx.lock().unwrap() = Some(frame_tx);
+    tokio::spawn(async move {
+        while let Some(frame) = frame_rx.recv().await {
+            let _ = edge.send_frame(&frame).await;
+        }
+    });
+
     *shared.session.lock().await = Some(session);
     // The epoch is intentionally NOT bumped here. Both edge sources (the paddle poller and
     // the type-ahead send worker) sample `shared.epoch` independently, so a bump would make
@@ -915,19 +941,16 @@ fn drive_edge(
     }
     shared.emit(ClientEvent::KeyState { down: key_down });
 
-    // The tunnel send is fire-and-forget: spawn it on the controller's multi-thread runtime
-    // and move on. Blocking the keyer thread on the send (as a `block_on` did) would couple
-    // CW timing to the tunnel and — on a stalled/backed-up link — leave the key latched down
-    // between the key-down edge and its key-up. The edge frame already carries its own
-    // timestamp, so the Station reconstructs spacing regardless of send-path jitter.
-    let transport = shared.transport.lock().unwrap().clone();
-    if let Some(transport) = transport {
-        let event = EdgeEvent { timestamp_ticks, key_down, source: EdgeSource::Paddle };
-        let frame = sender.frame_for(event);
-        rt.spawn(async move {
-            let _ = transport.send_frame(&frame).await;
-        });
+    // Hand the frame to the ordered outbound queue (non-blocking, FIFO). A single drain task
+    // sends them over the tunnel in order, so the keyer thread never waits on the network and
+    // datagrams never reorder — the latter is what broke keying above ~39 WPM. The frame
+    // carries its own timestamp, so the Station reconstructs spacing regardless of send jitter.
+    let event = EdgeEvent { timestamp_ticks, key_down, source: EdgeSource::Paddle };
+    let frame = sender.frame_for(event);
+    if let Some(tx) = shared.frame_tx.lock().unwrap().as_ref() {
+        let _ = tx.send(frame);
     }
+    let _ = rt;
 }
 
 // ─── Send worker: drains the type-ahead / macro buffer with real CW timing ─────
