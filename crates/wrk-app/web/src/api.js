@@ -41,6 +41,7 @@ export const serverApi = {
   selectLoggerPort: (port) => invoke("s_select_logger_port", { port }),
   setKeyLine: (line) => invoke("s_set_key_line", { line }),
   setPttLine: (line) => invoke("s_set_ptt_line", { line }),
+  setPttHang: (ms) => invoke("s_set_ptt_hang", { ms }),
   setTransport: (transport) => invoke("s_set_transport", { transport }),
   setRelay: (relay) => invoke("s_set_relay", { relay }),
   regenerateToken: () => invoke("s_regenerate_token"),

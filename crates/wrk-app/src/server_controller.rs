@@ -17,7 +17,7 @@ use rwk_core::engine::network::EdgeTransport;
 use rwk_core::engine::keying_arbiter::{KeyingArbiter, LineObserver, LineUpdate};
 use rwk_core::engine::replay::{spawn_driver, EdgeJitterProfile, KeyingOutput, SerialKeyingAdapter};
 use rwk_core::engine::serial::{
-    enumerate_ports, natural_port_key, KeyingOutputConfig, SerialKeyingOutput,
+    enumerate_ports, natural_port_key, KeyingOutputConfig, PttTiming, SerialKeyingOutput,
 };
 use rwk_core::engine::session::Session;
 use rwk_core::engine::tunnel;
@@ -56,6 +56,7 @@ pub enum ServerEvent {
         relay: String,
         token: String,
         logger_port: Option<String>,
+        ptt_hang_ms: u64,
     },
     /// The Player's logger input is sending CW (`true`) or idle (`false`).
     LoggerSending { active: bool },
@@ -82,12 +83,30 @@ pub struct LanPeerView {
 /// A sink the host (Tauri) registers for [`ServerEvent`]s.
 pub type EventSink = Arc<dyn Fn(ServerEvent) + Send + Sync>;
 
+/// The PTT hang time (held after key-up) the UI offers: 75 to 600 ms, 200 ms by default.
+pub const PTT_HANG_MIN_MS: u32 = 75;
+pub const PTT_HANG_MAX_MS: u32 = 600;
+const PTT_HANG_DEFAULT_MS: u64 = 200;
+
+/// Clamps a requested PTT hang time to the range the UI offers.
+fn clamp_ptt_hang(ms: u32) -> u32 {
+    ms.clamp(PTT_HANG_MIN_MS, PTT_HANG_MAX_MS)
+}
+
+/// The PTT line to drive, or `None` when it would share the key's line. Key and PTT must be
+/// on different control lines, so a duplicate is dropped rather than driven from one pin.
+fn ptt_line_for(key: KeyingLine, ptt: Option<KeyingLine>) -> Option<KeyingLine> {
+    ptt.filter(|p| *p != key)
+}
+
 #[derive(Debug, Clone)]
 struct Settings {
     keying_port: Option<String>,
     logger_port: Option<String>,
     key_line: KeyingLine,
     ptt_line: Option<KeyingLine>,
+    /// How long PTT is held after key-up, in ms (see [`PTT_HANG_MIN_MS`]).
+    ptt_hang_ms: u64,
     transport: Transport,
     relay: String,
     /// The pairing token the Server generated for this run (shown so the Client can enter it).
@@ -101,6 +120,7 @@ impl Default for Settings {
             logger_port: None,
             key_line: KeyingLine::Dtr,
             ptt_line: Some(KeyingLine::Rts),
+            ptt_hang_ms: PTT_HANG_DEFAULT_MS,
             transport: Transport::Wan,
             relay: pairing::DEFAULT_WAN_RELAY.to_string(),
             token: pairing::generate_token(),
@@ -159,6 +179,7 @@ impl Shared {
             relay: s.relay.clone(),
             token: s.token.clone(),
             logger_port: s.logger_port.clone(),
+            ptt_hang_ms: s.ptt_hang_ms,
         });
     }
 
@@ -386,17 +407,27 @@ impl ServerController {
         // Release the old logger and arbiter before the new ones claim their ports.
         active.logger = None;
         active._arbiter = None;
+        // `abort()` only requests cancellation. Wait until the pump has actually finished: that
+        // drops its DriverHandle (joining the replay threads) and the serial output it owns.
+        // Opening the same port before then fails, and the Player would silently fall back to
+        // LED-only keying, so no code reaches the radio.
+        let _ = self.runtime.block_on(&mut active.pump);
 
         self.shared.log("info", "Applying keying output change…");
-        let (pump, stop_bus, logger, arbiter) = start_replay_driver(
-            &self.shared,
-            &active.edge,
-            &active.clock,
-            &keying_port,
-            key_line,
-            ptt_line,
-            &logger_port,
-        );
+        // The edge pump is spawned with `tokio::spawn`, which needs a runtime context; this
+        // rebind runs on a Tauri command thread, so enter the runtime for the new driver only.
+        let (pump, stop_bus, logger, arbiter) = {
+            let _runtime = self.runtime.enter();
+            start_replay_driver(
+                &self.shared,
+                &active.edge,
+                &active.clock,
+                &keying_port,
+                key_line,
+                ptt_line,
+                &logger_port,
+            )
+        };
         active.pump = pump;
         active.stop_bus = stop_bus;
         active.logger = logger;
@@ -404,15 +435,46 @@ impl ServerController {
     }
 
     pub fn set_key_line(&self, line: &str) {
-        self.shared.settings.lock().unwrap().key_line = parse_line(line).unwrap_or(KeyingLine::Dtr);
+        let key = parse_line(line).unwrap_or(KeyingLine::Dtr);
+        let ptt = self.shared.settings.lock().unwrap().ptt_line;
+        if ptt == Some(key) {
+            self.shared.fail(
+                control::KEYING,
+                format!("{} is the PTT line", line_name(key).to_uppercase()),
+                format!("Key and PTT must be on different lines; {} is already the PTT line.", line_name(key).to_uppercase()),
+            );
+            return;
+        }
+        self.shared.settings.lock().unwrap().key_line = key;
+        self.shared.clear_error(control::KEYING);
         self.shared.emit_settings();
         self.rebind_keying_output();
     }
 
     pub fn set_ptt_line(&self, line: &str) {
-        self.shared.settings.lock().unwrap().ptt_line = parse_line(line);
+        let ptt = parse_line(line);
+        let key = self.shared.settings.lock().unwrap().key_line;
+        if ptt == Some(key) {
+            self.shared.fail(
+                control::KEYING,
+                format!("{} is the key line", line_name(key).to_uppercase()),
+                format!("Key and PTT must be on different lines; {} is already the key line.", line_name(key).to_uppercase()),
+            );
+            return;
+        }
+        self.shared.settings.lock().unwrap().ptt_line = ptt;
+        self.shared.clear_error(control::KEYING);
         self.shared.emit_settings();
         self.rebind_keying_output();
+    }
+
+    /// Sets the PTT hang time, clamped to [`PTT_HANG_MIN_MS`]..=[`PTT_HANG_MAX_MS`]. The value is
+    /// read when the replay driver is created, so it takes effect on the next connect. Rebuilding
+    /// the live driver on every slider move is what broke keying, so it is not done here.
+    pub fn set_ptt_hang(&self, ms: u32) {
+        let ms = clamp_ptt_hang(ms);
+        self.shared.settings.lock().unwrap().ptt_hang_ms = u64::from(ms);
+        self.shared.emit_settings();
     }
 
     pub fn set_transport(&self, transport: &str) {
@@ -745,6 +807,10 @@ fn start_replay_driver(
     Option<LoggerHost>,
     Option<Arc<KeyingArbiter>>,
 ) {
+    // Key and PTT must be on different control lines. A duplicate is ignored here (the setters
+    // refuse it too) so the same pin is never driven by both.
+    let ptt_line = ptt_line_for(key_line, ptt_line);
+
     let serial: Option<SerialKeyingOutput> = match keying_port {
         Some(port_name) => {
             let cfg = KeyingOutputConfig {
@@ -778,7 +844,13 @@ fn start_replay_driver(
         }
     };
 
-    let mut replayer = tunnel_replayer(clock.as_ref(), EdgeJitterProfile::PathAdaptive, None);
+    // PTT sequencing: the replayer asserts PTT just ahead of each keyed edge and holds it for the
+    // hang time after key-up. With no PTT line there is nothing to sequence, so pass None.
+    let ptt_timing = ptt_line.map(|_| PttTiming {
+        tail: std::time::Duration::from_millis(shared.settings.lock().unwrap().ptt_hang_ms),
+        ..PttTiming::default()
+    });
+    let mut replayer = tunnel_replayer(clock.as_ref(), EdgeJitterProfile::PathAdaptive, ptt_timing);
     replayer.begin_session(1);
 
     let bus = EventBus::new();
@@ -953,5 +1025,24 @@ fn line_name(line: KeyingLine) -> &'static str {
         KeyingLine::Dtr => "dtr",
         KeyingLine::Rts => "rts",
         KeyingLine::None => "none",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hang_is_clamped_to_the_ui_range() {
+        assert_eq!(clamp_ptt_hang(0), PTT_HANG_MIN_MS);
+        assert_eq!(clamp_ptt_hang(200), 200);
+        assert_eq!(clamp_ptt_hang(10_000), PTT_HANG_MAX_MS);
+    }
+
+    #[test]
+    fn ptt_never_shares_the_key_line() {
+        assert_eq!(ptt_line_for(KeyingLine::Dtr, Some(KeyingLine::Dtr)), None);
+        assert_eq!(ptt_line_for(KeyingLine::Dtr, Some(KeyingLine::Rts)), Some(KeyingLine::Rts));
+        assert_eq!(ptt_line_for(KeyingLine::Dtr, None), None);
     }
 }

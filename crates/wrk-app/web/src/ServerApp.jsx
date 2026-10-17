@@ -12,6 +12,7 @@ export default function ServerApp() {
     loggerPort: null,
     keyLine: "dtr",
     pttLine: "rts",
+    pttHangMs: 200,
     transport: "wan",
     relay: "",
     token: "",
@@ -36,6 +37,7 @@ export default function ServerApp() {
             loggerPort: ev.logger_port,
             keyLine: ev.key_line,
             pttLine: ev.ptt_line,
+            pttHangMs: ev.ptt_hang_ms,
             transport: ev.transport,
             relay: ev.relay,
             token: ev.token,
@@ -187,8 +189,8 @@ export default function ServerApp() {
                     value={settings.keyLine}
                     onChange={(e) => api.setKeyLine(e.target.value)}
                   >
-                    <option value="dtr">DTR</option>
-                    <option value="rts">RTS</option>
+                    <option value="dtr" disabled={settings.pttLine === "dtr"}>DTR</option>
+                    <option value="rts" disabled={settings.pttLine === "rts"}>RTS</option>
                   </select>
                 </div>
                 <div className="field" style={{ flex: 1, marginBottom: 0 }}>
@@ -197,10 +199,24 @@ export default function ServerApp() {
                     value={settings.pttLine}
                     onChange={(e) => api.setPttLine(e.target.value)}
                   >
-                    <option value="rts">RTS</option>
-                    <option value="dtr">DTR</option>
+                    <option value="rts" disabled={settings.keyLine === "rts"}>RTS</option>
+                    <option value="dtr" disabled={settings.keyLine === "dtr"}>DTR</option>
                     <option value="none">None</option>
                   </select>
+                  <label style={{ marginTop: 8 }}>PTT hang: {settings.pttHangMs} ms</label>
+                  <input
+                    type="range"
+                    min={75}
+                    max={600}
+                    step={5}
+                    value={settings.pttHangMs}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setSettings((s) => ({ ...s, pttHangMs: v }));
+                    }}
+                    onPointerUp={(e) => api.setPttHang(Number(e.currentTarget.value))}
+                    onKeyUp={(e) => api.setPttHang(Number(e.currentTarget.value))}
+                  />
                 </div>
               </div>
             </div>

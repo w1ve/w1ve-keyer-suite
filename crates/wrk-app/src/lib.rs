@@ -259,6 +259,7 @@ pub fn run_server() {
             s_select_logger_port,
             s_set_key_line,
             s_set_ptt_line,
+            s_set_ptt_hang,
             s_set_transport,
             s_set_relay,
             s_regenerate_token,
@@ -300,6 +301,10 @@ fn s_set_key_line(state: State<'_, ServerState>, line: String) {
 #[tauri::command]
 fn s_set_ptt_line(state: State<'_, ServerState>, line: String) {
     state.controller.set_ptt_line(&line);
+}
+#[tauri::command]
+fn s_set_ptt_hang(state: State<'_, ServerState>, ms: u32) {
+    state.controller.set_ptt_hang(ms);
 }
 #[tauri::command]
 fn s_set_transport(state: State<'_, ServerState>, transport: String) {
