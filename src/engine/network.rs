@@ -58,6 +58,25 @@ pub const MAX_DATAGRAM: usize = 2048;
 /// format**, which keeps interop with the existing apps and the C# intact.
 pub const EDGE_HEARTBEAT_MAGIC: [u8; 4] = *b"RWKH";
 
+/// Magic bytes of an **edge ping**: `RWKP` followed by an 8-byte big-endian send stamp (nanoseconds
+/// on the sender's own monotonic clock). The receiver answers with an [`EDGE_PONG_MAGIC`] datagram
+/// that echoes the stamp, so the sender measures the round trip on its own clock alone.
+pub const EDGE_PING_MAGIC: [u8; 4] = *b"RWKP";
+
+/// Magic bytes of an **edge pong**: the reply to a ping, echoing its stamp.
+pub const EDGE_PONG_MAGIC: [u8; 4] = *b"RWKQ";
+
+/// Length of a ping or pong: the 4 magic bytes and the 8-byte stamp.
+const CONTROL_LEN: usize = 12;
+
+/// Nanoseconds on this process's monotonic clock. Only differences are meaningful, so the origin
+/// is arbitrary (the first call); a ping and its pong are always compared on the same host.
+fn monotonic_nanos() -> u64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let origin = ORIGIN.get_or_init(std::time::Instant::now);
+    u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// One datagram received on the edge channel, classified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeInbound {
@@ -65,6 +84,8 @@ pub enum EdgeInbound {
     Frame(Vec<u8>),
     /// A liveness heartbeat from the peer. Carries no keying; it only proves the peer is up.
     Heartbeat,
+    /// A ping was answered or a pong recorded: transport control traffic with nothing to replay.
+    Control,
 }
 
 /// Maximum size of a single forwarded UDP datagram.
@@ -276,6 +297,8 @@ pub struct EdgeTransport {
     peer: Mutex<Option<SocketAddr>>,
     stats: Arc<EdgeStats>,
     health: PathHealth,
+    /// The latest round-trip time in nanoseconds, from a pong. `0` means no sample yet.
+    rtt_nanos: AtomicU64,
 }
 
 impl EdgeTransport {
@@ -308,6 +331,7 @@ impl EdgeTransport {
             peer: Mutex::new(None),
             stats: Arc::new(EdgeStats::default()),
             health: PathHealth::new(),
+            rtt_nanos: AtomicU64::new(0),
         }
     }
 
@@ -399,7 +423,38 @@ impl EdgeTransport {
             self.stats.drop_no_peer.fetch_add(1, Ordering::Relaxed);
             return Ok(0);
         };
-        match self.link.send_to(&EDGE_HEARTBEAT_MAGIC, peer).await {
+        self.send_control(&EDGE_HEARTBEAT_MAGIC, peer).await
+    }
+
+    /// The latest round-trip time to the peer, measured from a pong. [`None`] until the first pong.
+    #[must_use]
+    pub fn rtt(&self) -> Option<Duration> {
+        match self.rtt_nanos.load(Ordering::Relaxed) {
+            0 => None,
+            nanos => Some(Duration::from_nanos(nanos)),
+        }
+    }
+
+    /// Sends an edge ping stamped with this host's monotonic time. The peer answers with a pong,
+    /// which sets [`Self::rtt`] when it arrives. Like a heartbeat, a no-op returning `0` without a peer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `std::io::Error` if the datagram cannot be sent.
+    pub async fn send_ping(&self) -> Result<usize> {
+        let Some(peer) = self.peer().await else {
+            self.stats.drop_no_peer.fetch_add(1, Ordering::Relaxed);
+            return Ok(0);
+        };
+        let mut ping = [0u8; CONTROL_LEN];
+        ping[..4].copy_from_slice(&EDGE_PING_MAGIC);
+        ping[4..].copy_from_slice(&monotonic_nanos().to_be_bytes());
+        self.send_control(&ping, peer).await
+    }
+
+    /// Sends a control datagram, feeding the same statistics and [`PathHealth`] accounting as a frame.
+    async fn send_control(&self, datagram: &[u8], peer: SocketAddr) -> Result<usize> {
+        match self.link.send_to(datagram, peer).await {
             Ok(n) => {
                 self.stats.tx_datagrams.fetch_add(1, Ordering::Relaxed);
                 self.stats.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -415,6 +470,33 @@ impl EdgeTransport {
                 }
                 Err(e.into())
             }
+        }
+    }
+
+    /// Answers an edge ping by echoing its stamp in a pong, or records an incoming pong's round
+    /// trip. Returns [`Some`] with [`EdgeInbound::Control`] when `datagram` is one of the two, so the
+    /// caller classifies it no further.
+    async fn handle_control(&self, datagram: &[u8], src: SocketAddr) -> Option<EdgeInbound> {
+        if datagram.len() != CONTROL_LEN {
+            return None;
+        }
+        let mut stamp = [0u8; 8];
+        stamp.copy_from_slice(&datagram[4..]);
+        if datagram[..4] == EDGE_PING_MAGIC[..] {
+            let mut pong = [0u8; CONTROL_LEN];
+            pong[..4].copy_from_slice(&EDGE_PONG_MAGIC);
+            pong[4..].copy_from_slice(&stamp);
+            // A failed pong is already counted in the send statistics and path health.
+            let _ = self.send_control(&pong, src).await;
+            Some(EdgeInbound::Control)
+        } else if datagram[..4] == EDGE_PONG_MAGIC[..] {
+            let sent = u64::from_be_bytes(stamp);
+            // At least 1 ns, so a real sample never reads as "no sample yet" (0).
+            let rtt = monotonic_nanos().saturating_sub(sent).max(1);
+            self.rtt_nanos.store(rtt, Ordering::Relaxed);
+            Some(EdgeInbound::Control)
+        } else {
+            None
         }
     }
 
@@ -454,7 +536,7 @@ impl EdgeTransport {
             // A heartbeat is not a frame; the Station's pump has nothing to replay for it,
             // so report it as a dropped (non-frame) datagram here. Callers that care about
             // heartbeats use `recv_edge` directly.
-            Some(EdgeInbound::Heartbeat) | None => None,
+            Some(EdgeInbound::Heartbeat) | Some(EdgeInbound::Control) | None => None,
         })
     }
 
@@ -487,6 +569,9 @@ impl EdgeTransport {
         // is shorter than any frame and would otherwise be counted as malformed.
         if buf[..len] == EDGE_HEARTBEAT_MAGIC {
             return Ok(Some(EdgeInbound::Heartbeat));
+        }
+        if let Some(control) = self.handle_control(&buf[..len], src).await {
+            return Ok(Some(control));
         }
 
         // Validate the frame parses before forwarding, but return the *original* bytes:
@@ -882,6 +967,23 @@ mod tests {
 
         a.send_heartbeat().await.unwrap();
         assert_eq!(b.recv_edge().await.unwrap(), Some(EdgeInbound::Heartbeat));
+    }
+
+    #[tokio::test]
+    async fn ping_is_answered_with_a_pong_that_measures_rtt() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        a.set_peer(b.local_addr().unwrap()).await;
+        b.set_peer(a.local_addr().unwrap()).await;
+        assert_eq!(a.rtt(), None);
+
+        assert_eq!(a.send_ping().await.unwrap(), CONTROL_LEN);
+        // The peer answers the ping inside its receive path, so the ping is control, not a frame.
+        assert_eq!(b.recv_edge().await.unwrap(), Some(EdgeInbound::Control));
+        // The pong comes back the same way and sets this side's round trip.
+        assert_eq!(a.recv_edge().await.unwrap(), Some(EdgeInbound::Control));
+        let rtt = a.rtt().expect("a pong sets the round trip");
+        assert!(rtt < Duration::from_secs(5), "loopback RTT was {rtt:?}");
     }
 
     #[tokio::test]

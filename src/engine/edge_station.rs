@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use crate::engine::network::EdgeTransport;
+use crate::engine::network::{EdgeInbound, EdgeTransport};
 use crate::engine::replay::{DriverHandle, EdgeReplayer, EdgeJitterProfile, JitterBufferConfig};
 use crate::engine::serial::PttTiming;
 use crate::primitives::PathType;
@@ -82,10 +82,12 @@ pub fn tunnel_replayer(
 /// other than a clean shutdown.
 pub async fn pump_edges(transport: Arc<EdgeTransport>, driver: DriverHandle) -> crate::Result<()> {
     loop {
-        match transport.recv_raw().await {
-            Ok(Some(bytes)) => driver.submit(bytes),
-            // A dropped datagram (foreign/malformed): the transport counted it; keep going.
-            Ok(None) => continue,
+        match transport.recv_edge().await {
+            Ok(Some(EdgeInbound::Frame(bytes))) => driver.submit(bytes),
+            // The Client's liveness heartbeat feeds the F1/F2 watchdogs; it is not a frame.
+            Ok(Some(EdgeInbound::Heartbeat)) => driver.heartbeat(),
+            // Control or dropped datagrams (foreign/malformed): the transport counted them.
+            Ok(Some(EdgeInbound::Control)) | Ok(None) => continue,
             // A clean end-of-stream from the tunnel surfaces as UnexpectedEof; treat it as
             // a normal stop rather than an error the caller must handle.
             Err(crate::Error::SerialIo(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {

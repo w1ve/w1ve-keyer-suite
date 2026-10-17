@@ -503,6 +503,21 @@ async fn keying_survives_every_speed_from_5_to_60_wpm() {
             spawn_driver(replayer, Box::new(output), clock.clone(), Some(bus.clone()), None);
         let pump = tokio::spawn(pump_edges(Arc::clone(&station), driver));
 
+        // The Client's keepalive, as the app runs it: a heartbeat every KEEPALIVE_INTERVAL for
+        // the whole session. Without it the Station's F1 watchdog (750 ms with no traffic while
+        // key-down) races every dah, so the test would measure the watchdog, not keying.
+        let client = Arc::new(client);
+        let keepalive = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(KEEPALIVE_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    client.send_heartbeat().await.expect("keepalive heartbeat");
+                }
+            })
+        };
+
         // "PARIS" exercises dits, dahs and the gaps; short enough to run quickly per speed.
         let session_start = clock.now();
         let schedule = EdgeScheduleBuilder::build("PARIS", wpm, 50, session_start, TICK_HZ).unwrap();
@@ -538,9 +553,89 @@ async fn keying_survives_every_speed_from_5_to_60_wpm() {
             "at {wpm} WPM the Station replayed {replayed}/{expected} edges — it must replay all"
         );
 
+        keepalive.abort();
         pump.abort();
     }
 }
+
+/// Holds a key down for `hold` with the Client's keepalive on or off and returns the fail-safe
+/// codes that fired. The keepalive is the only traffic during a long key-down, so this shows
+/// the F1 watchdog depends on heartbeats reaching the Station.
+async fn hold_key_down(hold: Duration, keepalive: bool) -> Vec<u8> {
+    let (client, station) = tunnel_edge_pair().await;
+    let client = Arc::new(client);
+
+    let clock = SharedClock::new();
+    let transitions = Arc::new(Mutex::new(Vec::new()));
+    let mut replayer = tunnel_replayer(clock.as_ref(), EdgeJitterProfile::PathAdaptive, None);
+    replayer.begin_session(1);
+    let output = RecordingOutput {
+        clock: Arc::clone(&clock),
+        transitions: Arc::clone(&transitions),
+        last: None,
+    };
+    let bus = EventBus::new();
+    let mut events = bus.subscribe();
+    let driver = spawn_driver(replayer, Box::new(output), clock.clone(), Some(bus.clone()), None);
+    let pump = tokio::spawn(pump_edges(Arc::clone(&station), driver));
+
+    let keepalive_task = keepalive.then(|| {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(KEEPALIVE_INTERVAL);
+            loop {
+                tick.tick().await;
+                client.send_heartbeat().await.expect("keepalive heartbeat");
+            }
+        })
+    });
+
+    let session_start = clock.now();
+    let mut sender = EdgeSender::new(1, TICK_HZ, session_start);
+    let down = EdgeEvent { timestamp_ticks: session_start, key_down: true, source: EdgeSource::Host };
+    client.send_frame(&sender.frame_for(down)).await.unwrap();
+
+    let hold_ticks = hold.as_nanos() as u64 * TICK_HZ / 1_000_000_000;
+    let release = session_start + hold_ticks;
+    wait_until_tick(clock.as_ref(), release);
+    let up = EdgeEvent { timestamp_ticks: release, key_down: false, source: EdgeSource::Host };
+    client.send_frame(&sender.frame_for(up)).await.unwrap();
+
+    // Give the watchdog (50 ms cadence) and the replay thread time to settle.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut fired = Vec::new();
+    while let Ok(ev) = events.try_recv() {
+        if let CoreEvent::FailSafe { code, .. } = ev {
+            fired.push(code);
+        }
+    }
+
+    if let Some(task) = keepalive_task {
+        task.abort();
+    }
+    pump.abort();
+    fired
+}
+
+/// With no keepalive, a key held past the 750 ms F1 window is forced up. This is the condition
+/// the heartbeat exists to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn key_held_past_f1_without_keepalive_is_forced_up() {
+    let fired = hold_key_down(Duration::from_millis(1_500), false).await;
+    assert!(fired.contains(&1), "no keepalive: F1 must fire during a 1.5 s hold; fired {fired:?}");
+}
+
+/// With the Client's keepalive running, a key held well past F1 stays up. Liveness comes from
+/// the heartbeat, not from the edges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn key_held_past_f1_with_keepalive_stays_up() {
+    let fired = hold_key_down(Duration::from_millis(1_500), true).await;
+    assert!(fired.is_empty(), "a live keepalive must hold the key; fired {fired:?}");
+}
+
+/// The app's keepalive cadence (`HEARTBEAT_INTERVAL` in the W1VE controllers). It must stay
+/// well inside the 750 ms F1 window.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Busy-waits until the clock reaches `target_ticks`, yielding briefly so the runtime is
 /// not starved. Precise to well under a millisecond, unlike `tokio::time::sleep`.

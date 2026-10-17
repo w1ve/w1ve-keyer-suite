@@ -129,7 +129,7 @@ impl DriverDiagnostics {
 /// A datagram handed to the driver, stamped with its arrival time.
 #[derive(Debug, Clone)]
 pub struct InboundPacket {
-    /// Raw `RWK-PADDLE` datagram bytes.
+    /// Raw `RWK-PADDLE` datagram bytes. Empty for a heartbeat (a real frame is never empty).
     pub data: Vec<u8>,
     /// Arrival time on the driver's clock, in ticks.
     pub arrival: i64,
@@ -157,6 +157,16 @@ impl DriverHandle {
         let packet = InboundPacket { data, arrival: self.clock.now() as i64 };
         // A closed channel means the driver is shutting down; dropping the datagram is
         // the correct response, not an error the keying path should handle.
+        let _ = self.inbound.send(packet);
+    }
+
+    /// Records a liveness heartbeat from the peer, stamped with the current clock time.
+    ///
+    /// Feeds the F1 and F2 watchdogs. Without it the Station sees only frames, so a key held
+    /// longer than the F1 window with no edges would be forced up even while the Client is
+    /// alive.
+    pub fn heartbeat(&self) {
+        let packet = InboundPacket { data: Vec::new(), arrival: self.clock.now() as i64 };
         let _ = self.inbound.send(packet);
     }
 
@@ -278,7 +288,11 @@ fn spawn_replay_thread(
                 }
 
                 while let Ok(packet) = inbound.try_recv() {
-                    replayer.process_datagram(&packet.data, packet.arrival);
+                    if packet.data.is_empty() {
+                        replayer.process_heartbeat(packet.arrival);
+                    } else {
+                        replayer.process_datagram(&packet.data, packet.arrival);
+                    }
                 }
 
                 let now = clock.now() as i64;
