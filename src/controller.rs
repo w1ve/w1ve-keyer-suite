@@ -20,9 +20,9 @@ use rwk_core::config::{base64_decode, Config, ForwardRuleConfig, Role};
 use rwk_core::engine::audio::SidetoneEngine;
 use rwk_core::engine::control::{is_reserved_port, ControlLink, ControlMessage};
 use rwk_core::engine::debounce::ContactDebouncer;
-use rwk_core::engine::edge_sender::EdgeSender;
+use rwk_core::engine::edge_session::EdgeSession;
 use rwk_core::engine::flex_discovery::DiscoveryEmitter;
-use rwk_core::engine::keying::{EdgeEvent, KeyerElement, KeyerElementTiming};
+use rwk_core::engine::keying::{KeyerElement, KeyerElementTiming};
 use rwk_core::engine::network::EdgeTransport;
 use rwk_core::engine::paddle::PaddleKeyer;
 use rwk_core::engine::paddle_input::PaddleInputPort;
@@ -34,7 +34,7 @@ use rwk_core::engine::tunnel;
 use rwk_core::protocol::flex_vita;
 use rwk_core::protocol::morse::MorseTable;
 use rwk_core::platform::{ThreadPriorityGuard, TimerResolutionGuard};
-use rwk_core::primitives::{EdgeSource, KeyerMode, KeyingLine};
+use rwk_core::primitives::{KeyerMode, KeyingLine};
 use rwk_core::timing::{Clock, HybridWaiter, MonotonicClock};
 
 /// The inner UDP port the keying edge rides over the tunnel, both ends agreeing.
@@ -381,16 +381,11 @@ struct Shared {
     keying: Mutex<Option<SerialKeyingOutput>>,
     /// The edge transport over the tunnel, present only while paired.
     transport: Mutex<Option<Arc<EdgeTransport>>>,
-    /// Ordered, non-blocking outbound frame queue to the tunnel. `drive_edge` pushes finished
-    /// frames here; a single drain task (spawned per session in `bring_up_client`) sends them
-    /// over the transport **in order**. This replaces a spawn-per-edge send, which did not
-    /// preserve order: at high WPM (~30ms elements) concurrent send tasks could reorder
-    /// datagrams, and the Station's sequence tracker then discarded the "old" sequence as a
-    /// duplicate — so keying stopped above ~39 WPM. One FIFO channel keeps edges ordered and
-    /// never blocks the time-critical keyer thread.
-    frame_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<rwk_core::protocol::edge::RwkPaddleFrame>>>,
     /// Session epoch, incremented on each new pairing so the station re-anchors.
     epoch: Mutex<u16>,
+    /// The shared session edge path (`rwk-core`): one sender for every edge source and one
+    /// ordered tunnel FIFO. Restarted once per pairing in `bring_up_client`.
+    edge: EdgeSession,
     /// The running serial paddle poller, present only while a paddle port is selected.
     paddle: Mutex<Option<PaddlePollerHandle>>,
     /// The type-ahead / macro send buffer, drained by the single send-worker thread.
@@ -556,8 +551,8 @@ impl ClientController {
             sidetone: Mutex::new(None),
             keying: Mutex::new(None),
             transport: Mutex::new(None),
-            frame_tx: Mutex::new(None),
             epoch: Mutex::new(1),
+            edge: EdgeSession::new(MonotonicClock.frequency(), MonotonicClock.now()),
             paddle: Mutex::new(None),
             send: SendBuffer::default(),
             advertise: tokio::sync::Mutex::new(None),
@@ -1129,9 +1124,8 @@ impl ClientController {
     /// Tears the session, control channel, LAN advertiser and keying edge down.
     pub fn disconnect(&self) {
         *self.shared.transport.lock().unwrap() = None;
-        // Drop the outbound frame sender so the per-session drain task sees the channel close
-        // and exits; the next pairing installs a fresh channel + drain task.
-        *self.shared.frame_tx.lock().unwrap() = None;
+        // Ends the pairing's ordered tunnel FIFO; the next pairing starts a fresh one.
+        self.shared.edge.detach();
         let shared = Arc::clone(&self.shared);
         self.runtime.block_on(async move {
             if let Some(task) = shared.advertise.lock().await.take() {
@@ -1186,20 +1180,10 @@ async fn bring_up_client(shared: &Arc<Shared>, connected: tunnel::Connected) {
         Err(e) => shared.log("warn", format!("Control channel unavailable: {e}")),
     }
 
+    // A new pairing restarts the edge stream at sequence 0 and starts its ordered tunnel FIFO.
+    // The Station builds a fresh replayer per session, so it accepts the restart.
+    shared.edge.begin(*shared.epoch.lock().unwrap(), MonotonicClock.now(), Arc::clone(&transport));
     *shared.transport.lock().unwrap() = Some(Arc::clone(&transport));
-
-    // Spawn the ordered outbound drain task: it owns the receive half of the frame queue and
-    // sends each frame over the tunnel in FIFO order. drive_edge only ever pushes into the
-    // sender half, so the time-critical keyer thread never touches the network and datagrams
-    // leave in the exact order they were keyed.
-    let (frame_tx, mut frame_rx) =
-        tokio::sync::mpsc::unbounded_channel::<rwk_core::protocol::edge::RwkPaddleFrame>();
-    *shared.frame_tx.lock().unwrap() = Some(frame_tx);
-    tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            let _ = transport.send_frame(&frame).await;
-        }
-    });
 
     *shared.session.lock().await = Some(session);
     // The epoch is intentionally NOT bumped here. Both edge sources (the paddle poller and
@@ -1388,10 +1372,6 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
     let mut prev_emitted = false;
     let mut sending = false;
 
-    // The tunnel edge sender, re-anchored to `now` with the current epoch each time a fresh
-    // sending burst begins (so a re-pairing between bursts is honored).
-    let mut sender = EdgeSender::new(*shared.epoch.lock().unwrap(), hz, clock.now());
-
     let aborting = || shared.send.state.lock().unwrap_or_else(|e| e.into_inner()).abort;
 
     loop {
@@ -1411,7 +1391,7 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
                     prev_emitted = false;
                     if sending {
                         let tone = shared.sidetone.lock().unwrap().clone();
-                        drive_edge(shared, rt, tone.as_ref(), &mut sender, false, clock.now());
+                        drive_edge(shared, rt, tone.as_ref(), false, clock.now());
                         shared.emit(ClientEvent::Sending { active: false });
                         sending = false;
                     }
@@ -1456,8 +1436,6 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
         }
 
         if !sending {
-            // Fresh burst: re-anchor the tunnel sender to now with the current epoch.
-            sender = EdgeSender::new(*shared.epoch.lock().unwrap(), hz, now);
             shared.emit(ClientEvent::Sending { active: true });
             sending = true;
         }
@@ -1497,10 +1475,10 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
             if aborting() {
                 break;
             }
-            drive_edge(shared, rt, tone.as_ref(), &mut sender, true, position);
+            drive_edge(shared, rt, tone.as_ref(), true, position);
 
             HybridWaiter::wait_until_ticks(&clock, position + duration, &aborting);
-            drive_edge(shared, rt, tone.as_ref(), &mut sender, false, position + duration);
+            drive_edge(shared, rt, tone.as_ref(), false, position + duration);
             position += duration;
 
             if aborting() {
@@ -1519,7 +1497,6 @@ fn drive_edge(
     shared: &Arc<Shared>,
     rt: &tokio::runtime::Handle,
     tone: Option<&Sidetone>,
-    sender: &mut EdgeSender,
     key_down: bool,
     timestamp_ticks: u64,
 ) {
@@ -1539,11 +1516,7 @@ fn drive_edge(
     //    what broke keying above ~39 WPM (concurrent spawned sends could arrive out of order
     //    and the Station discarded the lower sequence as a duplicate). The frame carries its
     //    own timestamp, so the Station reconstructs spacing regardless of send jitter.
-    let event = EdgeEvent { timestamp_ticks, key_down, source: EdgeSource::Paddle };
-    let frame = sender.frame_for(event);
-    if let Some(tx) = shared.frame_tx.lock().unwrap().as_ref() {
-        let _ = tx.send(frame);
-    }
+    shared.edge.push_edge(key_down, timestamp_ticks);
     let _ = rt;
 }
 
@@ -1616,10 +1589,6 @@ fn paddle_loop(
         }
     };
 
-    // A fresh EdgeSender for the tunnel frames, with its own epoch window from now.
-    let epoch = *shared.epoch.lock().unwrap();
-    let mut sender = EdgeSender::new(epoch, hz, clock.now());
-
     let poll_step = hz.saturating_mul(PADDLE_POLL_MS) / 1000;
     let should_abort = || stop.load(Ordering::SeqCst);
 
@@ -1655,7 +1624,7 @@ fn paddle_loop(
             &clock,
             &paddle_now,
             &mut |edge| {
-                drive_edge(shared, rt, tone.as_ref(), &mut sender, edge.key_down, edge.timestamp_ticks);
+                drive_edge(shared, rt, tone.as_ref(), edge.key_down, edge.timestamp_ticks);
             },
             &should_abort,
         );
@@ -1669,7 +1638,7 @@ fn paddle_loop(
 
     // Leave the key up on the way out.
     let tone = shared.sidetone.lock().unwrap().clone();
-    drive_edge(shared, rt, tone.as_ref(), &mut sender, false, clock.now());
+    drive_edge(shared, rt, tone.as_ref(), false, clock.now());
 }
 
 /// Reads the current keyer settings (wpm, weight, mode, paddle-reverse) under the lock.
