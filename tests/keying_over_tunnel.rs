@@ -633,6 +633,94 @@ async fn key_held_past_f1_with_keepalive_stays_up() {
     assert!(fired.is_empty(), "a live keepalive must hold the key; fired {fired:?}");
 }
 
+/// Sends one word through `sender`, starting at the clock's current time. Returns the edge count.
+async fn send_word(
+    client: &EdgeTransport,
+    clock: &SharedClock,
+    sender: &mut EdgeSender,
+    text: &str,
+) -> usize {
+    let session_start = clock.now();
+    let schedule = EdgeScheduleBuilder::build(text, 20, 50, session_start, TICK_HZ).unwrap();
+    for edge in &schedule.edges {
+        wait_until_tick(clock, edge.timestamp_ticks);
+        let event = EdgeEvent {
+            timestamp_ticks: edge.timestamp_ticks,
+            key_down: edge.key_down,
+            source: EdgeSource::Host,
+        };
+        client.send_frame(&sender.frame_for(event)).await.unwrap();
+    }
+    schedule.edges.len()
+}
+
+/// The Player rebuilds its replay driver when a keying setting changes (the PTT hang slider
+/// included): the old pump is stopped and a new driver is started on the same live transport.
+/// The Keyer keeps its sender running across the rebuild. Keying must continue after it.
+async fn rebuild_keeps_keying(
+    before_ptt: Option<rwk_core::engine::serial::PttTiming>,
+    ptt: Option<rwk_core::engine::serial::PttTiming>,
+) {
+    let (client, station) = tunnel_edge_pair().await;
+    let clock = SharedClock::new();
+    let mut sender = EdgeSender::new(1, TICK_HZ, clock.now());
+
+    let (pump1, t1) = start_station(Arc::clone(&station), clock.clone(), before_ptt);
+    let first = send_word(&client, clock.as_ref(), &mut sender, "PARIS").await;
+    let before = wait_for_transition_count(&t1, first, Duration::from_secs(10)).await;
+    assert_eq!(before, first, "before the rebuild: replayed {before}/{first}");
+
+    pump1.abort();
+    let _ = pump1.await;
+    let (pump2, t2) = start_station(Arc::clone(&station), clock.clone(), ptt);
+
+    let second = send_word(&client, clock.as_ref(), &mut sender, "PARIS").await;
+    let after = wait_for_transition_count(&t2, second, Duration::from_secs(10)).await;
+    pump2.abort();
+    assert_eq!(after, second, "after the rebuild: replayed {after}/{second} edges");
+}
+
+/// Starts a replay driver and its edge pump on `station` (a fresh session each call).
+fn start_station(
+    station: Arc<EdgeTransport>,
+    clock: Arc<SharedClock>,
+    ptt: Option<rwk_core::engine::serial::PttTiming>,
+) -> (
+    tokio::task::JoinHandle<rwk_core::Result<()>>,
+    Arc<Mutex<Vec<(bool, u64)>>>,
+) {
+    let transitions = Arc::new(Mutex::new(Vec::new()));
+    let mut replayer = tunnel_replayer(clock.as_ref(), EdgeJitterProfile::PathAdaptive, ptt);
+    replayer.begin_session(1);
+    let output = RecordingOutput {
+        clock: Arc::clone(&clock),
+        transitions: Arc::clone(&transitions),
+        last: None,
+    };
+    let driver = spawn_driver(replayer, Box::new(output), clock.clone(), None, None);
+    (tokio::spawn(pump_edges(station, driver)), transitions)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keying_continues_after_a_driver_rebuild() {
+    rebuild_keeps_keying(None, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keying_continues_after_a_rebuild_with_ptt_on_both_sides() {
+    let ptt = rwk_core::engine::serial::PttTiming::default();
+    rebuild_keeps_keying(Some(ptt), Some(ptt)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keying_continues_after_a_rebuild_with_ptt_hang() {
+    let ptt = rwk_core::engine::serial::PttTiming {
+        tail: Duration::from_millis(200),
+        ..Default::default()
+    };
+    rebuild_keeps_keying(None, Some(ptt)).await;
+}
+
 /// The app's keepalive cadence (`HEARTBEAT_INTERVAL` in the W1VE controllers). It must stay
 /// well inside the 750 ms F1 window.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
