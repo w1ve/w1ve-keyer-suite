@@ -27,6 +27,7 @@ pub mod bus;
 pub mod control;
 pub mod debounce;
 pub mod edge_sender;
+pub mod edge_session;
 pub mod edge_station;
 pub mod flex_discovery;
 pub mod lan_discovery;
@@ -58,6 +59,7 @@ pub use tunnel_forward::{
 };
 pub use tunnel::{connect, Connected, Path, StaticIdentity, TunnelPacket, TunnelPeer, WireGuardTunnel};
 pub use edge_sender::EdgeSender;
+pub use edge_session::EdgeSession;
 pub use edge_station::{pump_edges, tunnel_replayer};
 pub use keying_arbiter::{
     KeySource, KeyingArbiter, LineObserver, LineUpdate, LocalKeyHandle, RemoteKeyingOutput,

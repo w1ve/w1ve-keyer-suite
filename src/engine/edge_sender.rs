@@ -58,6 +58,9 @@ pub struct EdgeSender {
     /// Most-recent edges, newest at the back. Capped at [`MAX_EDGE_COUNT`] entries so the
     /// front edge plus [`REDUNDANT_EDGES`] prior ones always fit a frame.
     recent: Vec<EdgeEntry>,
+    /// The last `timestamp_ms` emitted this epoch. Timestamps are clamped up to it so the
+    /// stream never regresses even when edges from several sources arrive out of clock order.
+    last_timestamp_ms: u32,
 }
 
 impl EdgeSender {
@@ -75,6 +78,7 @@ impl EdgeSender {
             session_start_ticks,
             next_sequence: 0,
             recent: Vec::with_capacity(MAX_EDGE_COUNT),
+            last_timestamp_ms: 0,
         }
     }
 
@@ -121,10 +125,16 @@ impl EdgeSender {
         // the arithmetic total.
         self.next_sequence = self.next_sequence.wrapping_add(1);
 
+        // A send span schedules edges ahead of the real clock, while a paddle edge is stamped
+        // "now". The Station rejects a timestamp earlier than the last applied one within an
+        // epoch (F5), so never emit a regression: clamp up to the last timestamp instead.
+        let timestamp_ms = self.timestamp_ms(event.timestamp_ticks).max(self.last_timestamp_ms);
+        self.last_timestamp_ms = timestamp_ms;
+
         let state = if event.key_down { STATE_KEY_DOWN } else { STATE_KEY_UP };
         let entry = EdgeEntry {
             sequence,
-            timestamp_ms: self.timestamp_ms(event.timestamp_ticks),
+            timestamp_ms,
             state,
             flags: 0,
             reserved: 0,
@@ -158,13 +168,16 @@ impl EdgeSender {
         self.session_start_ticks = session_start_ticks;
         self.next_sequence = 0;
         self.recent.clear();
+        self.last_timestamp_ms = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::replay::EdgeSequenceTracker;
     use crate::primitives::EdgeSource;
+    use crate::protocol::edge::RwkPaddleFrame;
 
     const TICK_HZ: u64 = 1_000_000_000;
 
@@ -261,5 +274,74 @@ mod tests {
         assert_eq!(frame.edge_count(), 1, "redundancy ring must be cleared");
         assert_eq!(frame.edges()[0].sequence, 0, "sequence must restart");
         assert_eq!(frame.edges()[0].timestamp_ms, 0, "timing rebased on new start");
+    }
+
+    /// True when the frame's current (first) edge was applied by `tracker`, i.e. the Station
+    /// would key it. Redundant copies are ignored: they are expected to be duplicates.
+    fn current_edge_applied(tracker: &mut EdgeSequenceTracker, frame: &RwkPaddleFrame) -> bool {
+        let current = frame.edges()[0].sequence;
+        tracker
+            .validate_frame(frame)
+            .iter()
+            .find(|r| r.edge.sequence == current)
+            .is_some_and(|r| r.applied)
+    }
+
+    /// Regression for the "change speed → Server never keys again" stall. The send worker used
+    /// to build a fresh sender for every send span, restarting sequence at 0 mid-session. The
+    /// Station then sees every new frame as a duplicate of the first span and stops keying.
+    #[test]
+    fn a_restarted_sender_is_rejected_after_the_first_span() {
+        let mut station = EdgeSequenceTracker::new(1);
+        let mut first_span = EdgeSender::new(1, TICK_HZ, 0);
+        for ev in [down_at(0), up_at(TICK_HZ / 20)] {
+            let frame = first_span.frame_for(ev);
+            assert!(current_edge_applied(&mut station, &frame));
+        }
+
+        // The next span builds a new sender, as the old send worker did.
+        let mut second_span = EdgeSender::new(1, TICK_HZ, TICK_HZ / 10);
+        let frame = second_span.frame_for(down_at(TICK_HZ / 10));
+        assert!(
+            !current_edge_applied(&mut station, &frame),
+            "a sequence restarted at 0 must not be keyed after the first span"
+        );
+    }
+
+    /// The fix's contract: one session-long sender, shared by every edge source, keeps the
+    /// Station keying across many spans with idle gaps between them.
+    #[test]
+    fn one_session_sender_keeps_keying_across_spans() {
+        let mut station = EdgeSequenceTracker::new(1);
+        let mut session = EdgeSender::new(1, TICK_HZ, 0);
+        let step = TICK_HZ / 20;
+        let mut t = 0u64;
+        for span in 0..3 {
+            for _ in 0..4 {
+                let frame = session.frame_for(down_at(t));
+                t += step;
+                assert!(current_edge_applied(&mut station, &frame), "span {span}: key-down");
+                let frame = session.frame_for(up_at(t));
+                t += step;
+                assert!(current_edge_applied(&mut station, &frame), "span {span}: key-up");
+            }
+            t += TICK_HZ / 2; // idle gap between send spans
+        }
+    }
+
+    /// A send span schedules edges ahead of the real clock, while a paddle edge is stamped
+    /// "now". Sharing one sender must never send an earlier timestamp after a later one, or
+    /// the Station latches F5 on a timestamp regression.
+    #[test]
+    fn timestamps_never_regress_when_sources_interleave() {
+        let mut station = EdgeSequenceTracker::new(1);
+        let mut session = EdgeSender::new(1, TICK_HZ, 0);
+
+        let scheduled = session.frame_for(down_at(60 * TICK_HZ / 1000));
+        assert!(current_edge_applied(&mut station, &scheduled));
+
+        let paddle = session.frame_for(up_at(10 * TICK_HZ / 1000));
+        assert_eq!(paddle.edges()[0].timestamp_ms, 60, "clamped to the last timestamp");
+        assert!(current_edge_applied(&mut station, &paddle), "must not latch F5");
     }
 }

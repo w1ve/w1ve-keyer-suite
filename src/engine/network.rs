@@ -47,6 +47,26 @@ use crate::Result;
 /// Maximum size of a single edge datagram.
 pub const MAX_DATAGRAM: usize = 2048;
 
+/// Magic bytes identifying an **edge heartbeat** datagram on the edge channel.
+///
+/// A heartbeat is a liveness beacon the two ends exchange so each can tell the other is
+/// still there even when no CW is flowing. It is deliberately *not* an [`RwkPaddleFrame`]:
+/// this 4-byte datagram is shorter than [`crate::protocol::edge::MIN_FRAME_SIZE`] (16) and
+/// its bytes 2..4 spell `KH` (0x484B), which is far outside the 1..=4 a frame's `count`
+/// field may hold — so a frame parser rejects it and a heartbeat parser rejects a frame.
+/// The two are therefore unambiguous on the same socket with **no change to the frame wire
+/// format**, which keeps interop with the existing apps and the C# intact.
+pub const EDGE_HEARTBEAT_MAGIC: [u8; 4] = *b"RWKH";
+
+/// One datagram received on the edge channel, classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeInbound {
+    /// A validated [`RwkPaddleFrame`] as raw bytes, ready for the replay driver.
+    Frame(Vec<u8>),
+    /// A liveness heartbeat from the peer. Carries no keying; it only proves the peer is up.
+    Heartbeat,
+}
+
 /// Maximum size of a single forwarded UDP datagram.
 pub const MAX_FORWARD_DATAGRAM: usize = 4096;
 
@@ -364,6 +384,40 @@ impl EdgeTransport {
         }
     }
 
+    /// Sends a liveness [heartbeat](EDGE_HEARTBEAT_MAGIC) to the configured peer.
+    ///
+    /// A no-op returning `0` when no peer is set. Unlike [`Self::send_frame`], a heartbeat is
+    /// a pure liveness beacon: it carries no keying and is counted as an ordinary tx datagram.
+    /// A send failure feeds the same consecutive-error → [`PathHealth`] accounting as a frame,
+    /// so a run of failed heartbeats on an idle link still surfaces a lost path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `std::io::Error` if the datagram cannot be sent.
+    pub async fn send_heartbeat(&self) -> Result<usize> {
+        let Some(peer) = self.peer().await else {
+            self.stats.drop_no_peer.fetch_add(1, Ordering::Relaxed);
+            return Ok(0);
+        };
+        match self.link.send_to(&EDGE_HEARTBEAT_MAGIC, peer).await {
+            Ok(n) => {
+                self.stats.tx_datagrams.fetch_add(1, Ordering::Relaxed);
+                self.stats.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                self.stats.consecutive_send_errors.store(0, Ordering::Relaxed);
+                Ok(n)
+            }
+            Err(e) => {
+                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                let consecutive =
+                    self.stats.consecutive_send_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                if consecutive >= MAX_CONSECUTIVE_SEND_ERRORS {
+                    self.health.report_lost();
+                }
+                Err(e.into())
+            }
+        }
+    }
+
     /// Receives one edge frame, ignoring datagrams from unexpected sources.
     ///
     /// Returns [`None`] when the datagram was dropped (foreign source or malformed
@@ -395,6 +449,26 @@ impl EdgeTransport {
     ///
     /// Propagates an `std::io::Error` if the socket read fails.
     pub async fn recv_raw(&self) -> Result<Option<Vec<u8>>> {
+        Ok(match self.recv_edge().await? {
+            Some(EdgeInbound::Frame(bytes)) => Some(bytes),
+            // A heartbeat is not a frame; the Station's pump has nothing to replay for it,
+            // so report it as a dropped (non-frame) datagram here. Callers that care about
+            // heartbeats use `recv_edge` directly.
+            Some(EdgeInbound::Heartbeat) | None => None,
+        })
+    }
+
+    /// Receives and classifies one datagram on the edge channel: a validated
+    /// [`RwkPaddleFrame`]'s raw bytes, or a liveness [`EdgeInbound::Heartbeat`].
+    ///
+    /// Applies the same foreign-source gate as [`Self::recv_raw`]. Returns [`None`] when the
+    /// datagram was dropped (foreign source, or neither a heartbeat nor a well-formed frame);
+    /// the caller should simply loop.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `std::io::Error` if the socket read fails.
+    pub async fn recv_edge(&self) -> Result<Option<EdgeInbound>> {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let (len, src) = self.link.recv_from(&mut buf).await?;
         self.stats.rx_datagrams.fetch_add(1, Ordering::Relaxed);
@@ -409,6 +483,12 @@ impl EdgeTransport {
             }
         }
 
+        // A heartbeat is the exact 4-byte magic and nothing more: classify it first, since it
+        // is shorter than any frame and would otherwise be counted as malformed.
+        if buf[..len] == EDGE_HEARTBEAT_MAGIC {
+            return Ok(Some(EdgeInbound::Heartbeat));
+        }
+
         // Validate the frame parses before forwarding, but return the *original* bytes:
         // the driver re-parses them, and reserialising could only ever reproduce the same
         // bytes for a valid frame. A parse failure here is a malformed datagram, dropped
@@ -418,7 +498,7 @@ impl EdgeTransport {
             return Ok(None);
         };
         buf.truncate(used);
-        Ok(Some(buf))
+        Ok(Some(EdgeInbound::Frame(buf)))
     }
 }
 
@@ -763,6 +843,52 @@ mod tests {
         let received = b.recv_frame().await.unwrap().expect("frame");
         assert_eq!(received, frame);
         assert_eq!(b.stats().rx_datagrams(), 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_received_as_heartbeat_not_a_frame() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        a.set_peer(b.local_addr().unwrap()).await;
+        b.set_peer(a.local_addr().unwrap()).await;
+
+        let sent = a.send_heartbeat().await.unwrap();
+        assert_eq!(sent, EDGE_HEARTBEAT_MAGIC.len());
+        assert_eq!(a.stats().tx_datagrams(), 1);
+
+        // Classified as a heartbeat...
+        assert_eq!(b.recv_edge().await.unwrap(), Some(EdgeInbound::Heartbeat));
+        // ...and NOT mistaken for a frame by the Station's frame path.
+        a.send_heartbeat().await.unwrap();
+        assert_eq!(b.recv_raw().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_frame_and_a_heartbeat_are_distinguishable_on_one_socket() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        a.set_peer(b.local_addr().unwrap()).await;
+        b.set_peer(a.local_addr().unwrap()).await;
+
+        let frame = RwkPaddleFrame::try_new(3, &[EdgeEntry::key_down_at(1, 10, 0)]).unwrap();
+        a.send_frame(&frame).await.unwrap();
+        match b.recv_edge().await.unwrap() {
+            Some(EdgeInbound::Frame(bytes)) => {
+                let (parsed, _) = RwkPaddleFrame::read_from(&bytes).unwrap();
+                assert_eq!(parsed, frame);
+            }
+            other => panic!("expected a frame, got {other:?}"),
+        }
+
+        a.send_heartbeat().await.unwrap();
+        assert_eq!(b.recv_edge().await.unwrap(), Some(EdgeInbound::Heartbeat));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_without_peer_is_counted_not_sent() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        assert_eq!(a.send_heartbeat().await.unwrap(), 0);
+        assert_eq!(a.stats().drop_no_peer(), 1);
     }
 
     #[tokio::test]
