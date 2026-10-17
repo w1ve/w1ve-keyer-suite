@@ -47,8 +47,11 @@ use crate::pairing::{self, Transport};
 /// The inner UDP port the keying edge rides over the tunnel, matching the Server.
 const EDGE_PORT: u16 = 5555;
 
-/// How often the Client beacons a liveness heartbeat to the Player.
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often the Client beacons a liveness heartbeat to the Player. It must stay well inside the
+/// Player's 750 ms F1 window, or a key held longer than that with no edges is forced up.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// The RTT readout refreshes once a second: every this many heartbeat ticks.
+const RTT_EVERY_TICKS: u32 = 4;
 
 /// How long the Client waits without ANY inbound traffic from the Player (heartbeats or any
 /// datagram) before declaring the peer lost and reconnecting. Five seconds rides out a brief
@@ -88,6 +91,9 @@ pub enum ClientEvent {
         paddle_port: Option<String>,
         logger_port: Option<String>,
     },
+    /// The round-trip time to the Player in whole milliseconds, once a second while paired (`None`
+    /// until the first pong arrives).
+    Rtt { ms: Option<u32> },
     /// Whether the LAN discovery beacon is currently being advertised.
     Advertising { active: bool },
     /// The type-ahead / macro send buffer is actively keying.
@@ -794,7 +800,7 @@ impl ClientController {
                         if let Some(edge) = bring_up_keying(&shared, connected).await {
                             // Connected: a successful pairing clears the failure budget.
                             attempts = 0;
-                            let outcome = watch_edge_liveness(edge).await;
+                            let outcome = watch_edge_liveness(edge, Arc::clone(&shared)).await;
                             // Tear the dead session down before retrying.
                             teardown_session(&shared).await;
                             if outcome == Liveness::Closed {
@@ -915,7 +921,7 @@ async fn lan_advertise_and_await(shared: Arc<Shared>, callsign: String, keyer_id
         //    responding (closed, or the link dropped), tear the dead session down and loop to
         //    re-advertise, so the radio site can re-establish without the operator re-arming.
         if let Some(edge) = bring_up_keying(&shared, connected).await {
-            let _ = watch_edge_liveness(edge).await;
+            let _ = watch_edge_liveness(edge, Arc::clone(&shared)).await;
             teardown_session(&shared).await;
             shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
             shared.log("info", "Player stopped responding; re-advertising on the LAN…");
@@ -944,6 +950,11 @@ enum Liveness {
     Closed,
 }
 
+/// The edge's round-trip time in whole milliseconds, or [`None`] before the first pong.
+fn rtt_millis(edge: &EdgeTransport) -> Option<u32> {
+    edge.rtt().map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
+}
+
 /// Watches the live edge for Player liveness while beaconing our own heartbeat.
 ///
 /// Runs two things concurrently against the current `edge`:
@@ -953,7 +964,7 @@ enum Liveness {
 ///
 /// Returns when the peer is lost or the stream closes. Keying out is unaffected — this only
 /// observes; the caller decides whether to reconnect.
-async fn watch_edge_liveness(edge: Arc<EdgeTransport>) -> Liveness {
+async fn watch_edge_liveness(edge: Arc<EdgeTransport>, shared: Arc<Shared>) -> Liveness {
     let recv_edge = Arc::clone(&edge);
     let receiver = async move {
         loop {
@@ -969,12 +980,20 @@ async fn watch_edge_liveness(edge: Arc<EdgeTransport>) -> Liveness {
         }
     };
 
+    // Each tick: a liveness heartbeat, a ping that the Player answers so we can measure the round
+    // trip, and the RTT the UI shows.
     let hb_edge = Arc::clone(&edge);
     let heartbeat = async move {
         let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let mut beats: u32 = 0;
         loop {
             tick.tick().await;
             let _ = hb_edge.send_heartbeat().await;
+            let _ = hb_edge.send_ping().await;
+            beats = beats.wrapping_add(1);
+            if beats % RTT_EVERY_TICKS == 0 {
+                shared.emit(ClientEvent::Rtt { ms: rtt_millis(&hb_edge) });
+            }
         }
     };
 

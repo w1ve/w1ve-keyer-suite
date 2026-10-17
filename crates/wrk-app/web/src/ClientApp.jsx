@@ -58,6 +58,7 @@ export default function ClientApp() {
   });
   const [connection, setConnection] = useState({ state: "disconnected", path: "none" });
   const [keyDown, setKeyDown] = useState(false);
+  const [rtt, setRtt] = useState(null); // round-trip ms to the Player, null until measured
   const [sending, setSending] = useState(false);
   const [advertising, setAdvertising] = useState(false);
   const [log, setLog] = useState([]);
@@ -95,6 +96,9 @@ export default function ClientApp() {
           break;
         case "connection":
           setConnection({ state: ev.state, path: ev.path });
+          break;
+        case "rtt":
+          setRtt(ev.ms ?? null);
           break;
         case "keyState":
           setKeyDown(ev.down);
@@ -170,7 +174,7 @@ export default function ClientApp() {
   const paired = connection.state === "connected";
   const connecting = connection.state === "connecting";
   const pathText =
-    paired ? (connection.path === "relay" ? "Relay" : "Direct") : connecting ? "Pairing…" : "Disconnected";
+    paired ? (connection.path === "relay" ? "DERP" : "Direct") : connecting ? "Pairing…" : "Disconnected";
   const linkColor = paired ? "var(--good)" : connecting ? "var(--warn)" : "var(--text-dim)";
 
   // Audio selection model: settings.audioDevice is null (follow system default), "" (off), or a
@@ -184,6 +188,8 @@ export default function ClientApp() {
       <div className="statusbar" style={{ borderTop: "none", borderBottom: "1px solid var(--border)" }}>
         <strong style={{ color: "var(--accent)" }}>W1VE Remote Keyer</strong>
         <span className="spring" />
+        {paired && <span>RTT {rtt ?? "—"} ms</span>}
+        {paired && <span style={{ margin: "0 8px", color: "var(--text-dim)" }}>|</span>}
         <span className="led" style={{ color: linkColor }}>●</span>
         <span>{pathText}</span>
       </div>

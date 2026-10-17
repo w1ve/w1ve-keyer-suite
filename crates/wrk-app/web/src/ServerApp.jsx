@@ -18,6 +18,7 @@ export default function ServerApp() {
   });
   const [connection, setConnection] = useState({ state: "disconnected", path: "none" });
   const [keyDown, setKeyDown] = useState(false);
+  const [rtt, setRtt] = useState(null); // round-trip ms to the Client, null until measured
   const [pttOn, setPttOn] = useState(false);
   const [lastFailSafe, setLastFailSafe] = useState(null);
   const [log, setLog] = useState([]);
@@ -43,6 +44,9 @@ export default function ServerApp() {
         case "connection":
           setConnection({ state: ev.state, path: ev.path });
           if (ev.state !== "connected") setLastFailSafe(null);
+          break;
+        case "rtt":
+          setRtt(ev.ms ?? null);
           break;
         case "keyState":
           setKeyDown(ev.down);
@@ -86,7 +90,7 @@ export default function ServerApp() {
   const running = connection.state === "connected";
   const connecting = connection.state === "connecting";
   const pathText =
-    running ? (connection.path === "relay" ? "Relay" : "Direct") : connecting ? "Waiting…" : "Stopped";
+    running ? (connection.path === "relay" ? "DERP" : "Direct") : connecting ? "Waiting…" : "Stopped";
   const linkColor = running ? "var(--good)" : connecting ? "var(--warn)" : "var(--text-dim)";
 
   return (
@@ -94,6 +98,8 @@ export default function ServerApp() {
       <div className="statusbar" style={{ borderTop: "none", borderBottom: "1px solid var(--border)" }}>
         <strong style={{ color: "var(--accent)" }}>W1VE Remote Keyer — Player</strong>
         <span className="spring" />
+        {running && <span>RTT {rtt ?? "—"} ms</span>}
+        {running && <span style={{ margin: "0 8px", color: "var(--text-dim)" }}>|</span>}
         <span className="led" style={{ color: linkColor }}>●</span>
         <span>{pathText}</span>
       </div>

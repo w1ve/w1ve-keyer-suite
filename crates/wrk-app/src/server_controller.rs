@@ -43,6 +43,9 @@ pub enum ServerEvent {
     KeyState { down: bool },
     Ptt { asserted: bool },
     Connection { state: String, path: String },
+    /// The round-trip time to the Client in whole milliseconds, once a second while paired (`None`
+    /// until the first pong arrives).
+    Rtt { ms: Option<u32> },
     FailSafe { code: u8, message: String },
     Log { level: String, message: String },
     Settings {
@@ -190,8 +193,11 @@ struct ActiveSession {
     heartbeat: tokio::task::JoinHandle<()>,
 }
 
-/// How often the Player beacons a liveness heartbeat to the Client.
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often the Player beacons a liveness heartbeat to the Client. It must stay well inside the
+/// F1 window (750 ms), or a key held longer than that with no edges is forced up.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// The RTT readout refreshes once a second: every this many heartbeat ticks.
+const RTT_EVERY_TICKS: u32 = 4;
 
 /// The Server controller.
 pub struct ServerController {
@@ -627,6 +633,11 @@ impl Drop for ServerController {
     }
 }
 
+/// The edge's round-trip time in whole milliseconds, or [`None`] before the first pong.
+fn rtt_millis(edge: &EdgeTransport) -> Option<u32> {
+    edge.rtt().map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
+}
+
 fn fail(shared: &Arc<Shared>, message: String) {
     shared.log("warn", message);
     shared.emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
@@ -676,13 +687,22 @@ async fn bring_up_replay(
 
     // Beacon a liveness heartbeat to the Client so it can tell the Player is up even when no
     // CW is flowing. The Client times out and reconnects if these stop arriving.
+    // Each tick also sends a ping the Client answers, so this side can measure the round trip
+    // the UI shows.
     let hb_edge = Arc::clone(&edge);
+    let rtt_shared = Arc::clone(shared);
     let heartbeat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let mut beats: u32 = 0;
         loop {
             tick.tick().await;
             if hb_edge.send_heartbeat().await.is_err() {
                 // A failed heartbeat is already folded into PathHealth/F9; keep beaconing.
+            }
+            let _ = hb_edge.send_ping().await;
+            beats = beats.wrapping_add(1);
+            if beats % RTT_EVERY_TICKS == 0 {
+                rtt_shared.emit(ServerEvent::Rtt { ms: rtt_millis(&hb_edge) });
             }
         }
     });
