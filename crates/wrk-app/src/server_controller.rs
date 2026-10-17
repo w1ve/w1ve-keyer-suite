@@ -14,6 +14,7 @@ use rwk_core::config::{Config, Role};
 use rwk_core::engine::bus::{CoreEvent, EventBus};
 use rwk_core::engine::edge_station::{pump_edges, tunnel_replayer};
 use rwk_core::engine::network::EdgeTransport;
+use rwk_core::engine::keying_arbiter::{KeyingArbiter, LineObserver, LineUpdate};
 use rwk_core::engine::replay::{spawn_driver, EdgeJitterProfile, KeyingOutput, SerialKeyingAdapter};
 use rwk_core::engine::serial::{
     enumerate_ports, natural_port_key, KeyingOutputConfig, SerialKeyingOutput,
@@ -24,6 +25,7 @@ use rwk_core::primitives::KeyingLine;
 use rwk_core::timing::{Clock, MonotonicClock};
 
 use crate::app_paths;
+use crate::logger_host::{HostReport, HostReporter, LoggerHost};
 use crate::pairing::{self, Transport};
 
 const EDGE_PORT: u16 = 5555;
@@ -31,6 +33,7 @@ const EDGE_PORT: u16 = 5555;
 /// Control identifiers for inline error messages in the UI.
 mod control {
     pub const KEYING: &str = "keying";
+    pub const LOGGER: &str = "logger";
 }
 
 /// An event the Server controller emits for the UI.
@@ -49,7 +52,10 @@ pub enum ServerEvent {
         transport: String,
         relay: String,
         token: String,
+        logger_port: Option<String>,
     },
+    /// The Player's logger input is sending CW (`true`) or idle (`false`).
+    LoggerSending { active: bool },
     /// The live list of LAN keyers available to connect to (for the dropdown).
     LanPeers { peers: Vec<LanPeerView> },
     /// The current serial-port inventory.
@@ -76,6 +82,7 @@ pub type EventSink = Arc<dyn Fn(ServerEvent) + Send + Sync>;
 #[derive(Debug, Clone)]
 struct Settings {
     keying_port: Option<String>,
+    logger_port: Option<String>,
     key_line: KeyingLine,
     ptt_line: Option<KeyingLine>,
     transport: Transport,
@@ -88,6 +95,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             keying_port: None,
+            logger_port: None,
             key_line: KeyingLine::Dtr,
             ptt_line: Some(KeyingLine::Rts),
             transport: Transport::Wan,
@@ -147,6 +155,7 @@ impl Shared {
             transport: s.transport.as_str().into(),
             relay: s.relay.clone(),
             token: s.token.clone(),
+            logger_port: s.logger_port.clone(),
         });
     }
 
@@ -160,11 +169,29 @@ impl Shared {
 }
 
 /// The resources a running pairing owns.
+///
+/// The `session` (tunnel + edge UDP socket) and the `edge` transport are independent of the
+/// replay driver, so the driver can be rebuilt live — e.g. when the operator changes the
+/// keying port — by stopping the old `pump`/bus and starting a new driver on the same `edge`
+/// (see [`ServerController::rebind_keying_output`]). `edge` and `clock` are retained for
+/// exactly that rebuild.
 struct ActiveSession {
     session: Session,
+    edge: Arc<EdgeTransport>,
+    clock: Arc<dyn Clock>,
     pump: tokio::task::JoinHandle<rwk_core::Result<()>>,
     stop_bus: Arc<AtomicBool>,
+    /// The logger-WinKeyer host, if running. Declared before `_arbiter` so it drops first.
+    logger: Option<LoggerHost>,
+    /// The keying arbiter the logger and remote replay share; held so it lives for the session.
+    _arbiter: Option<Arc<KeyingArbiter>>,
+    /// Sends a liveness heartbeat to the Client ~once a second so the Client can tell the
+    /// Player is still up even when no CW is flowing. Aborted on disconnect.
+    heartbeat: tokio::task::JoinHandle<()>,
 }
+
+/// How often the Player beacons a liveness heartbeat to the Client.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The Server controller.
 pub struct ServerController {
@@ -249,7 +276,11 @@ impl ServerController {
         let paired = self.is_paired();
         let mut present = Self::serial_ports();
         if paired {
-            if let Some(p) = self.shared.settings.lock().unwrap().keying_port.clone() {
+            let held = {
+                let s = self.shared.settings.lock().unwrap();
+                [s.keying_port.clone(), s.logger_port.clone()]
+            };
+            for p in held.into_iter().flatten() {
                 if !present.contains(&p) {
                     present.push(p);
                 }
@@ -261,9 +292,12 @@ impl ServerController {
         if paired {
             return;
         }
-        let keying_gone = {
+        let (keying_gone, logger_gone) = {
             let s = self.shared.settings.lock().unwrap();
-            matches!(&s.keying_port, Some(name) if !present.iter().any(|p| p == name))
+            let gone = |port: &Option<String>| {
+                matches!(port, Some(name) if !present.iter().any(|p| p == name))
+            };
+            (gone(&s.keying_port), gone(&s.logger_port))
         };
         if keying_gone {
             let name = self.shared.settings.lock().unwrap().keying_port.take();
@@ -271,24 +305,108 @@ impl ServerController {
                 self.shared.log("warn", format!("Keying port {n} removed; set to (None)."));
             }
             self.shared.clear_error(control::KEYING);
+        }
+        if logger_gone {
+            let name = self.shared.settings.lock().unwrap().logger_port.take();
+            if let Some(n) = name {
+                self.shared.log("warn", format!("Logger port {n} removed; set to (None)."));
+            }
+            self.shared.clear_error(control::LOGGER);
+        }
+        if keying_gone || logger_gone {
             self.shared.emit_settings();
         }
     }
 
     pub fn select_keying_port(&self, port: Option<String>) {
+        let logger = self.shared.settings.lock().unwrap().logger_port.clone();
+        if let (Some(p), Some(other)) = (&port, &logger) {
+            if p == other {
+                self.shared.fail(
+                    control::KEYING,
+                    format!("{p} is the logger port"),
+                    format!("{p} is already the logger port; a port can serve one job."),
+                );
+                return;
+            }
+        }
         self.shared.settings.lock().unwrap().keying_port = port;
         self.shared.clear_error(control::KEYING);
         self.shared.emit_settings();
+        // Apply the change live if we are paired, so fixing a bad port (or clearing it) takes
+        // effect immediately without the operator unpairing and re-pairing.
+        self.rebind_keying_output();
+    }
+
+    /// Selects the serial port the Player's logger (a WinKeyer host) talks on. Exclusive with the
+    /// keying port: one port serves one job. Applied live while paired, like the keying port.
+    pub fn select_logger_port(&self, port: Option<String>) {
+        let keying = self.shared.settings.lock().unwrap().keying_port.clone();
+        if let (Some(p), Some(other)) = (&port, &keying) {
+            if p == other {
+                self.shared.fail(
+                    control::LOGGER,
+                    format!("{p} is the keying port"),
+                    format!("{p} is already the keying port; a port can serve one job."),
+                );
+                return;
+            }
+        }
+        self.shared.settings.lock().unwrap().logger_port = port;
+        self.shared.clear_error(control::LOGGER);
+        self.shared.emit_settings();
+        self.rebind_keying_output();
+    }
+
+    /// Rebuilds the replay driver on the **live** session to pick up the current keying-port /
+    /// line selection, reusing the same tunnel + edge transport. No-op when not paired.
+    ///
+    /// This stops the old driver (which joins its threads and forces the key up on the old
+    /// output) and starts a fresh one on the same edge. The new replayer re-anchors on the
+    /// keyer's next frame, so a brief moment of no keying across the swap is expected and
+    /// harmless — the operator is deliberately changing hardware.
+    fn rebind_keying_output(&self) {
+        let (keying_port, logger_port, key_line, ptt_line) = {
+            let s = self.shared.settings.lock().unwrap();
+            (s.keying_port.clone(), s.logger_port.clone(), s.key_line, s.ptt_line)
+        };
+        let mut guard = self.active.lock().unwrap();
+        let Some(active) = guard.as_mut() else { return };
+
+        // Stop the old driver + bus forwarder. Aborting the pump drops its owned DriverHandle,
+        // which joins the replay/watchdog threads and releases the old serial port.
+        active.stop_bus.store(true, Ordering::SeqCst);
+        active.pump.abort();
+        // Release the old logger and arbiter before the new ones claim their ports.
+        active.logger = None;
+        active._arbiter = None;
+
+        self.shared.log("info", "Applying keying output change…");
+        let (pump, stop_bus, logger, arbiter) = start_replay_driver(
+            &self.shared,
+            &active.edge,
+            &active.clock,
+            &keying_port,
+            key_line,
+            ptt_line,
+            &logger_port,
+        );
+        active.pump = pump;
+        active.stop_bus = stop_bus;
+        active.logger = logger;
+        active._arbiter = arbiter;
     }
 
     pub fn set_key_line(&self, line: &str) {
         self.shared.settings.lock().unwrap().key_line = parse_line(line).unwrap_or(KeyingLine::Dtr);
         self.shared.emit_settings();
+        self.rebind_keying_output();
     }
 
     pub fn set_ptt_line(&self, line: &str) {
         self.shared.settings.lock().unwrap().ptt_line = parse_line(line);
         self.shared.emit_settings();
+        self.rebind_keying_output();
     }
 
     pub fn set_transport(&self, transport: &str) {
@@ -312,20 +430,21 @@ impl ServerController {
     /// Begins listening: the Server waits for the Client to pair over the current transport +
     /// token, then replays received edges onto the radio.
     pub fn listen(&self) {
-        let (transport, relay, token, keying_port, key_line, ptt_line) = {
+        let (transport, relay, token, keying_port, logger_port, key_line, ptt_line) = {
             let s = self.shared.settings.lock().unwrap();
-            (s.transport, s.relay.clone(), s.token.clone(), s.keying_port.clone(), s.key_line, s.ptt_line)
+            (
+                s.transport,
+                s.relay.clone(),
+                s.token.clone(),
+                s.keying_port.clone(),
+                s.logger_port.clone(),
+                s.key_line,
+                s.ptt_line,
+            )
         };
-        if keying_port.is_none() {
-            self.shared.fail(
-                control::KEYING,
-                "select a port",
-                "Select a keying output port before starting.",
-            );
-            self.shared
-                .emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
-            return;
-        }
+        // A keying port is NOT required to start: with none selected the Server still runs and
+        // shows keying on the KEY LED (nothing is wired to the radio). The port is opened
+        // best-effort in `bring_up_replay`.
         self.shared.clear_error(control::KEYING);
         self.disconnect();
 
@@ -347,7 +466,16 @@ impl ServerController {
                 Err(e) => return fail(&shared, format!("link failed: {e}")),
             };
             let config = config;
-            bring_up_replay(&shared, &active_slot, connected, &config, keying_port, key_line, ptt_line)
+            bring_up_replay(
+                &shared,
+                &active_slot,
+                connected,
+                &config,
+                keying_port,
+                logger_port,
+                key_line,
+                ptt_line,
+            )
                 .await;
         });
     }
@@ -403,18 +531,11 @@ impl ServerController {
     /// Picks a browsed keyer by its base64 public key and brings the link up as the initiator,
     /// then starts replaying its edges onto the radio.
     pub fn connect_lan(&self, peer_key_b64: &str, peer_endpoint: &str) {
-        let (keying_port, key_line, ptt_line) = {
+        let (keying_port, logger_port, key_line, ptt_line) = {
             let s = self.shared.settings.lock().unwrap();
-            (s.keying_port.clone(), s.key_line, s.ptt_line)
+            (s.keying_port.clone(), s.logger_port.clone(), s.key_line, s.ptt_line)
         };
-        if keying_port.is_none() {
-            self.shared.fail(
-                control::KEYING,
-                "select a port",
-                "Select a keying output port before connecting.",
-            );
-            return;
-        }
+        // A keying port is not required (see `listen`): best-effort open in `bring_up_replay`.
         self.shared.clear_error(control::KEYING);
         let peer_key = match rwk_core::config::base64_decode(peer_key_b64)
             .ok()
@@ -468,7 +589,16 @@ impl ServerController {
                 Ok(c) => c,
                 Err(e) => return fail(&shared, format!("LAN link failed: {e}")),
             };
-            bring_up_replay(&shared, &active_slot, connected, &config, keying_port, key_line, ptt_line)
+            bring_up_replay(
+                &shared,
+                &active_slot,
+                connected,
+                &config,
+                keying_port,
+                logger_port,
+                key_line,
+                ptt_line,
+            )
                 .await;
         });
     }
@@ -476,8 +606,9 @@ impl ServerController {
     pub fn disconnect(&self) {
         self.stop_browse();
         let active = self.active.lock().unwrap().take();
-        if let Some(mut active) = active {
+        if let Some(active) = active {
             active.stop_bus.store(true, Ordering::SeqCst);
+            active.heartbeat.abort();
             active.pump.abort();
             let mut session = active.session;
             self.runtime.block_on(async { session.shutdown().await });
@@ -511,6 +642,7 @@ async fn bring_up_replay(
     connected: tunnel::Connected,
     config: &Config,
     keying_port: Option<String>,
+    logger_port: Option<String>,
     key_line: KeyingLine,
     ptt_line: Option<KeyingLine>,
 ) {
@@ -531,51 +663,197 @@ async fn bring_up_replay(
     );
     edge.set_peer(peer).await;
 
-    let port_name = keying_port.expect("checked present before connect");
-    let cfg = KeyingOutputConfig {
-        port_name: port_name.clone(),
+    let clock: Arc<dyn Clock> = Arc::new(MonotonicClock);
+    let (pump, stop_bus, logger, arbiter) = start_replay_driver(
+        shared,
+        &edge,
+        &clock,
+        &keying_port,
         key_line,
-        ptt_line: ptt_line.unwrap_or(KeyingLine::None),
-        ..Default::default()
-    };
-    let serial = match SerialKeyingOutput::open(cfg) {
-        Ok(out) => out,
-        Err(e) => {
-            shared.fail(
-                control::KEYING,
-                format!("{port_name} not available"),
-                format!("keying port {port_name} failed: {e}"),
-            );
-            shared.emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
-            return;
+        ptt_line,
+        &logger_port,
+    );
+
+    // Beacon a liveness heartbeat to the Client so it can tell the Player is up even when no
+    // CW is flowing. The Client times out and reconnects if these stop arriving.
+    let hb_edge = Arc::clone(&edge);
+    let heartbeat = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            tick.tick().await;
+            if hb_edge.send_heartbeat().await.is_err() {
+                // A failed heartbeat is already folded into PathHealth/F9; keep beaconing.
+            }
+        }
+    });
+
+    *active_slot.lock().unwrap() = Some(ActiveSession {
+        session,
+        edge: Arc::clone(&edge),
+        clock,
+        pump,
+        stop_bus,
+        logger,
+        _arbiter: arbiter,
+        heartbeat,
+    });
+    shared.emit(ServerEvent::Connection { state: "connected".into(), path: path.clone() });
+    shared.log("info", format!("Paired with the keyer over the {path} path."));
+}
+
+/// Opens the keying output and spawns the replay driver + bus forwarder + edge pump for an
+/// **already-open** edge transport, returning the pump task and the bus-forwarder stop flag.
+///
+/// Factored out of [`bring_up_replay`] so the driver can be rebuilt on a live session (reusing
+/// the same [`Session`] and [`EdgeTransport`]) when the operator changes the keying port,
+/// without tearing the tunnel down. A fresh replayer re-anchors on the keyer's next frame, so
+/// this behaves like a clean reconnect to the replayer even though the link never dropped.
+///
+/// The keying output is opened **best-effort**: no port, or a port that will not open, leaves
+/// the hardware side `None` and the Server keys the KEY/PTT LEDs only.
+fn start_replay_driver(
+    shared: &Arc<Shared>,
+    edge: &Arc<EdgeTransport>,
+    clock: &Arc<dyn Clock>,
+    keying_port: &Option<String>,
+    key_line: KeyingLine,
+    ptt_line: Option<KeyingLine>,
+    logger_port: &Option<String>,
+) -> (
+    tokio::task::JoinHandle<rwk_core::Result<()>>,
+    Arc<AtomicBool>,
+    Option<LoggerHost>,
+    Option<Arc<KeyingArbiter>>,
+) {
+    let serial: Option<SerialKeyingOutput> = match keying_port {
+        Some(port_name) => {
+            let cfg = KeyingOutputConfig {
+                port_name: port_name.clone(),
+                key_line,
+                ptt_line: ptt_line.unwrap_or(KeyingLine::None),
+                ..Default::default()
+            };
+            match SerialKeyingOutput::open(cfg) {
+                Ok(out) => {
+                    shared.clear_error(control::KEYING);
+                    shared.log("info", format!("Keying output open on {port_name}."));
+                    Some(out)
+                }
+                Err(e) => {
+                    // Surface the problem but keep running with no hardware output.
+                    shared.fail(
+                        control::KEYING,
+                        format!("{port_name} not available"),
+                        format!("keying port {port_name} failed: {e}. Keying the LED only; \
+                                 pick an available port to drive the radio."),
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            shared.clear_error(control::KEYING);
+            shared.log("info", "No keying port selected — keying the LED only.");
+            None
         }
     };
-    shared.clear_error(control::KEYING);
-    shared.log("info", format!("Keying output open on {port_name}."));
 
-    let clock: Arc<dyn Clock> = Arc::new(MonotonicClock);
     let mut replayer = tunnel_replayer(clock.as_ref(), EdgeJitterProfile::PathAdaptive, None);
     replayer.begin_session(1);
 
     let bus = EventBus::new();
-    let output = UiKeyingOutput::new(SerialKeyingAdapter::new(serial), Arc::clone(shared));
-    let path_health = rwk_core::engine::network::PathHealth::new();
+    // With a keying output, the arbiter lets the Player's logger key the radio alongside remote
+    // replay (local priority). Without one there is nothing to key, so the LED-only output
+    // stands in and the logger cannot start.
+    let (output, arbiter, logger): (
+        Box<dyn KeyingOutput + Send>,
+        Option<Arc<KeyingArbiter>>,
+        Option<LoggerHost>,
+    ) = match serial {
+        Some(out) => {
+            let arbiter = Arc::new(KeyingArbiter::with_observer(
+                SerialKeyingAdapter::new(out),
+                Some(make_line_observer(Arc::clone(shared))),
+            ));
+            let logger = match logger_port {
+                Some(lp) => {
+                    match LoggerHost::open(lp, arbiter.local_handle(), make_host_reporter(Arc::clone(shared))) {
+                        Ok(host) => {
+                            shared.clear_error(control::LOGGER);
+                            shared.log("info", format!("Logger input active on {}.", host.port_name()));
+                            Some(host)
+                        }
+                        Err(e) => {
+                            shared.fail(
+                                control::LOGGER,
+                                format!("{lp} not available"),
+                                format!("Logger input unavailable: {e}"),
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            (Box::new(arbiter.remote_output()) as Box<dyn KeyingOutput + Send>, Some(arbiter), logger)
+        }
+        None => {
+            if let Some(lp) = logger_port {
+                shared.fail(
+                    control::LOGGER,
+                    "Select a keying port first",
+                    format!("Logger {lp} not started: a keying port is needed to key the radio from the logger."),
+                );
+            }
+            (Box::new(UiKeyingOutput::new(None, Arc::clone(shared))), None, None)
+        }
+    };
+    // F9's event source is the EDGE transport's real path-health flag, not a fresh one: a run
+    // of failed sends to a vanished peer raises it, and the watchdog turns that into F9.
     let driver = spawn_driver(
         replayer,
-        Box::new(output),
-        Arc::clone(&clock),
+        output,
+        Arc::clone(clock),
         Some(bus.clone()),
-        Some(path_health),
+        Some(edge.health()),
     );
 
     let stop_bus = Arc::new(AtomicBool::new(false));
     spawn_bus_forwarder(bus, Arc::clone(shared), Arc::clone(&stop_bus));
 
-    let pump = tokio::spawn(pump_edges(Arc::clone(&edge), driver));
+    let pump = tokio::spawn(pump_edges(Arc::clone(edge), driver));
+    (pump, stop_bus, logger, arbiter)
+}
 
-    *active_slot.lock().unwrap() = Some(ActiveSession { session, pump, stop_bus });
-    shared.emit(ServerEvent::Connection { state: "connected".into(), path: path.clone() });
-    shared.log("info", format!("Paired with the keyer over the {path} path."));
+/// Builds the arbiter's line observer: emits KEY/PTT to the UI only on an actual change, so the
+/// LEDs follow both the remote replay and the Player's logger.
+fn make_line_observer(shared: Arc<Shared>) -> LineObserver {
+    let last_key = Arc::new(Mutex::new(None::<bool>));
+    let last_ptt = Arc::new(Mutex::new(None::<bool>));
+    Arc::new(move |u: LineUpdate| {
+        {
+            let mut lk = last_key.lock().unwrap_or_else(|e| e.into_inner());
+            if *lk != Some(u.key_down) {
+                *lk = Some(u.key_down);
+                shared.emit(ServerEvent::KeyState { down: u.key_down });
+            }
+        }
+        {
+            let mut lp = last_ptt.lock().unwrap_or_else(|e| e.into_inner());
+            if *lp != Some(u.ptt) {
+                *lp = Some(u.ptt);
+                shared.emit(ServerEvent::Ptt { asserted: u.ptt });
+            }
+        }
+    })
+}
+
+/// Builds the logger host's reporter: logs its lines and bridges the sending indicator.
+fn make_host_reporter(shared: Arc<Shared>) -> HostReporter {
+    Arc::new(move |report: HostReport| match report {
+        HostReport::Log { level, message } => shared.log(&level, message),
+        HostReport::Sending(active) => shared.emit(ServerEvent::LoggerSending { active }),
+    })
 }
 
 fn spawn_bus_forwarder(bus: EventBus, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
@@ -597,23 +875,30 @@ fn spawn_bus_forwarder(bus: EventBus, shared: Arc<Shared>, stop: Arc<AtomicBool>
         .expect("spawn bus forwarder");
 }
 
-/// A keying output that drives the serial line and reports KEY/PTT to the UI on each change.
+/// A keying output that reports KEY/PTT to the UI on each change and, **when a serial port is
+/// open**, drives the hardware line too. The serial side is optional: with no keying port
+/// selected (or one that could not be opened), `inner` is `None` and the Server still runs —
+/// the KEY/PTT LEDs follow the keyer, there is simply nothing wired to the radio. This is what
+/// lets the operator start the Player without a port and pick/fix one later without the
+/// missing hardware ever stopping the session.
 struct UiKeyingOutput {
-    inner: SerialKeyingAdapter,
+    inner: Option<SerialKeyingAdapter>,
     shared: Arc<Shared>,
     last_key: Option<bool>,
     last_ptt: Option<bool>,
 }
 
 impl UiKeyingOutput {
-    fn new(inner: SerialKeyingAdapter, shared: Arc<Shared>) -> Self {
+    fn new(inner: Option<SerialKeyingAdapter>, shared: Arc<Shared>) -> Self {
         Self { inner, shared, last_key: None, last_ptt: None }
     }
 }
 
 impl KeyingOutput for UiKeyingOutput {
     fn set_key(&mut self, key_down: bool) {
-        self.inner.set_key(key_down);
+        if let Some(inner) = self.inner.as_mut() {
+            inner.set_key(key_down);
+        }
         if self.last_key != Some(key_down) {
             self.last_key = Some(key_down);
             self.shared.emit(ServerEvent::KeyState { down: key_down });
@@ -621,7 +906,9 @@ impl KeyingOutput for UiKeyingOutput {
     }
 
     fn set_ptt(&mut self, asserted: bool) {
-        self.inner.set_ptt(asserted);
+        if let Some(inner) = self.inner.as_mut() {
+            inner.set_ptt(asserted);
+        }
         if self.last_ptt != Some(asserted) {
             self.last_ptt = Some(asserted);
             self.shared.emit(ServerEvent::Ptt { asserted });
@@ -629,7 +916,7 @@ impl KeyingOutput for UiKeyingOutput {
     }
 
     fn take_fault(&mut self) -> Option<String> {
-        self.inner.take_fault()
+        self.inner.as_mut().and_then(|i| i.take_fault())
     }
 }
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { serverApi as api, onEvent } from "./api.js";
 import TransportSlider from "./TransportSlider.jsx";
+import LogPanel from "./LogPanel.jsx";
 
 // The Remote Keyer Server: keying-output configuration, WAN/LAN choice, the pairing token to
 // hand the Client, KEY/PTT indicators, and a fail-safe banner. Same look-and-feel as the
@@ -8,6 +9,7 @@ import TransportSlider from "./TransportSlider.jsx";
 export default function ServerApp() {
   const [settings, setSettings] = useState({
     keyingPort: null,
+    loggerPort: null,
     keyLine: "dtr",
     pttLine: "rts",
     transport: "wan",
@@ -30,6 +32,7 @@ export default function ServerApp() {
         case "settings":
           setSettings({
             keyingPort: ev.keying_port,
+            loggerPort: ev.logger_port,
             keyLine: ev.key_line,
             pttLine: ev.ptt_line,
             transport: ev.transport,
@@ -89,7 +92,7 @@ export default function ServerApp() {
   return (
     <div className="app">
       <div className="statusbar" style={{ borderTop: "none", borderBottom: "1px solid var(--border)" }}>
-        <strong style={{ color: "var(--accent)" }}>W1VE Remote Keyer — Server</strong>
+        <strong style={{ color: "var(--accent)" }}>W1VE Remote Keyer — Player</strong>
         <span className="spring" />
         <span className="led" style={{ color: linkColor }}>●</span>
         <span>{pathText}</span>
@@ -131,7 +134,6 @@ export default function ServerApp() {
                 <label>Serial port</label>
                 <select
                   value={settings.keyingPort || ""}
-                  disabled={running || connecting}
                   onChange={(e) => api.selectKeyingPort(e.target.value || null)}
                 >
                   <option value="">(None)</option>
@@ -150,12 +152,33 @@ export default function ServerApp() {
                   </div>
                 )}
               </div>
+              <div className="field">
+                <label>Logger port (WinKeyer, optional)</label>
+                <select
+                  value={settings.loggerPort || ""}
+                  onChange={(e) => api.selectLoggerPort(e.target.value || null)}
+                >
+                  <option value="">(None)</option>
+                  {(settings.loggerPort && !ports.includes(settings.loggerPort)
+                    ? [...ports, settings.loggerPort]
+                    : ports
+                  ).map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))}
+                </select>
+                {errors.logger && (
+                  <div style={{ color: "var(--bad, #e06c6c)", fontSize: 12, marginTop: 4 }}>
+                    {errors.logger}
+                  </div>
+                )}
+              </div>
               <div className="row" style={{ gap: 10 }}>
                 <div className="field" style={{ flex: 1, marginBottom: 0 }}>
                   <label>Key line</label>
                   <select
                     value={settings.keyLine}
-                    disabled={running || connecting}
                     onChange={(e) => api.setKeyLine(e.target.value)}
                   >
                     <option value="dtr">DTR</option>
@@ -166,7 +189,6 @@ export default function ServerApp() {
                   <label>PTT line</label>
                   <select
                     value={settings.pttLine}
-                    disabled={running || connecting}
                     onChange={(e) => api.setPttLine(e.target.value)}
                   >
                     <option value="rts">RTS</option>
@@ -220,7 +242,6 @@ export default function ServerApp() {
                     ) : (
                       <button
                         onClick={() => api.listen()}
-                        disabled={!settings.keyingPort}
                         style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
                       >
                         Start
@@ -261,7 +282,7 @@ export default function ServerApp() {
                           const peer = lanPeers.find((p) => p.key === pickedKey);
                           if (peer) api.connectLan(peer.key, peer.endpoint);
                         }}
-                        disabled={!settings.keyingPort || !pickedKey}
+                        disabled={!pickedKey}
                         style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
                       >
                         Connect
@@ -273,8 +294,8 @@ export default function ServerApp() {
             </div>
             <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0, marginTop: 8 }}>
               {settings.transport === "wan"
-                ? "Select a keying port, then Start and give the token to the Client."
-                : "Select a keying port, pick a keyer advertising on your LAN, then Connect. No relay, no internet."}
+                ? "Start and give the token to the Client. A keying port is optional — without one the KEY LED still follows the Client; pick or change the port any time."
+                : "Pick a keyer advertising on your LAN, then Connect. A keying port is optional and can be set or changed any time. No relay, no internet."}
             </p>
           </div>
 
@@ -312,32 +333,6 @@ function Indicator({ label, on, onColor }) {
       <span style={{ fontSize: 13, fontWeight: 700, color: on ? onColor : "var(--text-dim)" }}>
         {label}
       </span>
-    </div>
-  );
-}
-
-function LogPanel({ log }) {
-  return (
-    <div className="panel">
-      <h3>Log</h3>
-      <div
-        style={{
-          fontFamily: "Consolas, monospace",
-          fontSize: 12,
-          whiteSpace: "pre-wrap",
-          color: "var(--text-dim)",
-          maxHeight: 140,
-          overflow: "auto",
-        }}
-      >
-        {log.length === 0
-          ? "(no messages yet)"
-          : log.map((l, i) => (
-              <div key={i} style={{ color: l.level === "warn" ? "var(--warn)" : undefined }}>
-                {l.t.toLocaleTimeString()} [{l.level}] {l.message}
-              </div>
-            ))}
-      </div>
     </div>
   );
 }

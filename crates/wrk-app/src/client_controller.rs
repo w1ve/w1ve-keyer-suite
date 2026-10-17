@@ -24,19 +24,20 @@ use std::sync::{Arc, Condvar, Mutex};
 use rwk_core::config::{Config, Role};
 use rwk_core::engine::audio::SidetoneEngine;
 use rwk_core::engine::debounce::ContactDebouncer;
-use rwk_core::engine::edge_sender::EdgeSender;
-use rwk_core::engine::keying::{EdgeEvent, KeyerElement, KeyerElementTiming};
+use rwk_core::engine::edge_session::EdgeSession;
+use rwk_core::engine::keying::{KeyerElement, KeyerElementTiming};
 use rwk_core::engine::lan_discovery::{Beacon, LanAdvertiser};
 use rwk_core::engine::network::EdgeTransport;
 use rwk_core::engine::paddle::PaddleKeyer;
 use rwk_core::engine::paddle_input::PaddleInputPort;
 use rwk_core::engine::serial::{
-    enumerate_ports, natural_port_key, KeyingOutputConfig, SerialKeyingOutput,
+    enumerate_ports, natural_port_key,
 };
 use rwk_core::engine::session::Session;
 use rwk_core::engine::tunnel;
 use rwk_core::platform::{ThreadPriorityGuard, TimerResolutionGuard};
-use rwk_core::primitives::{EdgeSource, KeyerMode, KeyingLine};
+use rwk_core::protocol::winkeyer_host::{Decoder as WinKeyerHostDecoder, HostEvent};
+use rwk_core::primitives::KeyerMode;
 use rwk_core::protocol::morse::MorseTable;
 use rwk_core::timing::{Clock, HybridWaiter, MonotonicClock};
 
@@ -46,9 +47,21 @@ use crate::pairing::{self, Transport};
 /// The inner UDP port the keying edge rides over the tunnel, matching the Server.
 const EDGE_PORT: u16 = 5555;
 
+/// How often the Client beacons a liveness heartbeat to the Player.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long the Client waits without ANY inbound traffic from the Player (heartbeats or any
+/// datagram) before declaring the peer lost and reconnecting. Five seconds rides out a brief
+/// relay/roaming hiccup while still catching a Player that was closed.
+const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Consecutive failed reconnect attempts after which the Client gives up and stays
+/// disconnected (the operator must reconnect manually).
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+
 /// Control identifiers for inline error messages in the UI.
 mod control {
-    pub const KEYING: &str = "keying";
+    pub const LOGGER: &str = "logger";
     pub const PADDLE: &str = "paddle";
     pub const AUDIO: &str = "audio";
 }
@@ -72,6 +85,8 @@ pub enum ClientEvent {
         relay: String,
         callsign: String,
         keyer_id: String,
+        paddle_port: Option<String>,
+        logger_port: Option<String>,
     },
     /// Whether the LAN discovery beacon is currently being advertised.
     Advertising { active: bool },
@@ -106,7 +121,7 @@ struct Settings {
     tone_volume: u32,
     /// `None` = default output device; `Some("")` = sidetone off; `Some(name)` = that device.
     audio_device: Option<String>,
-    keying_port: Option<String>,
+    logger_port: Option<String>,
     paddle_port: Option<String>,
     transport: Transport,
     relay: String,
@@ -124,7 +139,7 @@ impl Default for Settings {
             tone_hz: 600,
             tone_volume: 70,
             audio_device: None,
-            keying_port: None,
+            logger_port: None,
             paddle_port: None,
             transport: Transport::Wan,
             relay: pairing::DEFAULT_WAN_RELAY.to_string(),
@@ -289,23 +304,23 @@ impl SendBuffer {
 struct Shared {
     settings: Mutex<Settings>,
     sidetone: Mutex<Option<Sidetone>>,
-    keying: Mutex<Option<SerialKeyingOutput>>,
+    /// The WinKeyer host thread on the logger port, present while a logger port is selected.
+    logger: Mutex<Option<LoggerHandle>>,
     transport: Mutex<Option<Arc<EdgeTransport>>>,
-    /// Ordered, non-blocking outbound frame queue to the tunnel. `drive_edge` pushes finished
-    /// frames here; a single drain task (spawned per session in `bring_up_keying`) sends them
-    /// over the transport **in order**. This replaces a spawn-per-edge send, which did not
-    /// preserve order: at high WPM (~30ms elements) concurrent send tasks could reorder
-    /// datagrams, and the Station's sequence tracker then discarded the "old" sequence as a
-    /// duplicate — so keying stopped above ~39 WPM. One FIFO channel keeps edges ordered and
-    /// never blocks the time-critical keyer thread.
-    frame_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<rwk_core::protocol::edge::RwkPaddleFrame>>>,
     epoch: Mutex<u16>,
+    /// The shared session edge path (`rwk-core`): one sender for every edge source and one
+    /// ordered tunnel FIFO. Restarted once per pairing in `bring_up_keying`.
+    edge: EdgeSession,
     paddle: Mutex<Option<PaddlePollerHandle>>,
     /// The type-ahead / macro send buffer, drained by the single send-worker thread.
     send: SendBuffer,
     session: tokio::sync::Mutex<Option<Session>>,
     /// The running LAN advertiser task (operating-position side), present while advertising.
     advertise: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The running WAN connect supervisor (pair → key → watch liveness → reconnect), present
+    /// between a `connect` and the next `disconnect`/`connect`. Aborted so a new attempt or an
+    /// unpair never leaves a second supervisor looping.
+    supervisor: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     config: Mutex<Config>,
     config_path: Option<std::path::PathBuf>,
     sink: EventSink,
@@ -345,6 +360,8 @@ impl Shared {
             relay: s.relay.clone(),
             callsign: s.callsign.clone(),
             keyer_id: s.keyer_id.clone(),
+            paddle_port: s.paddle_port.clone(),
+            logger_port: s.logger_port.clone(),
         });
     }
 
@@ -397,14 +414,15 @@ impl ClientController {
         let shared = Arc::new(Shared {
             settings: Mutex::new(settings.clone()),
             sidetone: Mutex::new(None),
-            keying: Mutex::new(None),
+            logger: Mutex::new(None),
             transport: Mutex::new(None),
-            frame_tx: Mutex::new(None),
             epoch: Mutex::new(1),
+            edge: EdgeSession::new(MonotonicClock.frequency(), MonotonicClock.now()),
             paddle: Mutex::new(None),
             send: SendBuffer::default(),
             session: tokio::sync::Mutex::new(None),
             advertise: tokio::sync::Mutex::new(None),
+            supervisor: tokio::sync::Mutex::new(None),
             config: Mutex::new(config),
             config_path,
             sink,
@@ -597,53 +615,60 @@ impl ClientController {
                 held.push(p.clone());
             }
         }
-        if self.shared.keying.lock().unwrap().is_some() {
-            if let Some(p) = &s.keying_port {
+        if self.shared.logger.lock().unwrap().is_some() {
+            if let Some(p) = &s.logger_port {
                 held.push(p.clone());
             }
         }
         held
     }
 
-    pub fn select_keying_port(&self, port: Option<String>) {
-        self.shared.settings.lock().unwrap().keying_port = port.clone();
-        self.open_keying_port(port);
+    pub fn select_logger_port(&self, port: Option<String>) {
+        let paddle = self.shared.settings.lock().unwrap().paddle_port.clone();
+        if let (Some(p), Some(other)) = (&port, &paddle) {
+            if p == other {
+                self.shared.fail(
+                    control::LOGGER,
+                    format!("{p} is the paddle port"),
+                    format!("{p} is already the paddle input; a port can serve one job."),
+                );
+                return;
+            }
+        }
+        self.shared.settings.lock().unwrap().logger_port = port.clone();
+        self.open_logger_port(port);
         self.shared.emit_settings();
     }
 
     pub fn select_paddle_port(&self, port: Option<String>) {
+        let logger = self.shared.settings.lock().unwrap().logger_port.clone();
+        if let (Some(p), Some(other)) = (&port, &logger) {
+            if p == other {
+                self.shared.fail(
+                    control::PADDLE,
+                    format!("{p} is the logger port"),
+                    format!("{p} is already the logger port; a port can serve one job."),
+                );
+                return;
+            }
+        }
         self.shared.settings.lock().unwrap().paddle_port = port.clone();
         self.open_paddle_port(port);
         self.shared.emit_settings();
     }
 
-    fn open_keying_port(&self, port: Option<String>) {
-        let mut guard = self.shared.keying.lock().unwrap();
-        *guard = None;
+    fn open_logger_port(&self, port: Option<String>) {
+        // Replacing the handle drops the previous one, which stops its thread and frees the port.
+        *self.shared.logger.lock().unwrap() = None;
         let Some(name) = port else {
-            self.shared.clear_error(control::KEYING);
-            self.shared.log("info", "Local key line cleared.");
+            self.shared.clear_error(control::LOGGER);
+            self.shared.log("info", "Logger port cleared.");
             return;
         };
-        let cfg = KeyingOutputConfig {
-            port_name: name.clone(),
-            key_line: KeyingLine::Dtr,
-            ..Default::default()
-        };
-        match SerialKeyingOutput::open(cfg) {
-            Ok(out) => {
-                *guard = Some(out);
-                self.shared.clear_error(control::KEYING);
-                self.shared.log("info", format!("Keying output on {name}."));
-            }
-            Err(e) => {
-                self.shared.fail(
-                    control::KEYING,
-                    format!("{name} not available"),
-                    format!("Keying port {name} failed: {e}"),
-                );
-            }
-        }
+        let handle = spawn_logger(Arc::clone(&self.shared), name.clone());
+        *self.shared.logger.lock().unwrap() = Some(handle);
+        self.shared.clear_error(control::LOGGER);
+        self.shared.log("info", format!("Logger port {name} listening for WinKeyer commands."));
     }
 
     fn open_paddle_port(&self, port: Option<String>) {
@@ -674,7 +699,7 @@ impl ClientController {
         }
     }
 
-    /// Re-enumerates serial ports and reconciles the two selections (paddle, keying): any
+    /// Re-enumerates serial ports and reconciles the two selections (paddle, logger): any
     /// selected port no longer present is dropped to `None` and its handle released, without
     /// disturbing the other. Always emits the fresh port list; also refreshes audio devices.
     ///
@@ -693,11 +718,11 @@ impl ClientController {
         self.shared.emit(ClientEvent::Ports { available: present.clone() });
         self.emit_audio_devices();
 
-        let (paddle_gone, keying_gone) = {
+        let (paddle_gone, logger_gone) = {
             let s = self.shared.settings.lock().unwrap();
-            (port_missing(&s.paddle_port, &present), port_missing(&s.keying_port, &present))
+            (port_missing(&s.paddle_port, &present), port_missing(&s.logger_port, &present))
         };
-        if !(paddle_gone || keying_gone) {
+        if !(paddle_gone || logger_gone) {
             return;
         }
 
@@ -708,12 +733,12 @@ impl ClientController {
             }
             self.open_paddle_port(None);
         }
-        if keying_gone {
-            let name = self.shared.settings.lock().unwrap().keying_port.take();
+        if logger_gone {
+            let name = self.shared.settings.lock().unwrap().logger_port.take();
             if let Some(n) = name {
-                self.shared.log("warn", format!("Keying port {n} removed; set to (None)."));
+                self.shared.log("warn", format!("Logger port {n} removed; set to (None)."));
             }
-            self.open_keying_port(None);
+            self.open_logger_port(None);
         }
         self.shared.emit_settings();
     }
@@ -746,32 +771,80 @@ impl ClientController {
             (s.transport, s.relay.clone())
         };
         let token = token.to_string();
+        // Cancel any prior pairing / supervisor so a re-Connect never leaves two loops running.
+        self.disconnect();
         let shared = Arc::clone(&self.shared);
         shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
 
-        self.runtime.spawn(async move {
-            let base = shared.config.lock().unwrap().clone();
-            let config = match pairing::build_config(&base, Role::Client, transport, &token, &relay)
-            {
-                Ok(c) => c,
-                Err(e) => return fail(&shared, e),
-            };
+        let handle = self.runtime.spawn(async move {
+            // Supervised WAN connect: pair, key, and watch the Player's liveness. If the Player
+            // stops heartbeating (closed, or the link dropped), reconnect automatically with the
+            // same token, up to MAX_RECONNECT_ATTEMPTS consecutive failures before giving up.
+            let mut attempts: u32 = 0;
+            loop {
+                let base = shared.config.lock().unwrap().clone();
+                let config =
+                    match pairing::build_config(&base, Role::Client, transport, &token, &relay) {
+                        Ok(c) => c,
+                        Err(e) => return fail(&shared, e),
+                    };
 
-            let connected = match tunnel::connect(&config).await {
-                Ok(c) => c,
-                Err(e) => return fail(&shared, format!("link failed: {e}")),
-            };
-            bring_up_keying(&shared, connected).await;
+                match tunnel::connect(&config).await {
+                    Ok(connected) => {
+                        if let Some(edge) = bring_up_keying(&shared, connected).await {
+                            // Connected: a successful pairing clears the failure budget.
+                            attempts = 0;
+                            let outcome = watch_edge_liveness(edge).await;
+                            // Tear the dead session down before retrying.
+                            teardown_session(&shared).await;
+                            if outcome == Liveness::Closed {
+                                // A deliberate local teardown (unpair) ends the supervisor.
+                                return;
+                            }
+                            shared.log("warn", "Player stopped responding; reconnecting…");
+                            shared.emit(ClientEvent::Connection {
+                                state: "connecting".into(),
+                                path: "none".into(),
+                            });
+                            continue;
+                        }
+                        // bring_up failed after a link came up; count it as an attempt.
+                    }
+                    Err(e) => shared.log("warn", format!("link failed: {e}")),
+                }
+
+                attempts += 1;
+                if attempts >= MAX_RECONNECT_ATTEMPTS {
+                    fail(
+                        &shared,
+                        format!(
+                            "Could not reach the Player after {MAX_RECONNECT_ATTEMPTS} attempts; \
+                             giving up. Reconnect to try again."
+                        ),
+                    );
+                    return;
+                }
+                shared.log(
+                    "info",
+                    format!("Reconnect attempt {attempts}/{MAX_RECONNECT_ATTEMPTS}…"),
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+        self.runtime.block_on(async {
+            *self.shared.supervisor.lock().await = Some(handle);
         });
     }
 
     pub fn disconnect(&self) {
         *self.shared.transport.lock().unwrap() = None;
-        // Drop the outbound frame sender so the per-session drain task sees the channel close
-        // and exits; the next pairing installs a fresh channel + drain task.
-        *self.shared.frame_tx.lock().unwrap() = None;
+        // Ends the pairing's ordered tunnel FIFO; the next pairing starts a fresh one.
+        self.shared.edge.detach();
         let shared = Arc::clone(&self.shared);
         self.runtime.block_on(async move {
+            if let Some(task) = shared.supervisor.lock().await.take() {
+                task.abort();
+            }
             if let Some(task) = shared.advertise.lock().await.take() {
                 task.abort();
             }
@@ -838,26 +911,100 @@ async fn lan_advertise_and_await(shared: Arc<Shared>, callsign: String, keyer_id
         beacon_task.abort();
         shared.emit(ClientEvent::Advertising { active: false });
 
-        // 4. Bring the keying edge up. This installs the session (replacing any prior one,
-        //    which is dropped and torn down), then returns; we loop to re-advertise so the
-        //    next reconnect from the radio site is answered.
-        bring_up_keying(&shared, connected).await;
+        // 4. Bring the keying edge up, then watch the Player's liveness. When the Player stops
+        //    responding (closed, or the link dropped), tear the dead session down and loop to
+        //    re-advertise, so the radio site can re-establish without the operator re-arming.
+        if let Some(edge) = bring_up_keying(&shared, connected).await {
+            let _ = watch_edge_liveness(edge).await;
+            teardown_session(&shared).await;
+            shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
+            shared.log("info", "Player stopped responding; re-advertising on the LAN…");
+        }
+    }
+}
+
+/// Tears the current pairing's edge + session down without emitting "disconnected" or touching
+/// the LAN advertiser, so the WAN supervisor can reconnect cleanly. The time-critical keyer
+/// threads key into `shared.edge`, which is detached here; with no transport the frames are
+/// simply dropped until the next `bring_up_keying` reinstalls one.
+async fn teardown_session(shared: &Arc<Shared>) {
+    *shared.transport.lock().unwrap() = None;
+    shared.edge.detach();
+    if let Some(mut session) = shared.session.lock().await.take() {
+        session.shutdown().await;
+    }
+}
+
+/// Why an edge-liveness watch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// No inbound traffic from the Player within [`PEER_TIMEOUT`]; the peer is presumed gone.
+    PeerLost,
+    /// The edge receive stream ended (the tunnel/netstack closed) — a clean teardown.
+    Closed,
+}
+
+/// Watches the live edge for Player liveness while beaconing our own heartbeat.
+///
+/// Runs two things concurrently against the current `edge`:
+/// * a 1 Hz heartbeat sender, so the Player can tell this keyer is up even when idle;
+/// * an inbound watch: every datagram (a Player heartbeat, or any edge frame) refreshes a
+///   deadline; if [`PEER_TIMEOUT`] passes with silence, the peer is declared [`Liveness::PeerLost`].
+///
+/// Returns when the peer is lost or the stream closes. Keying out is unaffected — this only
+/// observes; the caller decides whether to reconnect.
+async fn watch_edge_liveness(edge: Arc<EdgeTransport>) -> Liveness {
+    let recv_edge = Arc::clone(&edge);
+    let receiver = async move {
+        loop {
+            // A received datagram (heartbeat or frame) proves the peer is alive this instant.
+            match tokio::time::timeout(PEER_TIMEOUT, recv_edge.recv_edge()).await {
+                // Any inbound datagram (Some) or a dropped-but-received one (None) = alive.
+                Ok(Ok(_)) => continue,
+                // The stream ended (netstack stopped): a clean close.
+                Ok(Err(_)) => return Liveness::Closed,
+                // No datagram at all within the window: the Player is presumed gone.
+                Err(_) => return Liveness::PeerLost,
+            }
+        }
+    };
+
+    let hb_edge = Arc::clone(&edge);
+    let heartbeat = async move {
+        let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            tick.tick().await;
+            let _ = hb_edge.send_heartbeat().await;
+        }
+    };
+
+    // The heartbeat future never completes; the receiver decides the outcome.
+    tokio::select! {
+        outcome = receiver => outcome,
+        _ = heartbeat => Liveness::Closed,
     }
 }
 
 /// Shared tail of both the WAN and LAN connect paths: start the session, open the keying edge
-/// over the tunnel, install it, and report connected.
-async fn bring_up_keying(shared: &Arc<Shared>, connected: tunnel::Connected) {
+/// over the tunnel, install it, and report connected. Returns the live [`EdgeTransport`] so the
+/// caller can watch it for peer liveness, or [`None`] if bring-up failed.
+async fn bring_up_keying(shared: &Arc<Shared>, connected: tunnel::Connected) -> Option<Arc<EdgeTransport>> {
     let path = format!("{:?}", connected.path).to_lowercase();
     let config = shared.config.lock().unwrap().clone();
     let session = match Session::start(connected, &config) {
         Ok(s) => s,
-        Err(e) => return fail(shared, format!("session failed: {e}")),
+        Err(e) => {
+            fail(shared, format!("session failed: {e}"));
+            return None;
+        }
     };
     let net = session.handle();
     let conn = match net.open_udp(EDGE_PORT).await {
         Ok(c) => c,
-        Err(e) => return fail(shared, format!("edge open failed: {e}")),
+        Err(e) => {
+            fail(shared, format!("edge open failed: {e}"));
+            return None;
+        }
     };
     let edge = Arc::new(EdgeTransport::over_tunnel(conn));
     let peer = std::net::SocketAddr::new(
@@ -866,20 +1013,10 @@ async fn bring_up_keying(shared: &Arc<Shared>, connected: tunnel::Connected) {
     );
     edge.set_peer(peer).await;
 
+    // A new pairing restarts the edge stream at sequence 0 and starts its ordered tunnel FIFO.
+    // The Station builds a fresh replayer per session, so it accepts the restart.
+    shared.edge.begin(*shared.epoch.lock().unwrap(), MonotonicClock.now(), Arc::clone(&edge));
     *shared.transport.lock().unwrap() = Some(Arc::clone(&edge));
-
-    // Spawn the ordered outbound drain task: it owns the receive half of the frame queue and
-    // sends each frame over the tunnel in FIFO order. drive_edge only ever pushes into the
-    // sender half, so the time-critical keyer thread never touches the network and datagrams
-    // leave in the exact order they were keyed.
-    let (frame_tx, mut frame_rx) =
-        tokio::sync::mpsc::unbounded_channel::<rwk_core::protocol::edge::RwkPaddleFrame>();
-    *shared.frame_tx.lock().unwrap() = Some(frame_tx);
-    tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            let _ = edge.send_frame(&frame).await;
-        }
-    });
 
     *shared.session.lock().await = Some(session);
     // The epoch is intentionally NOT bumped here. Both edge sources (the paddle poller and
@@ -888,7 +1025,8 @@ async fn bring_up_keying(shared: &Arc<Shared>, connected: tunnel::Connected) {
     // the first frame's epoch of each fresh session and re-anchors on reconnect, so a stable
     // epoch is both correct and necessary.
     shared.emit(ClientEvent::Connection { state: "connected".into(), path: path.clone() });
-    shared.log("info", format!("Paired with the Server over the {path} path."));
+    shared.log("info", format!("Paired with the Player over the {path} path."));
+    Some(edge)
 }
 
 impl Drop for ClientController {
@@ -922,22 +1060,111 @@ fn load_or_create(path: &Option<std::path::PathBuf>, role: Role) -> Config {
 
 // ─── Per-edge output fan-out (sidetone + key line + UI + tunnel) ───────────────
 
+// ─── Logger port: K1EL WinKeyer host ───────────────────────────────────────────
+
+/// Baud for the logger link (WinKeyer2 class; a virtual serial pair ignores the rate).
+const LOGGER_BAUD: u32 = 1200;
+/// How long the logger reader blocks before checking its stop flag.
+const LOGGER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The WinKeyer host thread on the logger port. Dropping it stops the thread and frees the port.
+struct LoggerHandle {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for LoggerHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Serves a logger on `port` as a WinKeyer host, on a dedicated thread.
+fn spawn_logger(shared: Arc<Shared>, port: String) -> LoggerHandle {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("wrk-logger".into())
+        .spawn(move || {
+            if let Err(e) = run_logger(&shared, &port, &stop_thread) {
+                shared.fail(
+                    control::LOGGER,
+                    format!("{port} not available"),
+                    format!("Logger port {port} failed: {e}"),
+                );
+            }
+        })
+        .expect("spawn logger thread");
+    LoggerHandle { stop, thread: Some(thread) }
+}
+
+/// The logger link: 1200 baud, read the logger's bytes, decode them with the shared WinKeyer host
+/// decoder, and write back its replies (the Admin Open version byte, echoes) before reading on.
+fn run_logger(shared: &Arc<Shared>, port_name: &str, stop: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+    let mut port = serialport::new(port_name, LOGGER_BAUD)
+        .timeout(LOGGER_READ_TIMEOUT)
+        .open()
+        .map_err(|e| e.to_string())?;
+    let mut decoder = WinKeyerHostDecoder::new();
+    let mut events: Vec<HostEvent> = Vec::new();
+    let mut buf = [0u8; 256];
+    shared.log("info", format!("Logger port {port_name} listening (WinKeyer2, {LOGGER_BAUD} baud)."));
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        match std::io::Read::read(&mut port, &mut buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                events.clear();
+                decoder.feed(&buf[..n], &mut events);
+                for event in events.drain(..) {
+                    handle_logger_event(shared, event);
+                }
+                let out = decoder.take_output();
+                if !out.is_empty() {
+                    let _ = std::io::Write::write_all(&mut port, &out);
+                    let _ = std::io::Write::flush(&mut port);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// Applies one WinKeyer command from the logger: text joins the send buffer, speed and weight
+/// update the keyer, and Clear Buffer aborts sending.
+fn handle_logger_event(shared: &Arc<Shared>, event: HostEvent) {
+    match event {
+        HostEvent::HostOpened => shared.log("info", "Logger opened host mode (WinKeyer2)."),
+        HostEvent::HostClosed => shared.log("info", "Logger closed host mode."),
+        HostEvent::Text(ch) => shared.send.push(&ch.to_string()),
+        HostEvent::SetSpeed(wpm) => {
+            shared.settings.lock().unwrap().wpm = wpm;
+            shared.emit_settings();
+        }
+        // The Client keys only through its send buffer, so an immediate key-down or up from the
+        // logger has no place to go and is ignored (the decoder already consumed its byte).
+        HostEvent::KeyImmediate(_) => {}
+        HostEvent::ClearBuffer => shared.send.abort(),
+        HostEvent::Backspace => {}
+    }
+}
+
 fn drive_edge(
     shared: &Arc<Shared>,
     rt: &tokio::runtime::Handle,
     tone: Option<&Sidetone>,
-    sender: &mut EdgeSender,
     key_down: bool,
     timestamp_ticks: u64,
 ) {
-    // Local keying — sidetone, the UI indicator, and the local key line — happens
+    // Local keying — sidetone and the UI indicator — happens
     // immediately and NEVER waits on the network, so the operator always hears clean CW even
     // if the tunnel stalls.
     if let Some(tone) = tone {
         tone.key(key_down);
-    }
-    if let Some(out) = shared.keying.lock().unwrap().as_mut() {
-        let _ = out.apply(key_down, false);
     }
     shared.emit(ClientEvent::KeyState { down: key_down });
 
@@ -945,11 +1172,7 @@ fn drive_edge(
     // sends them over the tunnel in order, so the keyer thread never waits on the network and
     // datagrams never reorder — the latter is what broke keying above ~39 WPM. The frame
     // carries its own timestamp, so the Station reconstructs spacing regardless of send jitter.
-    let event = EdgeEvent { timestamp_ticks, key_down, source: EdgeSource::Paddle };
-    let frame = sender.frame_for(event);
-    if let Some(tx) = shared.frame_tx.lock().unwrap().as_ref() {
-        let _ = tx.send(frame);
-    }
+    shared.edge.push_edge(key_down, timestamp_ticks);
     let _ = rt;
 }
 
@@ -982,10 +1205,6 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
     let mut position = clock.now();
     let mut prev_emitted = false;
     let mut sending = false;
-    // The edge-sender epoch is sampled fresh for each character run so a reconnection (which
-    // bumps the epoch) is reflected.
-    let mut sender = EdgeSender::new(*shared.epoch.lock().unwrap(), hz, position);
-
     let aborting = || shared.send.state.lock().unwrap_or_else(|e| e.into_inner()).abort;
 
     loop {
@@ -1004,7 +1223,7 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
                     prev_emitted = false;
                     if sending {
                         let tone = shared.sidetone.lock().unwrap().clone();
-                        drive_edge(shared, rt, tone.as_ref(), &mut sender, false, clock.now());
+                        drive_edge(shared, rt, tone.as_ref(), false, clock.now());
                         shared.emit(ClientEvent::Sending { active: false });
                         sending = false;
                     }
@@ -1047,8 +1266,6 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
         }
 
         if !sending {
-            // Fresh send span: resample the epoch so a reconnection is picked up.
-            sender = EdgeSender::new(*shared.epoch.lock().unwrap(), hz, position);
             shared.emit(ClientEvent::Sending { active: true });
             sending = true;
         }
@@ -1087,10 +1304,10 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
             if aborting() {
                 break;
             }
-            drive_edge(shared, rt, tone.as_ref(), &mut sender, true, position);
+            drive_edge(shared, rt, tone.as_ref(), true, position);
 
             HybridWaiter::wait_until_ticks(&clock, position + duration, &aborting);
-            drive_edge(shared, rt, tone.as_ref(), &mut sender, false, position + duration);
+            drive_edge(shared, rt, tone.as_ref(), false, position + duration);
             position += duration;
 
             if aborting() {
@@ -1151,8 +1368,6 @@ fn paddle_loop(
             return;
         }
     };
-    let epoch = *shared.epoch.lock().unwrap();
-    let mut sender = EdgeSender::new(epoch, hz, clock.now());
     let poll_step = hz.saturating_mul(PADDLE_POLL_MS) / 1000;
     let should_abort = || stop.load(Ordering::SeqCst);
 
@@ -1188,7 +1403,7 @@ fn paddle_loop(
             &clock,
             &paddle_now,
             &mut |edge| {
-                drive_edge(shared, rt, tone.as_ref(), &mut sender, edge.key_down, edge.timestamp_ticks);
+                drive_edge(shared, rt, tone.as_ref(), edge.key_down, edge.timestamp_ticks);
             },
             &should_abort,
         );
@@ -1198,7 +1413,7 @@ fn paddle_loop(
         }
     }
     let tone = shared.sidetone.lock().unwrap().clone();
-    drive_edge(shared, rt, tone.as_ref(), &mut sender, false, clock.now());
+    drive_edge(shared, rt, tone.as_ref(), false, clock.now());
 }
 
 fn read_keyer_settings(shared: &Arc<Shared>) -> (u32, u32, KeyerMode, bool) {

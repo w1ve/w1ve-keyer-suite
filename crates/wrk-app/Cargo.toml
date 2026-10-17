@@ -28,6 +28,8 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Serial link for the logger (WinKeyer host) input; same version rwk-core uses.
+serialport = "4"
 
 # Windows device-change notifications (WM_DEVICECHANGE) for instant serial PnP detection. We
 # subclass Tauri's own window; off Windows the watcher falls back to timer polling and this

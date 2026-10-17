@@ -62,7 +62,7 @@ input[type="number"] {
   background: var(--bg-panel-2);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 5px 8px;
+  padding: 3px 8px;
 }
 
 input[type="range"] {
@@ -118,11 +118,11 @@ input[type="range"] {
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 12px 14px;
+  padding: 10px 14px;
 }
 
 .panel h3 {
-  margin: 0 0 10px;
+  margin: 0 0 8px;
   font-size: 13px;
   font-weight: 600;
   color: var(--text-dim);
@@ -165,11 +165,106 @@ input[type="range"] {
   font-weight: 500;
 }
 
+/* Collapsible Log panel header (LogPanel.jsx) */
+.log-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.log-toggle:hover:not(:disabled) {
+  border: none;
+  color: var(--text);
+}
+
+.log-glyph {
+  font-family: Consolas, monospace;
+  font-size: 14px;
+}
+
+/* Keyer client layout (ClientApp.jsx): Keyer | Sidetone + CW Macros, Pairing below */
+.keyer-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.keyer-top {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.keyer-top > .panel,
+.keyer-side {
+  min-width: 0;
+}
+
+.keyer-side {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.keyer-mode {
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.keyer-inputs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.two-up {
+  gap: 12px;
+  align-items: flex-end;
+}
+
+.two-up > .field {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+.typeahead {
+  margin-top: 8px;
+  gap: 6px;
+}
+
+.typeahead input {
+  flex: 1;
+  min-width: 0;
+}
+
+.log-drawer {
+  margin: 0 12px 8px;
+  max-height: 160px;
+  overflow: auto;
+}
+
 /* Macro grid */
 .macros {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 6px;
+  gap: 4px;
+}
+
+.macros button {
+  padding: 4px 4px;
+  font-size: 12px;
 }
 
 /* Status strip */

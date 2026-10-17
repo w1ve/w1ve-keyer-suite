@@ -15,6 +15,7 @@
 mod app_paths;
 mod client_controller;
 mod device_watch;
+mod logger_host;
 mod pairing;
 mod server_controller;
 
@@ -99,7 +100,7 @@ pub fn run_client() {
             c_audio_devices,
             c_refresh_audio_devices,
             c_serial_ports,
-            c_select_keying_port,
+            c_select_logger_port,
             c_select_paddle_port,
             c_send_cw,
             c_test_tx,
@@ -182,8 +183,8 @@ fn c_serial_ports() -> Vec<String> {
     ClientController::serial_ports()
 }
 #[tauri::command]
-fn c_select_keying_port(state: State<'_, ClientState>, port: Option<String>) {
-    state.controller.select_keying_port(port);
+fn c_select_logger_port(state: State<'_, ClientState>, port: Option<String>) {
+    state.controller.select_logger_port(port);
 }
 #[tauri::command]
 fn c_select_paddle_port(state: State<'_, ClientState>, port: Option<String>) {
@@ -235,7 +236,7 @@ pub fn run_server() {
             // firing the controller's port reconciliation.
             let raw_window = match app.get_webview_window("main") {
                 Some(window) => {
-                    let _ = window.set_title("W1VE Remote Keyer — Server");
+                    let _ = window.set_title("W1VE Remote Keyer — Player");
                     window_handle_isize(&window)
                 }
                 None => None,
@@ -255,6 +256,7 @@ pub fn run_server() {
             s_request_state,
             s_serial_ports,
             s_select_keying_port,
+            s_select_logger_port,
             s_set_key_line,
             s_set_ptt_line,
             s_set_transport,
@@ -266,7 +268,7 @@ pub fn run_server() {
             s_disconnect,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running the W1VE Remote Keyer Server");
+        .expect("error while running the W1VE Remote Keyer Player");
 }
 
 /// Role probe present only in the Server binary; the web bundle detects the role with it.
@@ -286,6 +288,10 @@ fn s_serial_ports() -> Vec<String> {
 #[tauri::command]
 fn s_select_keying_port(state: State<'_, ServerState>, port: Option<String>) {
     state.controller.select_keying_port(port);
+}
+#[tauri::command]
+fn s_select_logger_port(state: State<'_, ServerState>, port: Option<String>) {
+    state.controller.select_logger_port(port);
 }
 #[tauri::command]
 fn s_set_key_line(state: State<'_, ServerState>, line: String) {
