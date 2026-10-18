@@ -31,6 +31,7 @@ pub mod edge_session;
 pub mod edge_station;
 pub mod flex_discovery;
 pub mod lan_discovery;
+pub mod logger_host;
 pub mod keying;
 pub mod keying_arbiter;
 pub mod netstack;

@@ -91,6 +91,8 @@ pub enum HostEvent {
     ClearBuffer,
     /// Remove the last buffered character (Backspace).
     Backspace,
+    /// The logger polled status (Request Status, 0x15). The host must reply with a status byte.
+    RequestStatus,
 }
 
 /// Parser state across `feed` calls.
@@ -183,7 +185,8 @@ impl Decoder {
             cmd::CLEAR_BUFFER => out.push(HostEvent::ClearBuffer),
             cmd::BACKSPACE => out.push(HostEvent::Backspace),
             // Zero-payload commands we simply consume.
-            cmd::GET_SPEED_POT | cmd::NULL | cmd::REQ_STATUS | cmd::TIM_CHAR_SPACE => {}
+            cmd::REQ_STATUS => out.push(HostEvent::RequestStatus),
+            cmd::GET_SPEED_POT | cmd::NULL | cmd::TIM_CHAR_SPACE => {}
             // Commands with a payload: enter the Payload state to consume/decode it.
             _ => {
                 let len = payload_len(byte);
@@ -201,7 +204,9 @@ impl Decoder {
         match sub {
             admin::OPEN => {
                 self.open = true;
-                // Host-mode open: reply with the version byte, as the hardware does.
+                // Host-mode open: reply with the version byte alone, as the hardware does. An
+                // extra status byte after it stopped N1MM showing its WinKeyer banner; idle is
+                // reported on Request Status instead.
                 self.outbound.push(consts::WINKEYER_VERSION);
                 out.push(HostEvent::HostOpened);
                 self.state = State::Idle;
@@ -215,7 +220,11 @@ impl Decoder {
                 // The next byte is echoed back verbatim.
                 self.state = State::AdminEcho;
             }
-            // Other admin sub-commands take no further byte we need; return to idle.
+            // Sub-commands 0x10 and up take one data byte, as the C# emulator also consumes it.
+            // If that byte is not skipped, it is read as an opcode and the next character is
+            // swallowed as its payload: N1MM's first character went missing this way.
+            s if s >= 0x10 => self.state = State::Payload { opcode: cmd::ADMIN, remaining: 1 },
+            // Other admin sub-commands take no further byte; return to idle.
             _ => self.state = State::Idle,
         }
     }
@@ -245,13 +254,18 @@ impl Decoder {
 
     /// Builds a status byte to report to the logger, with the mandatory status prefix set.
     ///
-    /// Loggers that poll Request Status expect `0xC0 | bits`. `sending` reflects whether the
-    /// keyer is currently playing buffered CW.
+    /// Loggers that poll Request Status expect `0xC0 | bits`. The bits match the C# emulator,
+    /// which N1MM accepts: `0x04` while CW is sending, `0x01` while text is waiting to be sent.
+    /// Idle with nothing queued is exactly `0xC0`; reporting a set bit when idle makes N1MM
+    /// wait for a buffer that never empties.
     #[must_use]
-    pub fn status_byte(sending: bool) -> u8 {
-        let mut raw = consts::STATUS_PREFIX | consts::STATUS_BUFFER_SPACE_BIT;
+    pub fn status_byte(sending: bool, has_data: bool) -> u8 {
+        let mut raw = consts::STATUS_PREFIX;
         if sending {
-            raw |= consts::STATUS_SENDING_BIT | consts::STATUS_BUSY_BIT;
+            raw |= consts::STATUS_BUFFER_SPACE_BIT;
+        }
+        if has_data {
+            raw |= consts::STATUS_BUSY_BIT;
         }
         raw
     }
@@ -367,11 +381,47 @@ mod tests {
     }
 
     #[test]
-    fn status_byte_sets_the_prefix_and_sending_bits() {
-        let idle = Decoder::status_byte(false);
-        assert_eq!(idle & consts::STATUS_PREFIX, consts::STATUS_PREFIX);
-        assert_eq!(idle & consts::STATUS_SENDING_BIT, 0);
-        let sending = Decoder::status_byte(true);
-        assert_ne!(sending & consts::STATUS_SENDING_BIT, 0);
+    fn status_byte_matches_the_csharp_emulator() {
+        // Idle with nothing queued must be exactly 0xC0, or N1MM waits forever.
+        assert_eq!(Decoder::status_byte(false, false), 0xC0);
+        // Sending adds bit 2; text waiting adds bit 0.
+        assert_eq!(Decoder::status_byte(true, false), 0xC4);
+        assert_eq!(Decoder::status_byte(true, true), 0xC5);
+        assert_eq!(Decoder::status_byte(false, true), 0xC1);
+    }
+
+    #[test]
+    fn request_status_is_reported_to_the_host() {
+        let (events, _) = decode(&[cmd::REQ_STATUS]);
+        assert_eq!(events, vec![HostEvent::RequestStatus]);
+    }
+
+    #[test]
+    fn admin_subcommand_data_byte_does_not_swallow_the_next_character() {
+        // Admin 0x1C takes one data byte (0x18 here). The 'C' after it must still decode.
+        let (events, _) = decode(&[cmd::ADMIN, 0x1C, 0x18, b'C', b'Q']);
+        assert_eq!(events, vec![HostEvent::Text('C'), HostEvent::Text('Q')]);
+    }
+
+    #[test]
+    fn n1mm_macro_bytes_decode_every_character() {
+        // The exact bytes N1MM sent for "CQ 7Q" in the Client's trace: the first 'C' was lost.
+        let bytes = [0x16, 0x00, 0x16, 0x02, 0x00, 0x1C, 0x18, 0x43, 0x51, 0x20, 0x37, 0x51];
+        let (events, _) = decode(&bytes);
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                HostEvent::Text(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "CQ 7Q");
+    }
+
+    #[test]
+    fn admin_open_replies_with_version_only() {
+        let (events, out) = decode(&[cmd::ADMIN, admin::OPEN]);
+        assert_eq!(events, vec![HostEvent::HostOpened]);
+        assert_eq!(out, vec![consts::WINKEYER_VERSION]);
     }
 }
