@@ -6,14 +6,14 @@
 # would otherwise travel in the clear.
 #
 # Usage:
-#   cd rust
-#   RWK_ADMIN_PASSWORD=... RWK_JWT_SECRET=... docker compose -f crates/rwk-relay/docker-compose.yml up -d --build
+#   cd w1ve-keyer-suite
+#   RWK_ADMIN_PASSWORD=... RWK_JWT_SECRET=... docker compose -f rwk-relay/docker-compose.yml up -d --build
 
 services:
   rwk-relay:
     build:
-      context: ../..            # the rust/ workspace root
-      dockerfile: crates/rwk-relay/Dockerfile
+      context: ..               # the suite root (the Cargo workspace)
+      dockerfile: rwk-relay/Dockerfile
     image: rwk-relay:latest
     container_name: rwk-relay
     restart: unless-stopped

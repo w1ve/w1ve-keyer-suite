@@ -21,10 +21,10 @@ transport messages it only forwards, keyed by public key.
 ## Quick start (Docker)
 
 ```sh
-cd rust
+cd w1ve-keyer-suite
 export RWK_ADMIN_PASSWORD='choose-a-strong-password'
 export RWK_JWT_SECRET="$(openssl rand -hex 32)"
-docker compose -f crates/rwk-relay/docker-compose.yml up -d --build
+docker compose -f rwk-relay/docker-compose.yml up -d --build
 ```
 
 The dashboard is then on `http://<host>:8080` (behind Cloudflare, `https://relay.example.com`).

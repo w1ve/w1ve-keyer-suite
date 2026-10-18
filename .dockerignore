@@ -1,0 +1,8 @@
+# Docker build context for rwk-relay (build from the suite root).
+.git
+**/target
+**/node_modules
+**/dist
+# Standalone apps have their own workspaces and are not members of the root Cargo workspace.
+W1VE-Keyer
+W1VE-Remote-Keyer

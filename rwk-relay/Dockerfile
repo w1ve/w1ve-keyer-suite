@@ -5,16 +5,16 @@
 # binary and the built dashboard. The result is one small image that runs the relay protocol
 # and the metrics dashboard in a single process.
 #
-# Build context is the `rust/` workspace root (so the build can see the whole Cargo workspace):
-#   docker build -f crates/rwk-relay/Dockerfile -t rwk-relay .
+# Build context is the suite root (so the build can see the whole Cargo workspace):
+#   docker build -f rwk-relay/Dockerfile -t rwk-relay .
 
 # ---- Stage 1: build the dashboard ----
 FROM node:22-bookworm-slim AS web
 WORKDIR /web
 # Install deps against the lockfile first so this layer caches across source edits.
-COPY crates/rwk-relay/web/package*.json ./
+COPY rwk-relay/web/package*.json ./
 RUN npm install
-COPY crates/rwk-relay/web/ ./
+COPY rwk-relay/web/ ./
 RUN npm run build
 # -> /web/dist
 

@@ -79,12 +79,12 @@ Run on the Linux build box (ssh) and cross-checked for Windows (`cargo xwin`):
 Not verified:
 
 - No hardware or N1MM run of the Router Client logger, the Router speed lock, or the Remote Keyer Client after the sink refactor (the Client was run by the user before the refactor; the refactor itself is compile- and unit-tested only).
-- The rwk-relay Docker image was not built.
+- The rwk-relay deploy script has not been run against a VPS (the image and its compose file were verified on the build box).
 - The Keyer's and Remote Keyer's Windows release binaries were not rebuilt in the suite layout.
 
 ## Known open items
 
-1. `rwk-relay/Dockerfile` still copies `crates/rwk-relay/web` and `COPY . .` from the old RWK-Rust workspace layout. It must be built with the suite root as context and the paths fixed. Not done.
+1. Done: `rwk-relay` builds from the suite root (`docker build -f rwk-relay/Dockerfile .`, or `docker compose -f rwk-relay/docker-compose.yml up -d --build`). Verified on the build box (Docker 29.8.2): the image builds, and the container serves `/api/health` and the dashboard. `deploy/deploy.ps1` now runs from the suite root; its tar step was checked locally, but it has not been run against a VPS.
 2. `RWK-Rust/docs/mac/provision.sh` (macOS) clones the sibling repos into one parent. The suite layout changes that; update the script when the macOS build is next used.
 3. The duplicated sending logic: the Remote Keyer Client and the Router Client both use the send buffer, but the Router's buffer was changed to carry WPM per character to match the Client. Keep the two in step if the send worker changes.
 4. Uncommitted, not ours (left alone): `RWK-Rust/CONTEXT.md` (modified), `W1VE-Remote-Keyer/w1ve_keyer.svg` (untracked).

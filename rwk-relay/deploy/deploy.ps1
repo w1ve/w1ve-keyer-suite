@@ -1,8 +1,8 @@
 # Ships the rust/ workspace to the VPS and builds + runs the relay with Docker there.
-# Run from the `rust/` directory AFTER install-key.ps1 has installed the deploy key.
+# Run from the suite root (w1ve-keyer-suite/) AFTER install-key.ps1 has installed the deploy key.
 #
-# Usage (from rust/):
-#   .\crates\rwk-relay\deploy\deploy.ps1 -VpsHost 203.0.113.10 -VpsUser ubuntu `
+# Usage (from the suite root):
+#   .\rwk-relay\deploy\deploy.ps1 -VpsHost 203.0.113.10 -VpsUser ubuntu `
 #       -AdminPassword 'strong-pw' -JwtSecret (python -c "import secrets;print(secrets.token_hex(32))")
 #
 # If -JwtSecret is omitted a strong one is generated and printed (save it — it must stay
@@ -29,9 +29,9 @@ if (-not $JwtSecret) {
     Write-Host "Generated RWK_JWT_SECRET (SAVE THIS): $JwtSecret" -ForegroundColor Yellow
 }
 
-# We must run this from the workspace root so the relative paths line up.
-if (-not (Test-Path ".\Cargo.toml") -or -not (Test-Path ".\crates\rwk-relay")) {
-    throw "run this from the rust/ workspace root (where Cargo.toml and crates/rwk-relay live)"
+# We must run this from the suite root so the relative paths line up.
+if (-not (Test-Path ".\Cargo.toml") -or -not (Test-Path ".\rwk-relay")) {
+    throw "run this from the suite root (where Cargo.toml and rwk-relay live)"
 }
 
 Write-Host "1/4  Preparing remote directory $RemoteDir" -ForegroundColor Cyan
@@ -43,13 +43,13 @@ Write-Host "2/4  Copying source (this skips target/ and node_modules via a tar f
 $tarArgs = @(
     "--exclude=target", "--exclude=*/target", "--exclude=node_modules",
     "--exclude=*/node_modules", "--exclude=dist", "--exclude=*/dist",
-    "--exclude=.git", "-czf", "-", "."
+    "--exclude=.git", "--exclude=W1VE-Keyer", "--exclude=W1VE-Remote-Keyer", "-czf", "-", "."
 )
 # `tar` ships with Windows 10+; pipe its stdout straight into ssh.
 & tar @tarArgs | ssh @ssh "${VpsUser}@${VpsHost}" "tar -xzf - -C $RemoteDir"
 
 Write-Host "3/4  Building the Docker image on the VPS (this can take several minutes)" -ForegroundColor Cyan
-ssh @ssh "${VpsUser}@${VpsHost}" "cd $RemoteDir && docker build -f crates/rwk-relay/Dockerfile -t rwk-relay:latest ."
+ssh @ssh "${VpsUser}@${VpsHost}" "cd $RemoteDir && docker build -f rwk-relay/Dockerfile -t rwk-relay:latest ."
 
 Write-Host "4/4  Starting the relay container" -ForegroundColor Cyan
 # Write an env file on the VPS (chmod 600) rather than putting secrets on the command line,
