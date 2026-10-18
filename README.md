@@ -85,20 +85,20 @@ lineage.
 
 ## Repository layout
 
-> **Note on structure.** The suite is being consolidated into a single workspace. During the
-> transition the applications live in sibling repositories that share the engine by path; the
-> shared engine is `rwk-core`.
+> **Layout.** Each project keeps its own directory. The shared engine, the relay, the CLI and
+> the Router share a root Cargo workspace (`Cargo.toml`). The two standalone apps are their own
+> workspaces and reach the engine through `../rwk-core`.
 
 ```
 w1ve-keyer-suite/
-  crates/
-    rwk-core/        the shared engine: keyer timing, serial keying, sidetone,
-                     paddle decode, WinKeyer2 host, WireGuard tunnel, relay, netstack
-    wk-app/          W1VE Keyer            (standalone, no networking)
-    wrk-app/         W1VE Remote Keyer     (Client + Station)
-    rwk-app/         W1VE Remote Keyer-Router (Client + Station + Ham Router)
-    rwk-relay/       the relay server + dashboard
-    rwk/             an engine CLI (keygen, connect, selftest, …)
+  Cargo.toml          root workspace: rwk-core, rwk, rwk-relay, rwk-app
+  rwk-core/           the shared engine: keyer timing, serial keying, sidetone,
+                      paddle decode, WinKeyer2 host, WireGuard tunnel, relay, netstack
+  rwk-app/            W1VE Remote Keyer-Router (Client + Station + Ham Router)
+  rwk-relay/          the relay server + dashboard
+  rwk/                an engine CLI (keygen, connect, selftest, …)
+  W1VE-Keyer/         W1VE Keyer (standalone, no networking); crates/wk-app
+  W1VE-Remote-Keyer/  W1VE Remote Keyer (Client + Station); crates/wrk-app
 ```
 
 ## Building
@@ -107,8 +107,10 @@ Each app is a Rust workspace member with a Tauri v2 front-end. In broad strokes:
 
 ```sh
 # Build an app's web bundle, then the release binary:
-( cd crates/<app>/web && npm install && npm run build )
+( cd <app-dir>/web && npm install && npm run build )
 cargo build --release --features custom-protocol -p <app>
+# <app-dir> is rwk-app, W1VE-Keyer/crates/wk-app or W1VE-Remote-Keyer/crates/wrk-app;
+# build the standalone apps from inside their own directory (their own workspace).
 ```
 
 On a stock toolchain (`cargo` + Node + a platform C toolchain) a plain `cargo build` works.
