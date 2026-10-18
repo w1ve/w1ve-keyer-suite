@@ -1,0 +1,48 @@
+[package]
+name = "wrk-app"
+description = "W1VE Remote Keyer desktop app (Tauri v2): a Server + Client CW keyer pair over the native rwk-core engine, with no router."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# The Client (operating position) binary: paddle/keyer + sends edges to the Server.
+[[bin]]
+name = "w1ve-remote-keyer"
+path = "src/main_client.rs"
+
+# The Server (remote radio site) binary: receives keyed edges and keys the radio.
+[[bin]]
+name = "w1ve-remote-keyer-station"
+path = "src/main_server.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+rwk-core = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Serial link for the logger (WinKeyer host) input; same version rwk-core uses.
+serialport = "4"
+
+# Windows device-change notifications (WM_DEVICECHANGE) for instant serial PnP detection. We
+# subclass Tauri's own window; off Windows the watcher falls back to timer polling and this
+# dependency is not compiled.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+] }
+
+[features]
+# Enabled by Tauri's build tooling (and our standalone build) so the webview serves the
+# bundled web/dist assets instead of the dev URL. Mirrors the Keyer-Router app.
+custom-protocol = ["tauri/custom-protocol"]
