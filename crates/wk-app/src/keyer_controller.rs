@@ -786,6 +786,8 @@ fn make_line_observer(shared: Arc<Shared>) -> LineObserver {
 fn make_host_reporter(shared: Arc<Shared>) -> HostReporter {
     Arc::new(move |report: HostReport| match report {
         HostReport::Log { level, message } => shared.log(&level, message),
+        // The reader's failure is also logged as a Log line; nothing more to show.
+        HostReport::ReadFailed(_) => {}
         HostReport::Sending(active) => {
             shared.emit(KeyerEvent::Sending { active });
             // The logger host keys the arbiter's local handle for the radio; mirror its send
