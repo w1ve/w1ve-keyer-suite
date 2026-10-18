@@ -63,6 +63,8 @@ export default function KeyerTab({
   const keyingPort = settings.keyingPort || "";
   const paddlePort = settings.paddlePort || "";
   const winkeyerPort = settings.winkeyerPort || "";
+  // N1MM owns the speed while it has the logger open (WinKeyer host mode).
+  const speedLocked = !!settings.speedLocked;
 
   // Macros + type-ahead
   const [macros, setMacros] = useState(loadMacros);
@@ -136,12 +138,16 @@ export default function KeyerTab({
             <div className="wpm">
               {wpm} <small>WPM</small>
             </div>
+            {speedLocked && (
+              <small className="hint">Set by N1MM while it has the logger open</small>
+            )}
           </div>
           <input
             type="range"
             min={5}
             max={60}
             value={wpm}
+            disabled={speedLocked}
             onChange={(e) => {
               const v = Number(e.target.value);
               setWpm(v);

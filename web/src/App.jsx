@@ -53,6 +53,7 @@ export default function App() {
             transport: ev.transport ?? "wan",
             callsign: ev.callsign ?? "",
             keyerId: ev.keyer_id ?? "",
+            speedLocked: ev.speed_locked ?? false,
           });
           break;
         case "ports":

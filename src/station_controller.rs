@@ -700,6 +700,8 @@ fn make_host_reporter(shared: Arc<Shared>) -> HostReporter {
     Arc::new(move |report: HostReport| match report {
         HostReport::Log { level, message } => shared.log(&level, message),
         HostReport::Sending(active) => shared.emit(StationEvent::LoggerSending { active }),
+        // The reader's failure is also logged as a Log line; nothing more to show.
+        HostReport::ReadFailed(_) => {}
     })
 }
 

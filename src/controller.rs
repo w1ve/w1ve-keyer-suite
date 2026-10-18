@@ -23,6 +23,7 @@ use rwk_core::engine::debounce::ContactDebouncer;
 use rwk_core::engine::edge_session::EdgeSession;
 use rwk_core::engine::flex_discovery::DiscoveryEmitter;
 use rwk_core::engine::keying::{KeyerElement, KeyerElementTiming};
+use rwk_core::engine::logger_host::{HostReport, HostReporter, LoggerHost, TextSink};
 use rwk_core::engine::network::EdgeTransport;
 use rwk_core::engine::paddle::PaddleKeyer;
 use rwk_core::engine::paddle_input::PaddleInputPort;
@@ -172,8 +173,8 @@ fn build_engine(
 /// The character queue + control flags shared with the send-worker thread.
 #[derive(Default)]
 struct SendState {
-    /// Characters waiting to be keyed, in order.
-    queue: VecDeque<char>,
+    /// Characters waiting to be keyed, in order, each with the WPM its batch was queued at.
+    queue: VecDeque<(char, u32)>,
     /// Set by [`ClientController::abort_send`]; the worker drops the queue and the current
     /// schedule immediately when it sees this, then clears it.
     abort: bool,
@@ -190,10 +191,10 @@ struct SendBuffer {
 }
 
 impl SendBuffer {
-    /// Appends `text` to the queue and wakes the worker.
-    fn push(&self, text: &str) {
+    /// Appends `text` to the queue at `wpm` and wakes the worker.
+    fn push(&self, text: &str, wpm: u32) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.queue.extend(text.chars());
+        st.queue.extend(text.chars().map(|c| (c, wpm)));
         self.cv.notify_all();
     }
 
@@ -210,6 +211,38 @@ impl SendBuffer {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.shutdown = true;
         self.cv.notify_all();
+    }
+}
+
+/// The Router Client's logger output. The shared WinKeyer host (`rwk_core::engine::logger_host`)
+/// answers the logger and batches its text; this sink takes the text into the send buffer, which
+/// keys it with sidetone, the key line, and the tunnel, as the Remote Keyer's Client does.
+struct ClientLogger {
+    shared: Arc<Shared>,
+}
+
+impl TextSink for ClientLogger {
+    fn speed(&self) -> u32 {
+        self.shared.settings.lock().unwrap().wpm
+    }
+
+    fn set_speed(&self, wpm: u32) {
+        self.shared.settings.lock().unwrap().wpm = wpm;
+        self.shared.emit_settings();
+    }
+
+    fn host_mode(&self, open: bool) {
+        // The logger owns the speed while host mode is open; the slider is locked.
+        self.shared.speed_from_logger.store(open, Ordering::SeqCst);
+        self.shared.emit_settings();
+    }
+
+    fn send_text(&self, text: &str, wpm: u32) {
+        self.shared.send.push(text, wpm);
+    }
+
+    fn abort(&self) {
+        self.shared.send.abort();
     }
 }
 
@@ -243,6 +276,8 @@ pub enum ClientEvent {
         transport: String,
         callsign: String,
         keyer_id: String,
+        /// The logger has host mode open and owns the speed; the Keyer's slider is locked.
+        speed_locked: bool,
     },
     /// The current forward-rule table, echoed whenever it changes (for the Ham Router tab).
     ForwardRules { rules: Vec<ForwardRuleView> },
@@ -390,6 +425,10 @@ struct Shared {
     paddle: Mutex<Option<PaddlePollerHandle>>,
     /// The type-ahead / macro send buffer, drained by the single send-worker thread.
     send: SendBuffer,
+    /// The WinKeyer host on the logger port, present while a logger port is selected.
+    logger: Mutex<Option<LoggerHost>>,
+    /// True while the logger has host mode open. It owns the speed then, so the slider is locked.
+    speed_from_logger: AtomicBool,
     /// The running LAN advertiser task (operating-position side), present while advertising.
     advertise: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The control channel to the Station, present only while paired. Used to push the
@@ -443,6 +482,7 @@ impl Shared {
             transport: s.transport.as_str().into(),
             callsign: s.callsign.clone(),
             keyer_id: s.keyer_id.clone(),
+            speed_locked: self.speed_from_logger.load(Ordering::SeqCst),
         });
     }
 
@@ -555,6 +595,8 @@ impl ClientController {
             edge: EdgeSession::new(MonotonicClock.frequency(), MonotonicClock.now()),
             paddle: Mutex::new(None),
             send: SendBuffer::default(),
+            logger: Mutex::new(None),
+            speed_from_logger: AtomicBool::new(false),
             advertise: tokio::sync::Mutex::new(None),
             control: tokio::sync::Mutex::new(None),
             session: tokio::sync::Mutex::new(None),
@@ -606,6 +648,11 @@ impl ClientController {
 
     /// Sets the keyer speed in WPM (clamped 5..=60 downstream).
     pub fn set_speed(&self, wpm: u32) {
+        if self.shared.speed_from_logger.load(Ordering::SeqCst) {
+            // The logger owns the speed while host mode is open: ignore the slider and resync the UI.
+            self.shared.emit_settings();
+            return;
+        }
         self.shared.settings.lock().unwrap().wpm = wpm;
         self.shared.log("debug", format!("Speed {wpm} WPM."));
     }
@@ -894,17 +941,45 @@ impl ClientController {
         self.shared.emit_settings();
     }
 
-    /// Records the selected WinKeyer port. NOTE: the WinKeyer protocol host is a later
-    /// increment; this persists the choice only.
+    /// Selects the WinKeyer port: a logging program on it is served as a WinKeyer host, and its
+    /// text is keyed through the send buffer (sidetone, key line, tunnel).
     pub fn select_winkeyer_port(&self, port: Option<String>) {
+        // Replacing the handle drops the previous host, which stops its threads and frees the port.
+        *self.shared.logger.lock().unwrap() = None;
+        self.shared.speed_from_logger.store(false, Ordering::SeqCst);
         self.shared.settings.lock().unwrap().winkeyer_port = port.clone();
-        self.shared.clear_error(control::WINKEYER);
         match port {
-            Some(name) => self.shared.log(
-                "info",
-                format!("WinKeyer port {name} selected (protocol host not yet wired)."),
-            ),
-            None => self.shared.log("info", "WinKeyer port cleared."),
+            None => {
+                self.shared.clear_error(control::WINKEYER);
+                self.shared.log("info", "WinKeyer port cleared.");
+            }
+            Some(name) => {
+                let shared = Arc::clone(&self.shared);
+                let port_name = name.clone();
+                let report: HostReporter = Arc::new(move |report: HostReport| match report {
+                    HostReport::Log { level, message } => shared.log(&level, message),
+                    HostReport::ReadFailed(e) => shared.fail(
+                        control::WINKEYER,
+                        format!("{port_name} not available"),
+                        format!("WinKeyer port {port_name} failed: {e}"),
+                    ),
+                    HostReport::Sending(_) => {}
+                });
+                let sink = ClientLogger { shared: Arc::clone(&self.shared) };
+                match LoggerHost::open_text(&name, sink, report) {
+                    Ok(host) => {
+                        *self.shared.logger.lock().unwrap() = Some(host);
+                        self.shared.clear_error(control::WINKEYER);
+                        self.shared.log(
+                            "info",
+                            format!("WinKeyer port {name} listening for WinKeyer commands."),
+                        );
+                    }
+                    Err(e) => {
+                        self.shared.fail(control::WINKEYER, format!("{name} not available"), e);
+                    }
+                }
+            }
         }
         self.emit_ports();
         self.shared.emit_settings();
@@ -918,7 +993,8 @@ impl ClientController {
     /// seamlessly. Playback fans to the sidetone, the local key line, the UI indicator, and
     /// (when paired) the tunnel through `drive_edge`.
     pub fn send_cw(&self, text: &str) {
-        self.shared.send.push(text);
+        let wpm = self.shared.settings.lock().unwrap().wpm;
+        self.shared.send.push(text, wpm);
     }
 
     /// Sends the standard test string, matching the C# "Test TX" button.
@@ -1376,7 +1452,7 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
 
     loop {
         // Pop the next character, blocking until one is available.
-        let next: Option<char> = {
+        let next: Option<(char, u32)> = {
             let mut st = shared.send.state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if st.shutdown {
@@ -1398,8 +1474,8 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
                     st = shared.send.state.lock().unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
-                if let Some(ch) = st.queue.pop_front() {
-                    break Some(ch);
+                if let Some(entry) = st.queue.pop_front() {
+                    break Some(entry);
                 }
                 // Nothing queued: drop the SEND indicator and wait for more input.
                 if sending {
@@ -1411,12 +1487,11 @@ fn send_worker(shared: &Arc<Shared>, rt: &tokio::runtime::Handle) {
                 st = shared.send.cv.wait(st).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let Some(ch) = next else { continue };
+        let Some((ch, wpm)) = next else { continue };
 
-        let (wpm, weight) = {
-            let s = shared.settings.lock().unwrap();
-            (s.wpm, s.weight)
-        };
+        // WPM travels with the character, so a speed change applies to the next batch and does
+        // not retime text already queued.
+        let weight = shared.settings.lock().unwrap().weight;
         let timing = match KeyerElementTiming::from_speed(wpm, weight, hz) {
             Ok(t) => t,
             Err(e) => {
