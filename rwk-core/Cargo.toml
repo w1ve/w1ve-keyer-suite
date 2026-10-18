@@ -1,0 +1,24 @@
+[package]
+name = "rwk-core"
+description = "Native Rust core engine for RWK Router Keyer: serial keying, deterministic CW timing, sidetone, edge protocol, and event bus."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serialport = { workspace = true }
+cpal = { workspace = true }
+spin_sleep = { workspace = true }
+thiserror = { workspace = true }
+boringtun = { workspace = true }
+getrandom = { workspace = true }
+smoltcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+socket2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

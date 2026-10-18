@@ -1,0 +1,1302 @@
+//! Native network layer: UDP edge transport and port forwarding, with **no sidecar**.
+//!
+//! This module is the first slice of the "one EXE, no child process" requirement. It
+//! replaces two of the Go sidecar's jobs with in-process Rust:
+//!
+//! * the **edge relay** — moving [`RwkPaddleFrame`] datagrams between the keying engine
+//!   and the peer (the sidecar's loopback UDP ↔ tailnet relay); and
+//! * the **UDP port forwarder** — the sidecar's `out-udp` / `in-udp` kinds, used for
+//!   Flex SmartSDR command (`4992/udp`) and VITA-49 (`4991/udp`) traffic; and
+//! * the **TCP port forwarder** — the sidecar's `out` / `in` kinds, the latency-sensitive
+//!   control channel the Client dials on loopback and the Station accepts, preserving
+//!   `TCP_NODELAY` and half-close propagation.
+//!
+//! ## What replaces Tailscale (research spike)
+//!
+//! The embedded `tsnet` node provided WireGuard transport, DERP relaying, NAT
+//! traversal and the userspace netstack. Dropping the sidecar means that layer becomes
+//! the application's responsibility. The realistic Rust path is documented in
+//! `rust/docs/NATIVE-NETWORK-SPIKE.md`; the short version:
+//!
+//! * **Transport** — `boringtun` (Cloudflare's userspace WireGuard) already provides
+//!   the encrypted tunnel and is a drop-in for the WireGuard half of `tsnet`.
+//! * **Userspace IP stack** — `smoltcp` consumes boringtun's decrypted datagrams,
+//!   matching `tsnet`'s "no TUN adapter, no admin privilege" property.
+//! * **Coordination** — the tailnet control plane (key exchange, peer discovery, DERP
+//!   map) has no maintained Rust client; this is the genuine spike work.
+//!
+//! The types below are transport-agnostic: they speak plain UDP and will ride over
+//! whatever tunnel implementation lands, so the keying path is ready before the mesh is.
+
+use std::io;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{watch, Mutex};
+
+use crate::engine::netstack_driver::{UdpConn, UdpConnReceiver, UdpConnSender};
+use crate::primitives::{ForwardDirection, ForwardProtocol};
+use crate::protocol::edge::RwkPaddleFrame;
+use crate::Result;
+
+/// Maximum size of a single edge datagram.
+pub const MAX_DATAGRAM: usize = 2048;
+
+/// Magic bytes identifying an **edge heartbeat** datagram on the edge channel.
+///
+/// A heartbeat is a liveness beacon the two ends exchange so each can tell the other is
+/// still there even when no CW is flowing. It is deliberately *not* an [`RwkPaddleFrame`]:
+/// this 4-byte datagram is shorter than [`crate::protocol::edge::MIN_FRAME_SIZE`] (16) and
+/// its bytes 2..4 spell `KH` (0x484B), which is far outside the 1..=4 a frame's `count`
+/// field may hold — so a frame parser rejects it and a heartbeat parser rejects a frame.
+/// The two are therefore unambiguous on the same socket with **no change to the frame wire
+/// format**, which keeps interop with the existing apps and the C# intact.
+pub const EDGE_HEARTBEAT_MAGIC: [u8; 4] = *b"RWKH";
+
+/// Magic bytes of an **edge ping**: `RWKP` followed by an 8-byte big-endian send stamp (nanoseconds
+/// on the sender's own monotonic clock). The receiver answers with an [`EDGE_PONG_MAGIC`] datagram
+/// that echoes the stamp, so the sender measures the round trip on its own clock alone.
+pub const EDGE_PING_MAGIC: [u8; 4] = *b"RWKP";
+
+/// Magic bytes of an **edge pong**: the reply to a ping, echoing its stamp.
+pub const EDGE_PONG_MAGIC: [u8; 4] = *b"RWKQ";
+
+/// Length of a ping or pong: the 4 magic bytes and the 8-byte stamp.
+const CONTROL_LEN: usize = 12;
+
+/// Nanoseconds on this process's monotonic clock. Only differences are meaningful, so the origin
+/// is arbitrary (the first call); a ping and its pong are always compared on the same host.
+fn monotonic_nanos() -> u64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let origin = ORIGIN.get_or_init(std::time::Instant::now);
+    u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// One datagram received on the edge channel, classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeInbound {
+    /// A validated [`RwkPaddleFrame`] as raw bytes, ready for the replay driver.
+    Frame(Vec<u8>),
+    /// A liveness heartbeat from the peer. Carries no keying; it only proves the peer is up.
+    Heartbeat,
+    /// A ping was answered or a pong recorded: transport control traffic with nothing to replay.
+    Control,
+}
+
+/// Maximum size of a single forwarded UDP datagram.
+pub const MAX_FORWARD_DATAGRAM: usize = 4096;
+
+/// Idle timeout for a UDP forwarding session, in seconds.
+pub const UDP_FORWARD_IDLE_SECONDS: u64 = 60;
+
+/// Consecutive outbound failures that add up to a lost path.
+///
+/// A single UDP send failure is usually transient and must not tear the radio down;
+/// a run of them means the route is gone. This is deliberately a *sustained* signal,
+/// so a station never trips F9 on one hiccup.
+pub const MAX_CONSECUTIVE_SEND_ERRORS: u32 = 3;
+
+/// Copy buffer for one direction of a TCP forward, in bytes.
+///
+/// Sized so each direction of a connection holds one modest allocation, while still
+/// amortising the syscall over a typical burst of control-channel traffic.
+pub const TCP_FORWARD_BUFFER: usize = 16 * 1024;
+
+/// Pause after a failed `accept`, so descriptor exhaustion cannot spin the accept loop.
+pub const TCP_ACCEPT_BACKOFF: Duration = Duration::from_millis(20);
+
+/// A one-way flag that any mesh/tunnel layer can raise when the path to the peer is lost.
+///
+/// This is the missing event source for fail-safe **F9**: the edge transport and the
+/// future WireGuard tunnel each hold a clone, so a detection anywhere becomes an F9 at the
+/// replay driver's watchdog. It is shared by `Arc`, so cloning is cheap and every holder
+/// observes the same flag.
+///
+/// The flag is *latching until consumed*: [`Self::take_lost`] clears it, which is exactly
+/// the audit trail F9's auto-clearing latch policy expects — each reported loss raises F9
+/// once, and traffic resuming re-arms the session.
+#[derive(Debug, Clone, Default)]
+pub struct PathHealth {
+    lost: Arc<AtomicBool>,
+}
+
+impl PathHealth {
+    /// Creates a healthy path flag.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Raises the flag. Call from the layer that detects the loss.
+    pub fn report_lost(&self) {
+        self.lost.store(true, Ordering::SeqCst);
+    }
+
+    /// Reads the flag without clearing it.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    /// Drains the flag: returns `true` at most once per reported loss.
+    pub fn take_lost(&self) -> bool {
+        self.lost.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// Counters for a network path, surfaced to the UI's packet-statistics panel.
+#[derive(Debug, Default)]
+pub struct EdgeStats {
+    tx_datagrams: AtomicU64,
+    rx_datagrams: AtomicU64,
+    tx_bytes: AtomicU64,
+    rx_bytes: AtomicU64,
+    drop_no_peer: AtomicU64,
+    drop_foreign: AtomicU64,
+    errors: AtomicU64,
+    consecutive_send_errors: AtomicU32,
+}
+
+impl EdgeStats {
+    /// Datagrams transmitted.
+    #[must_use]
+    pub fn tx_datagrams(&self) -> u64 {
+        self.tx_datagrams.load(Ordering::Relaxed)
+    }
+
+    /// Datagrams received.
+    #[must_use]
+    pub fn rx_datagrams(&self) -> u64 {
+        self.rx_datagrams.load(Ordering::Relaxed)
+    }
+
+    /// Bytes transmitted.
+    #[must_use]
+    pub fn tx_bytes(&self) -> u64 {
+        self.tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes received.
+    #[must_use]
+    pub fn rx_bytes(&self) -> u64 {
+        self.rx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Datagrams dropped because no peer was configured.
+    #[must_use]
+    pub fn drop_no_peer(&self) -> u64 {
+        self.drop_no_peer.load(Ordering::Relaxed)
+    }
+
+    /// Datagrams dropped because they came from an unexpected source.
+    #[must_use]
+    pub fn drop_foreign(&self) -> u64 {
+        self.drop_foreign.load(Ordering::Relaxed)
+    }
+
+    /// Read/write errors observed by the path.
+    #[must_use]
+    pub fn errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Outbound failures since the last successful send.
+    #[must_use]
+    pub fn consecutive_send_errors(&self) -> u32 {
+        self.consecutive_send_errors.load(Ordering::Relaxed)
+    }
+}
+
+/// The datagram carrier under an [`EdgeTransport`]: either a plain OS UDP socket, or a
+/// UDP socket living on the in-process WireGuard netstack ([`UdpConn`]).
+///
+/// This is the seam that lets the keying edge ride the tunnel without the transport,
+/// stats, foreign-source gating, or [`PathHealth`] logic forking. `EdgeTransport` speaks
+/// to this enum in [`SocketAddr`] terms; the tunnel arm converts to and from the
+/// `(IpAddr, u16)` the netstack driver uses.
+///
+/// The tunnel arm's receiver is a channel that only one task may drain, so it is held
+/// behind a `Mutex`; the local-socket arm needs no such lock because `UdpSocket::recv_from`
+/// is already `&self`.
+enum DatagramLink {
+    /// A plain OS UDP socket (direct peer, or loopback edge relay).
+    Udp(UdpSocket),
+    /// A UDP socket on the netstack, carrying datagrams inside the WireGuard tunnel.
+    ///
+    /// The connection is split into its two independent halves: the sender clones cheaply
+    /// and sends under `&self`, while the receiver needs `&mut self` and so lives behind
+    /// its own `Mutex`. Splitting matters here — holding one lock across both directions
+    /// would let a blocked `recv` stall every outbound key edge, which on the keying path
+    /// is a deadlock, not merely slow.
+    Tunnel {
+        /// Send half; `&self`, so no lock is needed to transmit.
+        tx: UdpConnSender,
+        /// Receive half; `&mut self`, guarded so the shared transport can drain it.
+        rx: Mutex<UdpConnReceiver>,
+    },
+}
+
+impl DatagramLink {
+    /// Sends `bytes` to `peer`, returning the count written.
+    async fn send_to(&self, bytes: &[u8], peer: SocketAddr) -> io::Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.send_to(bytes, peer).await,
+            Self::Tunnel { tx, .. } => tx
+                .send(bytes.to_vec(), (peer.ip(), peer.port()))
+                .await
+                .map(|()| bytes.len())
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())),
+        }
+    }
+
+    /// Receives one datagram into `buf`, returning its length and source address.
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Udp(socket) => socket.recv_from(buf).await,
+            Self::Tunnel { rx, .. } => {
+                let mut guard = rx.lock().await;
+                let Some((data, (ip, port))) = guard.recv().await else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "netstack driver stopped",
+                    ));
+                };
+                let len = data.len().min(buf.len());
+                buf[..len].copy_from_slice(&data[..len]);
+                Ok((len, SocketAddr::new(ip, port)))
+            }
+        }
+    }
+
+    /// The local socket address, when the link is a plain OS socket.
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Udp(socket) => socket.local_addr(),
+            Self::Tunnel { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "tunnel edge has no OS-level local address",
+            )),
+        }
+    }
+}
+
+/// A UDP endpoint that carries [`RwkPaddleFrame`]s to and from one peer.
+///
+/// Both directions share one carrier, mirroring the sidecar's `edgeRelay`: outbound
+/// frames go to the configured peer, and inbound frames are accepted only from that
+/// peer once it is known. The carrier is either a plain OS UDP socket or a tunnel
+/// [`UdpConn`] — see [`DatagramLink`] — so the same stats, foreign-source gating and
+/// [`PathHealth`] serve a direct edge and a tunneled one alike.
+pub struct EdgeTransport {
+    link: DatagramLink,
+    peer: Mutex<Option<SocketAddr>>,
+    stats: Arc<EdgeStats>,
+    health: PathHealth,
+    /// The latest round-trip time in nanoseconds, from a pong. `0` means no sample yet.
+    rtt_nanos: AtomicU64,
+}
+
+impl EdgeTransport {
+    /// Binds the transport to `bind` (use port 0 for an ephemeral port).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::SerialIo`] (an `std::io::Error`) if the socket cannot be
+    /// bound.
+    pub async fn bind(bind: SocketAddr) -> Result<Self> {
+        let socket = UdpSocket::bind(bind).await?;
+        Ok(Self::from_link(DatagramLink::Udp(socket)))
+    }
+
+    /// Wraps a tunnel [`UdpConn`] so the keying edge rides the WireGuard netstack.
+    ///
+    /// The resulting transport is identical in behaviour to a UDP-backed one — same
+    /// stats, same foreign-source gate, same [`PathHealth`] — but every datagram travels
+    /// inside the encrypted tunnel. The caller still sets the peer with [`Self::set_peer`];
+    /// for a tunnel the peer address is the inner netstack address of the far end.
+    #[must_use]
+    pub fn over_tunnel(conn: UdpConn) -> Self {
+        let (tx, rx) = conn.split();
+        Self::from_link(DatagramLink::Tunnel { tx, rx: Mutex::new(rx) })
+    }
+
+    fn from_link(link: DatagramLink) -> Self {
+        Self {
+            link,
+            peer: Mutex::new(None),
+            stats: Arc::new(EdgeStats::default()),
+            health: PathHealth::new(),
+            rtt_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// The local address the transport is bound to.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `std::io::Error` if the address cannot be read, or
+    /// [`crate::Error::SerialIo`] with `Unsupported` for a tunnel edge, which has no
+    /// OS-level address.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.link.local_addr()?)
+    }
+
+    /// Shared statistics for the path.
+    #[must_use]
+    pub fn stats(&self) -> Arc<EdgeStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// The path-health flag, so a caller can hand it to the replay driver's F9 source.
+    #[must_use]
+    pub fn health(&self) -> PathHealth {
+        self.health.clone()
+    }
+
+    /// Sets the outbound peer and the only accepted inbound source.
+    pub async fn set_peer(&self, peer: SocketAddr) {
+        *self.peer.lock().await = Some(peer);
+    }
+
+    /// Clears the configured peer, leaving outbound frames undeliverable.
+    pub async fn clear_peer(&self) {
+        *self.peer.lock().await = None;
+    }
+
+    /// The configured peer, if any.
+    pub async fn peer(&self) -> Option<SocketAddr> {
+        *self.peer.lock().await
+    }
+
+    /// Sends one edge frame to the configured peer.
+    ///
+    /// Returns the number of bytes written, or `0` when no peer is configured (counted
+    /// as [`EdgeStats::drop_no_peer`]).
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `std::io::Error` if the datagram cannot be sent.
+    pub async fn send_frame(&self, frame: &RwkPaddleFrame) -> Result<usize> {
+        let Some(peer) = self.peer().await else {
+            self.stats.drop_no_peer.fetch_add(1, Ordering::Relaxed);
+            return Ok(0);
+        };
+        let bytes = frame.to_vec();
+        match self.link.send_to(&bytes, peer).await {
+            Ok(n) => {
+                self.stats.tx_datagrams.fetch_add(1, Ordering::Relaxed);
+                self.stats.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                self.stats.consecutive_send_errors.store(0, Ordering::Relaxed);
+                Ok(n)
+            }
+            Err(e) => {
+                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                // A run of failures means the route is gone, not that one datagram was
+                // unlucky; only then is F9 raised, so a station never drops the key on a
+                // single transient error.
+                let consecutive = self.stats.consecutive_send_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                if consecutive >= MAX_CONSECUTIVE_SEND_ERRORS {
+                    self.health.report_lost();
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Sends a liveness [heartbeat](EDGE_HEARTBEAT_MAGIC) to the configured peer.
+    ///
+    /// A no-op returning `0` when no peer is set. Unlike [`Self::send_frame`], a heartbeat is
+    /// a pure liveness beacon: it carries no keying and is counted as an ordinary tx datagram.
+    /// A send failure feeds the same consecutive-error → [`PathHealth`] accounting as a frame,
+    /// so a run of failed heartbeats on an idle link still surfaces a lost path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `std::io::Error` if the datagram cannot be sent.
+    pub async fn send_heartbeat(&self) -> Result<usize> {
+        let Some(peer) = self.peer().await else {
+            self.stats.drop_no_peer.fetch_add(1, Ordering::Relaxed);
+            return Ok(0);
+        };
+        self.send_control(&EDGE_HEARTBEAT_MAGIC, peer).await
+    }
+
+    /// The latest round-trip time to the peer, measured from a pong. [`None`] until the first pong.
+    #[must_use]
+    pub fn rtt(&self) -> Option<Duration> {
+        match self.rtt_nanos.load(Ordering::Relaxed) {
+            0 => None,
+            nanos => Some(Duration::from_nanos(nanos)),
+        }
+    }
+
+    /// Sends an edge ping stamped with this host's monotonic time. The peer answers with a pong,
+    /// which sets [`Self::rtt`] when it arrives. Like a heartbeat, a no-op returning `0` without a peer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `std::io::Error` if the datagram cannot be sent.
+    pub async fn send_ping(&self) -> Result<usize> {
+        let Some(peer) = self.peer().await else {
+            self.stats.drop_no_peer.fetch_add(1, Ordering::Relaxed);
+            return Ok(0);
+        };
+        let mut ping = [0u8; CONTROL_LEN];
+        ping[..4].copy_from_slice(&EDGE_PING_MAGIC);
+        ping[4..].copy_from_slice(&monotonic_nanos().to_be_bytes());
+        self.send_control(&ping, peer).await
+    }
+
+    /// Sends a control datagram, feeding the same statistics and [`PathHealth`] accounting as a frame.
+    async fn send_control(&self, datagram: &[u8], peer: SocketAddr) -> Result<usize> {
+        match self.link.send_to(datagram, peer).await {
+            Ok(n) => {
+                self.stats.tx_datagrams.fetch_add(1, Ordering::Relaxed);
+                self.stats.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                self.stats.consecutive_send_errors.store(0, Ordering::Relaxed);
+                Ok(n)
+            }
+            Err(e) => {
+                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                let consecutive =
+                    self.stats.consecutive_send_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                if consecutive >= MAX_CONSECUTIVE_SEND_ERRORS {
+                    self.health.report_lost();
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Answers an edge ping by echoing its stamp in a pong, or records an incoming pong's round
+    /// trip. Returns [`Some`] with [`EdgeInbound::Control`] when `datagram` is one of the two, so the
+    /// caller classifies it no further.
+    async fn handle_control(&self, datagram: &[u8], src: SocketAddr) -> Option<EdgeInbound> {
+        if datagram.len() != CONTROL_LEN {
+            return None;
+        }
+        let mut stamp = [0u8; 8];
+        stamp.copy_from_slice(&datagram[4..]);
+        if datagram[..4] == EDGE_PING_MAGIC[..] {
+            let mut pong = [0u8; CONTROL_LEN];
+            pong[..4].copy_from_slice(&EDGE_PONG_MAGIC);
+            pong[4..].copy_from_slice(&stamp);
+            // A failed pong is already counted in the send statistics and path health.
+            let _ = self.send_control(&pong, src).await;
+            Some(EdgeInbound::Control)
+        } else if datagram[..4] == EDGE_PONG_MAGIC[..] {
+            let sent = u64::from_be_bytes(stamp);
+            // At least 1 ns, so a real sample never reads as "no sample yet" (0).
+            let rtt = monotonic_nanos().saturating_sub(sent).max(1);
+            self.rtt_nanos.store(rtt, Ordering::Relaxed);
+            Some(EdgeInbound::Control)
+        } else {
+            None
+        }
+    }
+
+    /// Receives one edge frame, ignoring datagrams from unexpected sources.
+    ///
+    /// Returns [`None`] when the datagram was dropped (foreign source or malformed
+    /// frame); the caller should simply loop.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `std::io::Error` if the socket read fails.
+    pub async fn recv_frame(&self) -> Result<Option<RwkPaddleFrame>> {
+        Ok(self.recv_raw().await?.and_then(|raw| {
+            RwkPaddleFrame::read_from(&raw).map(|(frame, _)| frame)
+        }))
+    }
+
+    /// Receives one edge frame as **validated raw bytes**, ready to hand to the replay
+    /// driver's [`submit`](crate::engine::replay::DriverHandle::submit).
+    ///
+    /// This is the Station-side bridge's entry point: the driver re-parses the bytes on
+    /// its own time-critical thread and stamps arrival there, so handing it the original
+    /// datagram — rather than a reserialised [`RwkPaddleFrame`] — avoids a needless
+    /// round-trip and keeps the exact wire bytes the sender produced. The same
+    /// foreign-source gate and statistics as [`Self::recv_frame`] apply.
+    ///
+    /// Returns [`None`] when the datagram was dropped (foreign source, or not a
+    /// well-formed frame); the caller should simply loop. A truncated or malformed
+    /// datagram is rejected here so the driver never sees bytes that would fail to parse.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `std::io::Error` if the socket read fails.
+    pub async fn recv_raw(&self) -> Result<Option<Vec<u8>>> {
+        Ok(match self.recv_edge().await? {
+            Some(EdgeInbound::Frame(bytes)) => Some(bytes),
+            // A heartbeat is not a frame; the Station's pump has nothing to replay for it,
+            // so report it as a dropped (non-frame) datagram here. Callers that care about
+            // heartbeats use `recv_edge` directly.
+            Some(EdgeInbound::Heartbeat) | Some(EdgeInbound::Control) | None => None,
+        })
+    }
+
+    /// Receives and classifies one datagram on the edge channel: a validated
+    /// [`RwkPaddleFrame`]'s raw bytes, or a liveness [`EdgeInbound::Heartbeat`].
+    ///
+    /// Applies the same foreign-source gate as [`Self::recv_raw`]. Returns [`None`] when the
+    /// datagram was dropped (foreign source, or neither a heartbeat nor a well-formed frame);
+    /// the caller should simply loop.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `std::io::Error` if the socket read fails.
+    pub async fn recv_edge(&self) -> Result<Option<EdgeInbound>> {
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let (len, src) = self.link.recv_from(&mut buf).await?;
+        self.stats.rx_datagrams.fetch_add(1, Ordering::Relaxed);
+        self.stats.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+
+        // Tailscale ACLs were the primary control in the sidecar; this source check is
+        // the same cheap second gate, so an unexpected node cannot reach the keying path.
+        if let Some(peer) = self.peer().await {
+            if peer != src {
+                self.stats.drop_foreign.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+        }
+
+        // A heartbeat is the exact 4-byte magic and nothing more: classify it first, since it
+        // is shorter than any frame and would otherwise be counted as malformed.
+        if buf[..len] == EDGE_HEARTBEAT_MAGIC {
+            return Ok(Some(EdgeInbound::Heartbeat));
+        }
+        if let Some(control) = self.handle_control(&buf[..len], src).await {
+            return Ok(Some(control));
+        }
+
+        // Validate the frame parses before forwarding, but return the *original* bytes:
+        // the driver re-parses them, and reserialising could only ever reproduce the same
+        // bytes for a valid frame. A parse failure here is a malformed datagram, dropped
+        // exactly as a foreign one would be.
+        let Some((_, used)) = RwkPaddleFrame::read_from(&buf[..len]) else {
+            self.stats.drop_foreign.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        };
+        buf.truncate(used);
+        Ok(Some(EdgeInbound::Frame(buf)))
+    }
+}
+
+/// A persisted port forwarding rule.
+///
+/// Mirrors the profile JSON the .NET client already writes (`ForwardRule`), so existing
+/// configurations load unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardRule {
+    /// Stable rule identifier.
+    pub id: String,
+    /// Display name, e.g. `[Flex] VITA-49 Stream`.
+    pub name: String,
+    /// Transport protocol.
+    pub protocol: ForwardProtocol,
+    /// Port the client side binds (or dials, for an inbound rule).
+    pub client_port: u16,
+    /// Port on the station side.
+    pub station_port: u16,
+    /// Whether the rule is active.
+    pub enabled: bool,
+    /// Loopback address the rule binds to. Defaults to `127.0.0.1` — never the
+    /// any-address, which would expose the relay to the whole LAN.
+    pub bind_address: String,
+    /// Address on the station LAN that traffic is delivered to.
+    pub station_target_address: String,
+    /// Which side initiates the connection.
+    pub direction: ForwardDirection,
+}
+
+impl ForwardRule {
+    /// Validates the rule's ports and bind address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Config`] when a port is zero or the bind address is not
+    /// a loopback literal.
+    pub fn validate(&self) -> Result<()> {
+        if self.client_port == 0 {
+            return Err(crate::Error::Config("client_port must be non-zero".into()));
+        }
+        if self.station_port == 0 {
+            return Err(crate::Error::Config("station_port must be non-zero".into()));
+        }
+        if self.bind_address.is_empty() {
+            return Err(crate::Error::Config("bind_address must not be empty".into()));
+        }
+        Ok(())
+    }
+
+    /// The loopback address this rule would bind on the client side.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Config`] when the address cannot be parsed.
+    pub fn bind_socket_addr(&self) -> Result<SocketAddr> {
+        format!("{}:{}", self.bind_address, self.client_port)
+            .parse()
+            .map_err(|e| crate::Error::Config(format!("invalid bind address: {e}")))
+    }
+}
+
+/// A UDP forwarder: relays datagrams between a local listener and a target, preserving
+/// datagram boundaries and forwarding replies back to the most recent sender.
+///
+/// This is the in-process replacement for the sidecar's `out-udp` relay. It is
+/// deliberately single-session: the Flex/VITA-49 traffic these rules carry is
+/// point-to-point, and a full NAT-style session table is a later increment.
+pub struct UdpForwarder {
+    listen: UdpSocket,
+    reply: UdpSocket,
+    target: SocketAddr,
+    stats: Arc<EdgeStats>,
+}
+
+impl UdpForwarder {
+    /// Binds a loopback listener and a reply socket for talking to `target`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `std::io::Error` if either socket cannot be bound.
+    pub async fn bind(listen_addr: SocketAddr, target: SocketAddr) -> Result<Self> {
+        let listen = UdpSocket::bind(listen_addr).await?;
+        // The reply socket is what the target sees as the source, so replies route back
+        // to it and are then relayed to the application.
+        let reply = UdpSocket::bind("127.0.0.1:0").await?;
+        Ok(Self { listen, reply, target, stats: Arc::new(EdgeStats::default()) })
+    }
+
+    /// The address the application should send to.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `std::io::Error`.
+    pub fn listen_addr(&self) -> Result<SocketAddr> {
+        Ok(self.listen.local_addr()?)
+    }
+
+    /// Shared statistics.
+    #[must_use]
+    pub fn stats(&self) -> Arc<EdgeStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// Relays datagrams until `shutdown` flips to `true`.
+    ///
+    /// Uses a `tokio::sync::watch` channel for shutdown rather than a shared lock, so
+    /// the task can be stopped from the UI thread without blocking either side.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `std::io::Error` from the sockets.
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        let last_sender: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let mut inbound = vec![0u8; MAX_FORWARD_DATAGRAM];
+        let mut outbound = vec![0u8; MAX_FORWARD_DATAGRAM];
+
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    // A closed or flipped channel both mean "stop".
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                read = self.listen.recv_from(&mut inbound) => {
+                    let (len, src) = read?;
+                    *last_sender.lock().await = Some(src);
+                    self.stats.tx_datagrams.fetch_add(1, Ordering::Relaxed);
+                    self.stats.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                    self.reply.send_to(&inbound[..len], self.target).await?;
+                }
+                read = self.reply.recv_from(&mut outbound) => {
+                    let (len, _) = read?;
+                    self.stats.rx_datagrams.fetch_add(1, Ordering::Relaxed);
+                    self.stats.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                    if let Some(sender) = *last_sender.lock().await {
+                        self.listen.send_to(&outbound[..len], sender).await?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Connection counters for a TCP forwarder, mirroring the sidecar's `forwardInfo`.
+///
+/// Deliberately separate from [`EdgeStats`]: a connection-oriented forward counts
+/// connections, not datagrams, and the UI presents the two differently.
+#[derive(Debug, Default)]
+pub struct TcpForwardStats {
+    accepted: AtomicU64,
+    active: AtomicI64,
+    errors: AtomicU64,
+    tx_bytes: AtomicU64,
+    rx_bytes: AtomicU64,
+}
+
+impl TcpForwardStats {
+    /// Connections accepted since the forwarder started.
+    #[must_use]
+    pub fn accepted(&self) -> u64 {
+        self.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Connections currently being relayed.
+    #[must_use]
+    pub fn active(&self) -> i64 {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    /// Failed dials, failed accepts, and failed copies.
+    #[must_use]
+    pub fn errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Bytes copied from the local listener side to the target.
+    #[must_use]
+    pub fn tx_bytes(&self) -> u64 {
+        self.tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes copied from the target back to the local listener side.
+    #[must_use]
+    pub fn rx_bytes(&self) -> u64 {
+        self.rx_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// A TCP forwarder: listens on one address and relays every accepted connection to
+/// `target`, copying bytes both ways and propagating a half-close per direction.
+///
+/// This is the in-process replacement for the sidecar's `out` / `in` relays. Once the
+/// tailnet stack is gone both kinds reduce to the same shape — bind a listener, dial the
+/// other end, pump — so a single type serves both; the rule's [`ForwardDirection`]
+/// decides which address ends up bound and which is dialed.
+///
+/// Unlike [`UdpForwarder`], this is inherently multi-connection: a Station control channel
+/// can stay open for hours, so each accepted connection is pumped on its own task and
+/// never blocks a new one.
+pub struct TcpForwarder {
+    listen: TcpListener,
+    target: SocketAddr,
+    stats: Arc<TcpForwardStats>,
+}
+
+impl TcpForwarder {
+    /// Binds `listen_addr`; every accepted connection is relayed to `target`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `std::io::Error` if the listener cannot be bound.
+    pub async fn bind(listen_addr: SocketAddr, target: SocketAddr) -> Result<Self> {
+        let listen = TcpListener::bind(listen_addr).await?;
+        Ok(Self { listen, target, stats: Arc::new(TcpForwardStats::default()) })
+    }
+
+    /// The address the application should connect to.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `std::io::Error` if the local address cannot be read.
+    pub fn listen_addr(&self) -> Result<SocketAddr> {
+        Ok(self.listen.local_addr()?)
+    }
+
+    /// Shared connection counters.
+    #[must_use]
+    pub fn stats(&self) -> Arc<TcpForwardStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// Accepts and relays connections until `shutdown` flips to `true`.
+    ///
+    /// Returning on shutdown stops *new* connections; connections already being relayed
+    /// drain on their own, exactly as the sidecar's did. A transient `accept` failure is
+    /// counted and retried rather than tearing the forward down.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible for a bound listener: failures are counted, not propagated.
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    // A closed or flipped channel both mean "stop".
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                accepted = self.listen.accept() => {
+                    match accepted {
+                        Ok((stream, _peer)) => {
+                            self.stats.accepted.fetch_add(1, Ordering::Relaxed);
+                            self.stats.active.fetch_add(1, Ordering::Relaxed);
+                            let target = self.target;
+                            let stats = Arc::clone(&self.stats);
+                            tokio::spawn(async move {
+                                relay_connection(stream, target, &stats).await;
+                                stats.active.fetch_sub(1, Ordering::Relaxed);
+                            });
+                        }
+                        Err(_) => {
+                            // `accept` rarely fails transiently (e.g. EMFILE); back off
+                            // briefly instead of spinning on a descriptor storm.
+                            self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                            tokio::time::sleep(TCP_ACCEPT_BACKOFF).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Relays one accepted connection to `target` until both directions have ended.
+async fn relay_connection(inbound: TcpStream, target: SocketAddr, stats: &TcpForwardStats) {
+    // The control channel is low-volume and latency sensitive, so Nagle must not batch
+    // small writes on either leg.
+    let _ = inbound.set_nodelay(true);
+    let outbound = match TcpStream::connect(target).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            stats.errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    let _ = outbound.set_nodelay(true);
+
+    let (in_read, in_write) = inbound.into_split();
+    let (out_read, out_write) = outbound.into_split();
+
+    // `join!`, not `select!`: a half-close in one direction must not cut the other short,
+    // so a client that finishes sending can still read the reply.
+    tokio::join!(
+        pump(in_read, out_write, &stats.tx_bytes),
+        pump(out_read, in_write, &stats.rx_bytes),
+    );
+}
+
+/// Copies one direction of a relay, then half-closes the destination's write side.
+async fn pump(mut src: OwnedReadHalf, mut dst: OwnedWriteHalf, counter: &AtomicU64) {
+    let mut buf = vec![0u8; TCP_FORWARD_BUFFER];
+    loop {
+        match src.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if dst.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+                counter.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+    }
+    // Propagate the FIN so the peer sees end-of-stream; the reverse direction stays open.
+    let _ = dst.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::edge::EdgeEntry;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn edge_frame_round_trips_over_loopback() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        a.set_peer(b.local_addr().unwrap()).await;
+        let frame = RwkPaddleFrame::try_new(
+            7,
+            &[EdgeEntry::key_down_at(1, 10, 0), EdgeEntry::key_up_at(2, 40, 0)],
+        )
+        .unwrap();
+
+        let sent = a.send_frame(&frame).await.unwrap();
+        assert!(sent > 0);
+        assert_eq!(a.stats().tx_datagrams(), 1);
+
+        let received = b.recv_frame().await.unwrap().expect("frame");
+        assert_eq!(received, frame);
+        assert_eq!(b.stats().rx_datagrams(), 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_received_as_heartbeat_not_a_frame() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        a.set_peer(b.local_addr().unwrap()).await;
+        b.set_peer(a.local_addr().unwrap()).await;
+
+        let sent = a.send_heartbeat().await.unwrap();
+        assert_eq!(sent, EDGE_HEARTBEAT_MAGIC.len());
+        assert_eq!(a.stats().tx_datagrams(), 1);
+
+        // Classified as a heartbeat...
+        assert_eq!(b.recv_edge().await.unwrap(), Some(EdgeInbound::Heartbeat));
+        // ...and NOT mistaken for a frame by the Station's frame path.
+        a.send_heartbeat().await.unwrap();
+        assert_eq!(b.recv_raw().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_frame_and_a_heartbeat_are_distinguishable_on_one_socket() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        a.set_peer(b.local_addr().unwrap()).await;
+        b.set_peer(a.local_addr().unwrap()).await;
+
+        let frame = RwkPaddleFrame::try_new(3, &[EdgeEntry::key_down_at(1, 10, 0)]).unwrap();
+        a.send_frame(&frame).await.unwrap();
+        match b.recv_edge().await.unwrap() {
+            Some(EdgeInbound::Frame(bytes)) => {
+                let (parsed, _) = RwkPaddleFrame::read_from(&bytes).unwrap();
+                assert_eq!(parsed, frame);
+            }
+            other => panic!("expected a frame, got {other:?}"),
+        }
+
+        a.send_heartbeat().await.unwrap();
+        assert_eq!(b.recv_edge().await.unwrap(), Some(EdgeInbound::Heartbeat));
+    }
+
+    #[tokio::test]
+    async fn ping_is_answered_with_a_pong_that_measures_rtt() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        a.set_peer(b.local_addr().unwrap()).await;
+        b.set_peer(a.local_addr().unwrap()).await;
+        assert_eq!(a.rtt(), None);
+
+        assert_eq!(a.send_ping().await.unwrap(), CONTROL_LEN);
+        // The peer answers the ping inside its receive path, so the ping is control, not a frame.
+        assert_eq!(b.recv_edge().await.unwrap(), Some(EdgeInbound::Control));
+        // The pong comes back the same way and sets this side's round trip.
+        assert_eq!(a.recv_edge().await.unwrap(), Some(EdgeInbound::Control));
+        let rtt = a.rtt().expect("a pong sets the round trip");
+        assert!(rtt < Duration::from_secs(5), "loopback RTT was {rtt:?}");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_without_peer_is_counted_not_sent() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        assert_eq!(a.send_heartbeat().await.unwrap(), 0);
+        assert_eq!(a.stats().drop_no_peer(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_without_peer_is_counted_not_sent() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let frame = RwkPaddleFrame::try_new(1, &[EdgeEntry::key_down_at(0, 0, 0)]).unwrap();
+        assert_eq!(a.send_frame(&frame).await.unwrap(), 0);
+        assert_eq!(a.stats().drop_no_peer(), 1);
+    }
+
+    #[tokio::test]
+    async fn sustained_send_failures_raise_path_loss_once_per_run() {
+        // An IPv4 socket sending to an IPv6 peer fails deterministically with an address
+        // family mismatch, which gives the detector a real failure to react to.
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        a.set_peer("[::1]:9".parse().unwrap()).await;
+        let health = a.health();
+        let frame = RwkPaddleFrame::try_new(1, &[EdgeEntry::key_down_at(0, 0, 0)]).unwrap();
+
+        for i in 1..MAX_CONSECUTIVE_SEND_ERRORS {
+            assert!(a.send_frame(&frame).await.is_err());
+            assert!(!health.is_lost(), "must not trip after {i} failure(s)");
+        }
+        assert!(a.send_frame(&frame).await.is_err());
+        assert!(health.is_lost(), "a sustained failure run must raise path loss");
+        assert!(health.take_lost(), "the flag is consumable");
+        assert!(!health.is_lost(), "taking it clears it");
+        assert_eq!(a.stats().consecutive_send_errors(), MAX_CONSECUTIVE_SEND_ERRORS);
+        assert_eq!(a.stats().errors(), u64::from(MAX_CONSECUTIVE_SEND_ERRORS));
+    }
+
+    #[tokio::test]
+    async fn a_successful_send_resets_the_failure_run() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let frame = RwkPaddleFrame::try_new(1, &[EdgeEntry::key_down_at(0, 0, 0)]).unwrap();
+
+        a.set_peer("[::1]:9".parse().unwrap()).await;
+        assert!(a.send_frame(&frame).await.is_err());
+        assert_eq!(a.stats().consecutive_send_errors(), 1);
+
+        a.set_peer(b.local_addr().unwrap()).await;
+        assert!(a.send_frame(&frame).await.is_ok());
+        assert_eq!(a.stats().consecutive_send_errors(), 0);
+        assert!(!a.health().is_lost(), "a successful send proves the path is back");
+    }
+
+    #[tokio::test]
+    async fn foreign_source_is_dropped() {
+        let b = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let c = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        // B only trusts A, but C sends to it.
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        b.set_peer(a.local_addr().unwrap()).await;
+
+        let frame = RwkPaddleFrame::try_new(1, &[EdgeEntry::key_down_at(0, 0, 0)]).unwrap();
+        c.set_peer(b.local_addr().unwrap()).await;
+        c.send_frame(&frame).await.unwrap();
+
+        assert!(b.recv_frame().await.unwrap().is_none(), "foreign datagram must be dropped");
+        assert_eq!(b.stats().drop_foreign(), 1);
+    }
+
+    #[test]
+    fn forward_rule_validation() {
+        let mut rule = ForwardRule {
+            id: "r1".into(),
+            name: "VITA-49".into(),
+            protocol: ForwardProtocol::Udp,
+            client_port: 4991,
+            station_port: 4991,
+            enabled: true,
+            bind_address: "127.0.0.1".into(),
+            station_target_address: "192.168.88.213".into(),
+            direction: ForwardDirection::ClientToStation,
+        };
+        assert!(rule.validate().is_ok());
+        assert_eq!(rule.bind_socket_addr().unwrap().port(), 4991);
+
+        rule.client_port = 0;
+        assert!(rule.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_forwarder_relays_both_directions() {
+        // "app" plays the local application; "radio" plays the station-LAN target.
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let radio = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forwarder =
+            UdpForwarder::bind("127.0.0.1:0".parse().unwrap(), radio.local_addr().unwrap())
+                .await
+                .unwrap();
+        let listen = forwarder.listen_addr().unwrap();
+
+        let (tx, rx) = watch::channel(false);
+        let stats = forwarder.stats();
+        let task = tokio::spawn(async move { forwarder.run(rx).await });
+
+        // App -> forwarder -> radio.
+        app.send_to(b"ping", listen).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (len, reply_to) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            radio.recv_from(&mut buf),
+        )
+        .await
+        .expect("radio receive timed out")
+        .unwrap();
+        assert_eq!(&buf[..len], b"ping");
+
+        // Radio replies to the forwarder's reply socket; the forwarder relays it back
+        // to the application's original source address.
+        radio.send_to(b"pong", reply_to).await.unwrap();
+        let (len2, _from) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.recv_from(&mut buf),
+        )
+        .await
+        .expect("app receive timed out")
+        .unwrap();
+        assert_eq!(&buf[..len2], b"pong");
+
+        // Shut the forwarder down cleanly.
+        tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("forwarder did not stop")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stats.tx_datagrams(), 1);
+        assert_eq!(stats.rx_datagrams(), 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_forwarder_relays_both_directions() {
+        // "app" is the local application; "radio" plays the station-LAN target.
+        let radio = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let radio_addr = radio.local_addr().unwrap();
+        let forwarder = TcpForwarder::bind("127.0.0.1:0".parse().unwrap(), radio_addr)
+            .await
+            .unwrap();
+        let listen = forwarder.listen_addr().unwrap();
+        let stats = forwarder.stats();
+
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move { forwarder.run(rx).await });
+
+        // The radio accepts one connection and echoes the datagram it reads.
+        let echo = tokio::spawn(async move {
+            let (mut stream, _) = radio.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).await.unwrap();
+            stream.write_all(&buf[..n]).await.unwrap();
+            stream.flush().await.unwrap();
+            n
+        });
+
+        let mut app = TcpStream::connect(listen).await.unwrap();
+        app.write_all(b"hello morse").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), app.read(&mut buf))
+            .await
+            .expect("app read timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"hello morse");
+        assert_eq!(echo.await.unwrap(), 11);
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("forwarder did not stop")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stats.accepted(), 1);
+        assert_eq!(stats.errors(), 0);
+        assert_eq!(stats.tx_bytes(), 11);
+        assert_eq!(stats.rx_bytes(), 11);
+    }
+
+    #[tokio::test]
+    async fn tcp_forwarder_propagates_half_close() {
+        let radio = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let radio_addr = radio.local_addr().unwrap();
+        let forwarder = TcpForwarder::bind("127.0.0.1:0".parse().unwrap(), radio_addr)
+            .await
+            .unwrap();
+        let listen = forwarder.listen_addr().unwrap();
+
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move { forwarder.run(rx).await });
+
+        // The radio reads to EOF — proving the FIN crossed the forwarder — then answers on
+        // the still-open reverse direction.
+        let radio_task = tokio::spawn(async move {
+            let (mut stream, _) = radio.accept().await.unwrap();
+            let mut got = Vec::new();
+            stream.read_to_end(&mut got).await.unwrap();
+            stream.write_all(b"roger").await.unwrap();
+            stream.flush().await.unwrap();
+            got
+        });
+
+        let mut app = TcpStream::connect(listen).await.unwrap();
+        app.write_all(b"cq test").await.unwrap();
+        app.shutdown().await.unwrap(); // the application's half-close
+
+        let received = tokio::time::timeout(Duration::from_secs(2), radio_task)
+            .await
+            .expect("radio never saw end-of-stream")
+            .unwrap();
+        assert_eq!(received, b"cq test");
+
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(2), app.read(&mut buf))
+            .await
+            .expect("app read timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"roger", "a half-close must not cut the reply direction");
+
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    #[tokio::test]
+    async fn tcp_forwarder_counts_a_failed_dial() {
+        // A closed *loopback* port is not usable here: a host firewall can swallow the
+        // RST, leaving the dial in SYN retransmit for the whole test. The unspecified
+        // address is instead rejected locally and instantly, on both Windows and Linux.
+        let dead_addr: SocketAddr = "0.0.0.0:1".parse().unwrap();
+
+        let forwarder = TcpForwarder::bind("127.0.0.1:0".parse().unwrap(), dead_addr)
+            .await
+            .unwrap();
+        let listen = forwarder.listen_addr().unwrap();
+        let stats = forwarder.stats();
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move { forwarder.run(rx).await });
+
+        let mut app = TcpStream::connect(listen).await.unwrap();
+        // The relay cannot dial, so it drops the inbound connection and the app sees EOF.
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(2), app.read(&mut buf))
+            .await
+            .expect("relay did not close the connection")
+            .unwrap();
+        assert_eq!(n, 0, "a failed dial must close the inbound connection");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while stats.errors() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(stats.accepted(), 1);
+        assert_eq!(stats.errors(), 1);
+        assert_eq!(stats.tx_bytes(), 0);
+
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    #[tokio::test]
+    async fn tcp_forwarder_handles_concurrent_connections() {
+        let radio = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let radio_addr = radio.local_addr().unwrap();
+        let forwarder = TcpForwarder::bind("127.0.0.1:0".parse().unwrap(), radio_addr)
+            .await
+            .unwrap();
+        let listen = forwarder.listen_addr().unwrap();
+        let stats = forwarder.stats();
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(async move { forwarder.run(rx).await });
+
+        // Three long-lived sessions at once: the second must not wait for the first.
+        let radio_task = tokio::spawn(async move {
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = radio.accept().await.unwrap();
+                handles.push(tokio::spawn(async move {
+                    let mut buf = [0u8; 32];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    stream.write_all(&buf[..n]).await.unwrap();
+                    stream.flush().await.unwrap();
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+
+        for i in 0..3u8 {
+            let mut app = TcpStream::connect(listen).await.unwrap();
+            app.write_all(&[i]).await.unwrap();
+            let mut buf = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(2), app.read_exact(&mut buf))
+                .await
+                .expect("concurrent session timed out")
+                .unwrap();
+            assert_eq!(buf[0], i);
+        }
+        radio_task.await.unwrap();
+
+        assert_eq!(stats.accepted(), 3);
+        assert_eq!(stats.errors(), 0);
+
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+}
