@@ -45,6 +45,7 @@ function loadMacros() {
 export default function ClientApp() {
   const [settings, setSettings] = useState({
     wpm: 20,
+    speedLocked: false,
     weight: 50,
     mode: "iambicB",
     paddleReverse: false,
@@ -80,6 +81,7 @@ export default function ClientApp() {
         case "settings":
           setSettings({
             wpm: ev.wpm,
+            speedLocked: ev.speed_locked ?? false,
             weight: ev.weight,
             mode: ev.mode,
             paddleReverse: ev.paddle_reverse,
@@ -202,11 +204,15 @@ export default function ClientApp() {
             <div className="wpm">
               {settings.wpm} <small>WPM</small>
             </div>
+            {settings.speedLocked && (
+              <small className="hint">Set by N1MM while it has the logger open</small>
+            )}
             <input
               type="range"
               min={5}
               max={60}
               value={settings.wpm}
+              disabled={settings.speedLocked}
               onChange={(e) => {
                 const v = Number(e.target.value);
                 setSettings((s) => ({ ...s, wpm: v }));
