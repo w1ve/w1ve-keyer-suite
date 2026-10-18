@@ -1,0 +1,41 @@
+// Tauri command bridge for the single-binary W1VE Keyer. Each function maps to a
+// #[tauri::command] in src/lib.rs.
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+export const api = {
+  // Pull the current settings + port list (called once the UI has subscribed, since the
+  // backend's startup push races the webview and would otherwise be missed).
+  requestState: () => invoke("request_state"),
+
+  // Keyer
+  setSpeed: (wpm) => invoke("set_speed", { wpm }),
+  setWeight: (weight) => invoke("set_weight", { weight }),
+  setMode: (mode) => invoke("set_mode", { mode }),
+  setPaddleReverse: (reverse) => invoke("set_paddle_reverse", { reverse }),
+
+  // Sidetone
+  setToneFrequency: (hz) => invoke("set_tone_frequency", { hz }),
+  setToneVolume: (percent) => invoke("set_tone_volume", { percent }),
+  selectAudioDevice: (device) => invoke("select_audio_device", { device }),
+  audioDevices: () => invoke("audio_devices"),
+  refreshAudioDevices: () => invoke("refresh_audio_devices"),
+
+  // Ports
+  serialPorts: () => invoke("serial_ports"),
+  selectKeyingPort: (port) => invoke("select_keying_port", { port }),
+  selectPaddlePort: (port) => invoke("select_paddle_port", { port }),
+  selectLoggerPort: (port) => invoke("select_logger_port", { port }),
+  setKeyLine: (line) => invoke("set_key_line", { line }),
+  setPttLine: (line) => invoke("set_ptt_line", { line }),
+
+  // Keying
+  sendCw: (text) => invoke("send_cw", { text }),
+  testTx: () => invoke("test_tx"),
+  abortSend: () => invoke("abort_send"),
+};
+
+// Subscribes to the controller event stream on the `wk://event` channel.
+export function onEvent(handler) {
+  return listen("wk://event", (e) => handler(e.payload));
+}

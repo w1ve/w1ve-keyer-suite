@@ -1,0 +1,44 @@
+[package]
+name = "wk-app"
+description = "W1VE Keyer desktop app (Tauri v2): a standalone software WinKeyer — paddle + logger (WinKeyer2) in, serial key-line out, local sidetone. No networking."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# One executable: there is no client/server split. Window title "W1VE Keyer".
+[[bin]]
+name = "w1ve-keyer"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+rwk-core = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# The logger (WinKeyer) input must *read* bytes from the serial port; rwk-core's serial layer
+# is keying-output only (control lines, no data bytes), so the host decoder owns its own port.
+serialport = { workspace = true }
+
+# Windows device-change notifications (WM_DEVICECHANGE) for instant serial PnP detection. We
+# subclass Tauri's own window; off Windows the watcher falls back to timer polling and this
+# dependency is not compiled.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+] }
+
+[features]
+# Enabled by Tauri's build tooling for production bundles so the webview serves the bundled
+# web/dist assets instead of the dev URL. Mirrors the sibling apps.
+custom-protocol = ["tauri/custom-protocol"]
