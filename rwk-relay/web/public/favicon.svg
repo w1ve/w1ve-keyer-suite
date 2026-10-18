@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <!-- Dark Mode Background Gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1f242d" />
+      <stop offset="100%" stop-color="#0d1117" />
+    </linearGradient>
+    
+    <!-- High-Contrast Blue Pulse Gradient -->
+    <linearGradient id="pulseGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00d2ff" />
+      <stop offset="100%" stop-color="#0066ff" />
+    </linearGradient>
+  </defs>
+
+  <!-- Base Icon Frame -->
+  <rect x="8" y="8" width="240" height="240" rx="48" fill="url(#bgGrad)" stroke="#30363d" stroke-width="6" />
+
+  <!-- Outer Signal Ring (Networking/Wireless) -->
+  <path d="M 48 110 A 88 88 0 0 1 208 110" fill="none" stroke="url(#pulseGrad)" stroke-width="14" stroke-linecap="round" />
+  <path d="M 76 130 A 56 56 0 0 1 180 130" fill="none" stroke="#58a6ff" stroke-width="10" stroke-linecap="round" stroke-dasharray="1 0" />
+
+  <!-- Dual Paddle Key Graphic -->
+  <g transform="translate(0, 10)">
+    <!-- Base -->
+    <rect x="72" y="170" width="112" height="24" rx="6" fill="#8b949e" />
+    
+    <!-- Left Lever & Thumb Paddle -->
+    <rect x="100" y="100" width="16" height="70" fill="#f0f6fc" />
+    <circle cx="76" cy="112" r="16" fill="url(#pulseGrad)" />
+    
+    <!-- Right Lever & Finger Paddle -->
+    <rect x="140" y="100" width="16" height="70" fill="#f0f6fc" />
+    <circle cx="180" cy="112" r="16" fill="url(#pulseGrad)" />
+  </g>
+
+  <!-- Central WinKeyer / CW Pulse Dot -->
+  <circle cx="128" cy="62" r="10" fill="#00d2ff" />
+</svg>
