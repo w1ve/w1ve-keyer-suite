@@ -25,7 +25,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rwk_core::config::{base64_encode, Config, Role};
+use rwk_core::config::{base64_decode, base64_encode, Config, ForwardRuleConfig, Role};
 use rwk_core::engine::bus::{CoreEvent, EventBus};
 use rwk_core::engine::control::{ControlLink, ControlMessage};
 use rwk_core::engine::edge_station::{pump_edges, tunnel_replayer};
@@ -33,7 +33,7 @@ use rwk_core::engine::flex_discovery::DiscoveryListener;
 use rwk_core::engine::keying_arbiter::{KeyingArbiter, LineObserver, LineUpdate};
 use rwk_core::engine::network::EdgeTransport;
 use rwk_core::engine::replay::{spawn_driver, EdgeJitterProfile, SerialKeyingAdapter};
-use rwk_core::engine::serial::{enumerate_ports, KeyingOutputConfig, SerialKeyingOutput};
+use rwk_core::engine::serial::{enumerate_ports, KeyingOutputConfig, PttTiming, SerialKeyingOutput};
 use rwk_core::engine::session::Session;
 use rwk_core::engine::tunnel;
 use rwk_core::primitives::KeyingLine;
@@ -47,6 +47,12 @@ use crate::station_winkeyer::{HostReport, HostReporter, StationWinKeyerHost};
 /// The inner UDP port the keying edge rides over the tunnel, matching the Client's
 /// [`crate::controller`] `EDGE_PORT` so the two ends agree.
 const EDGE_PORT: u16 = 5555;
+
+/// PTT hang time bounds and default, in ms (how long PTT is held after key-up). Same range as
+/// the Remote Keyer's Player.
+pub const PTT_HANG_MIN_MS: u32 = 75;
+pub const PTT_HANG_MAX_MS: u32 = 600;
+const PTT_HANG_DEFAULT_MS: u64 = 200;
 
 /// Control identifiers for inline per-control error messages in the UI.
 mod control {
@@ -67,6 +73,9 @@ pub enum StationEvent {
     LoggerSending { active: bool },
     /// The link to the client changed. `path` is "none" | "direct" | "relay".
     Connection { state: String, path: String },
+    /// The round-trip time to the Client in ms, refreshed about once a second while paired.
+    /// `None` until measured (and when unpaired).
+    Rtt { ms: Option<u32> },
     /// A fail-safe fired (F1..=F10). `code` is the number, `message` the description.
     FailSafe { code: u8, message: String },
     /// A human-readable log line for the Log tab.
@@ -87,9 +96,16 @@ pub enum StationEvent {
         relay: Option<String>,
         pairing_code: Option<String>,
         transport: String,
+        ptt_hang_ms: u64,
     },
     /// The live list of LAN keyers available to connect to (for the dropdown).
     LanPeers { peers: Vec<LanPeerView> },
+    /// The forward-rule table the Client last pushed (read-only on the Station). Empty when
+    /// unpaired. Emitted on every push, so the Station's view follows the operator's rules.
+    ForwardRules { rules: Vec<ForwardRuleConfig> },
+    /// Whether the Station is capturing FlexRadio discovery and relaying it to the Client. True
+    /// while a Flex rule is pushed and the control channel is up.
+    FlexDiscovery { enabled: bool },
 }
 
 /// A LAN keyer as the Station UI shows it in the dropdown.
@@ -121,6 +137,8 @@ struct Settings {
     pairing_code: Option<String>,
     /// Pairing transport: "wan" (relay + code) or "lan" (broadcast discovery / pick a keyer).
     transport: String,
+    /// How long PTT is held after key-up, in ms.
+    ptt_hang_ms: u64,
 }
 
 impl Default for Settings {
@@ -134,6 +152,7 @@ impl Default for Settings {
             relay: None,
             pairing_code: None,
             transport: "wan".to_string(),
+            ptt_hang_ms: PTT_HANG_DEFAULT_MS,
         }
     }
 }
@@ -181,6 +200,7 @@ impl Shared {
             relay: s.relay.clone(),
             pairing_code: s.pairing_code.clone(),
             transport: s.transport.clone(),
+            ptt_hang_ms: s.ptt_hang_ms,
         });
     }
 
@@ -203,6 +223,7 @@ impl Shared {
                 Some(s.ptt_line.map(|l| line_name(l).to_string()).unwrap_or_else(|| "none".into()));
             config.station.logger_port = s.logger_port.clone();
             config.station.logger_enabled = s.logger_enabled;
+            config.station.ptt_hang_ms = Some(s.ptt_hang_ms);
         }
         let config = self.config.lock().unwrap();
         if let Err(e) = config.save(path) {
@@ -276,6 +297,8 @@ impl StationController {
             active: Arc::new(Mutex::new(None)),
             browse: Mutex::new(None),
         };
+        // Persist once so a freshly generated pairing token survives the next restart.
+        controller.shared.persist();
         controller.shared.emit_settings();
         controller.emit_ports();
         controller
@@ -384,6 +407,17 @@ impl StationController {
     /// when pairing starts, so the replay driver owns it for the session; changing it while
     /// paired takes effect on the next pairing.
     pub fn select_keying_port(&self, port: Option<String>) {
+        // Exclusive with the logger port: one port serves one job.
+        if let Some(p) = &port {
+            if self.shared.settings.lock().unwrap().logger_port.as_deref() == Some(p.as_str()) {
+                self.shared.fail(
+                    control::KEYING,
+                    format!("{p} is the logger port"),
+                    format!("{p} is already the logger port; a port can serve one job."),
+                );
+                return;
+            }
+        }
         self.shared.settings.lock().unwrap().keying_port = port.clone();
         self.shared.clear_error(control::KEYING);
         match port {
@@ -410,9 +444,40 @@ impl StationController {
         self.shared.emit_settings();
     }
 
-    /// Selects the serial port the local logger sends WinKeyer protocol on, or `None`.
+    /// Sets the PTT hang time (how long PTT is held after key-up), clamped to the valid range.
+    pub fn set_ptt_hang(&self, ms: u32) {
+        let ms = ms.clamp(PTT_HANG_MIN_MS, PTT_HANG_MAX_MS);
+        self.shared.settings.lock().unwrap().ptt_hang_ms = u64::from(ms);
+        self.shared.persist();
+        self.shared.emit_settings();
+    }
+
+    /// Generates a new pairing token. The Station shows it and the Client types it.
+    pub fn regenerate_token(&self) {
+        self.shared.settings.lock().unwrap().pairing_code = Some(generate_token());
+        self.shared.persist();
+        self.shared.emit_settings();
+    }
+
+    /// Selects the serial port the local logger sends WinKeyer protocol on, or `None`. A logger
+    /// port turns the logger input on; clearing it turns the input off.
     pub fn set_logger_port(&self, port: Option<String>) {
-        self.shared.settings.lock().unwrap().logger_port = port.clone();
+        // Exclusive with the keying port: one port serves one job.
+        if let Some(p) = &port {
+            if self.shared.settings.lock().unwrap().keying_port.as_deref() == Some(p.as_str()) {
+                self.shared.fail(
+                    control::LOGGER,
+                    format!("{p} is the keying port"),
+                    format!("{p} is already the keying port; a port can serve one job."),
+                );
+                return;
+            }
+        }
+        {
+            let mut s = self.shared.settings.lock().unwrap();
+            s.logger_port = port.clone();
+            s.logger_enabled = port.is_some();
+        }
         self.shared.clear_error(control::LOGGER);
         match port {
             Some(name) => self.shared.log("info", format!("Logger input port set to {name}.")),
@@ -465,14 +530,8 @@ impl StationController {
             let s = self.shared.settings.lock().unwrap();
             (s.keying_port.clone(), s.logger_port.clone(), s.logger_enabled)
         };
-        if keying_port.is_none() {
-            self.shared.log("warn", "Select a keying output port before pairing.");
-            self.shared
-                .emit(StationEvent::Connection { state: "disconnected".into(), path: "none".into() });
-            return;
-        }
-
-        // Only one pairing at a time.
+        // Only one pairing at a time. A keying port is not required to pair: with none the
+        // Station still runs and the KEY/PTT LEDs follow the Client.
         self.disconnect();
 
         let code = code.to_string();
@@ -492,7 +551,14 @@ impl StationController {
 
             let connected = match tunnel::connect(&config).await {
                 Ok(c) => c,
-                Err(e) => return fail(&shared, format!("link failed: {e}")),
+                Err(e) => {
+                    // The relay did not answer: ask the operator for a relay address.
+                    shared.emit(StationEvent::Error {
+                        control: "relay".into(),
+                        message: "Relay not reachable".into(),
+                    });
+                    return fail(&shared, format!("link failed: {e}"));
+                }
             };
             bring_up_station(&shared, &active_slot, connected, keying_port, logger_port, logger_enabled)
                 .await;
@@ -550,10 +616,6 @@ impl StationController {
             let s = self.shared.settings.lock().unwrap();
             (s.keying_port.clone(), s.logger_port.clone(), s.logger_enabled)
         };
-        if keying_port.is_none() {
-            self.shared.log("warn", "Select a keying output port before connecting.");
-            return;
-        }
         let peer_key = match rwk_core::config::base64_decode(peer_key_b64)
             .ok()
             .and_then(|b| <[u8; 32]>::try_from(b).ok())
@@ -630,6 +692,9 @@ impl StationController {
             self.shared.emit(StationEvent::KeyState { down: false });
             self.shared.emit(StationEvent::Ptt { asserted: false });
             self.shared.emit(StationEvent::LoggerSending { active: false });
+            self.shared.emit(StationEvent::ForwardRules { rules: Vec::new() });
+            self.shared.emit(StationEvent::FlexDiscovery { enabled: false });
+            self.shared.emit(StationEvent::Rtt { ms: None });
             self.shared
                 .emit(StationEvent::Connection { state: "disconnected".into(), path: "none".into() });
             self.shared.log("info", "Unpaired.");
@@ -666,8 +731,13 @@ fn load_or_create(path: &Option<std::path::PathBuf>) -> (Config, Settings) {
         logger_port: config.station.logger_port.clone(),
         logger_enabled: config.station.logger_enabled,
         relay: config.relay.as_ref().map(|r| r.address.to_string()),
-        pairing_code: config.pairing_code.clone(),
+        pairing_code: Some(config.pairing_code.clone().unwrap_or_else(generate_token)),
         transport: "wan".to_string(),
+        ptt_hang_ms: config
+            .station
+            .ptt_hang_ms
+            .unwrap_or(PTT_HANG_DEFAULT_MS)
+            .clamp(u64::from(PTT_HANG_MIN_MS), u64::from(PTT_HANG_MAX_MS)),
     };
     (config, settings)
 }
@@ -762,38 +832,58 @@ async fn bring_up_station(
         let s = shared.settings.lock().unwrap();
         (s.key_line, s.ptt_line)
     };
-    let port_name = keying_port.expect("checked present before connect");
-    let cfg = KeyingOutputConfig {
-        port_name: port_name.clone(),
-        key_line,
-        ptt_line: ptt_line.unwrap_or(KeyingLine::None),
-        ..Default::default()
-    };
-    let serial = match SerialKeyingOutput::open(cfg) {
-        Ok(out) => out,
-        Err(e) => {
-            shared.fail(
-                control::KEYING,
-                format!("{port_name} not available"),
-                format!("keying port {port_name} failed: {e}"),
-            );
-            shared.emit(StationEvent::Connection {
-                state: "disconnected".into(),
-                path: "none".into(),
-            });
-            return;
+    // Key and PTT must be on different lines; a duplicate drops PTT rather than fight the key.
+    let ptt_line = ptt_line_for(key_line, ptt_line);
+
+    // The serial output is optional: with no keying port (or one that will not open) the Station
+    // still runs and the KEY/PTT LEDs follow the Client. Nothing is wired to the radio then.
+    let serial = match keying_port {
+        Some(port_name) => {
+            let cfg = KeyingOutputConfig {
+                port_name: port_name.clone(),
+                key_line,
+                ptt_line: ptt_line.unwrap_or(KeyingLine::None),
+                ..Default::default()
+            };
+            match SerialKeyingOutput::open(cfg) {
+                Ok(out) => {
+                    shared.clear_error(control::KEYING);
+                    shared.log("info", format!("Keying output open on {port_name}."));
+                    Some(out)
+                }
+                Err(e) => {
+                    shared.fail(
+                        control::KEYING,
+                        format!("{port_name} not available"),
+                        format!("keying port {port_name} failed: {e}. Keying the LED only; pick an available port to drive the radio."),
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            shared.clear_error(control::KEYING);
+            shared.log("info", "No keying port selected — keying the LED only.");
+            None
         }
     };
-    shared.clear_error(control::KEYING);
-    shared.log("info", format!("Keying output open on {port_name}."));
 
     let arbiter = Arc::new(KeyingArbiter::with_observer(
-        SerialKeyingAdapter::new(serial),
+        match serial {
+            Some(out) => SerialKeyingAdapter::new(out),
+            None => SerialKeyingAdapter::led_only(),
+        },
         Some(make_line_observer(Arc::clone(shared))),
     ));
 
+    // PTT sequencing: the replayer asserts PTT just ahead of each keyed edge and holds it for the
+    // hang time after key-up. With no PTT line there is nothing to sequence.
     let clock: Arc<dyn Clock> = Arc::new(MonotonicClock);
-    let mut replayer = tunnel_replayer(clock.as_ref(), EdgeJitterProfile::PathAdaptive, None);
+    let ptt_timing = ptt_line.map(|_| PttTiming {
+        tail: std::time::Duration::from_millis(shared.settings.lock().unwrap().ptt_hang_ms),
+        ..PttTiming::default()
+    });
+    let mut replayer = tunnel_replayer(clock.as_ref(), EdgeJitterProfile::PathAdaptive, ptt_timing);
     replayer.begin_session(1);
 
     let bus = EventBus::new();
@@ -837,6 +927,7 @@ async fn bring_up_station(
 
     let stop_bus = Arc::new(AtomicBool::new(false));
     spawn_bus_forwarder(bus, Arc::clone(shared), Arc::clone(&stop_bus));
+    spawn_rtt_probe(Arc::clone(shared), Arc::clone(&transport), Arc::clone(&stop_bus));
 
     let pump = tokio::spawn(pump_edges(Arc::clone(&transport), driver));
 
@@ -861,6 +952,29 @@ async fn bring_up_station(
     shared.log("info", format!("Paired with the keyer over the {path} path."));
 }
 
+/// Heartbeat and round-trip probe for the Station's link. Each quarter second it sends a heartbeat
+/// and a ping (the Client answers, and its pong sets the round trip); every fourth tick it reports
+/// the RTT to the UI. It stops when the session's stop flag is set.
+fn spawn_rtt_probe(shared: Arc<Shared>, transport: Arc<EdgeTransport>, stop: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        let mut beats: u32 = 0;
+        loop {
+            tick.tick().await;
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let _ = transport.send_heartbeat().await;
+            let _ = transport.send_ping().await;
+            beats = beats.wrapping_add(1);
+            if beats % 4 == 0 {
+                let ms = transport.rtt().map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
+                shared.emit(StationEvent::Rtt { ms });
+            }
+        }
+    });
+}
+
 /// Spawns the Station's control-channel task: accept the Client's control connection, apply
 /// each pushed forward-rule table to the live session, and — when any FlexRadio rule is
 /// present — capture the radio's VITA-49 discovery broadcasts and forward them to the Client.
@@ -871,58 +985,79 @@ fn spawn_control_task(
     stop: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Accept the Client's control connection over the tunnel.
-        let link = match ControlLink::listen(&net).await {
-            Ok(l) => l,
-            Err(e) => {
-                shared.log("warn", format!("Control channel listen failed: {e}"));
-                return;
-            }
-        };
-        shared.log("info", "Control channel up.");
-        let link = Arc::new(tokio::sync::Mutex::new(link));
-
-        // A handle to a running Flex discovery listener task, so a later rule change can stop
-        // it (or leave it running).
-        let mut flex_task: Option<tokio::task::JoinHandle<()>> = None;
-
-        loop {
-            if stop.load(Ordering::SeqCst) {
-                break;
-            }
-            let message = {
-                let mut guard = link.lock().await;
-                guard.recv().await
-            };
-            match message {
-                Ok(Some(ControlMessage::ForwardRules { rules })) => {
-                    let started = session.lock().await.apply_forwards(&rules).await;
-                    shared.log(
-                        "info",
-                        format!("Applied {started} forward rule(s) pushed from the client."),
-                    );
-                    // If the Client pushed any Flex rule, make sure the discovery listener is
-                    // running so SmartSDR discovery is relayed back.
-                    let has_flex = rules.iter().any(|r| r.id.starts_with("flex-"));
-                    if has_flex && flex_task.is_none() {
-                        flex_task = Some(spawn_flex_listener(
-                            Arc::clone(&shared),
-                            Arc::clone(&link),
-                            Arc::clone(&stop),
-                        ));
-                        shared.log("info", "FlexRadio discovery capture started.");
-                    } else if !has_flex {
-                        if let Some(task) = flex_task.take() {
-                            task.abort();
-                        }
-                    }
+        // The Client dials this channel and redials it after any drop, so listen again whenever a
+        // connection ends, until the session stops.
+        while !stop.load(Ordering::SeqCst) {
+            let mut link = match ControlLink::listen(&net).await {
+                Ok(l) => l,
+                Err(e) => {
+                    shared.log("warn", format!("Control channel listen failed: {e}"));
+                    return;
                 }
-                Ok(Some(_)) => {} // the Station ignores other message types
-                Ok(None) | Err(_) => break, // closed or error
+            };
+            shared.log("info", "Control channel up.");
+
+            // Messages to the Client (FlexRadio discovery) are queued here and sent by the loop
+            // below, so the link is never locked across a read.
+            let (tx, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
+            // A running Flex discovery listener, present while a Flex rule is pushed.
+            let mut flex_task: Option<tokio::task::JoinHandle<()>> = None;
+
+            loop {
+                tokio::select! {
+                    queued = outgoing.recv() => match queued {
+                        Some(message) => {
+                            if let Err(e) = link.send(&message).await {
+                                shared.log("warn", format!("Control channel send failed: {e}"));
+                                break;
+                            }
+                        }
+                        None => break,
+                    },
+                    incoming = link.recv() => match incoming {
+                        Ok(Some(ControlMessage::ForwardRules { rules })) => {
+                            shared.log("info", "Forward rules received from the client.");
+                            let started = session.lock().await.apply_forwards(&rules).await;
+                            shared.log(
+                                "info",
+                                format!("Applied {started} forward rule(s) pushed from the client."),
+                            );
+                            shared.emit(StationEvent::ForwardRules { rules: rules.clone() });
+                            // If the Client pushed any Flex rule, make sure the discovery listener is
+                            // running so SmartSDR discovery is relayed back.
+                            let has_flex = rules.iter().any(|r| r.id.starts_with("flex-"));
+                            if has_flex && flex_task.is_none() {
+                                flex_task = Some(spawn_flex_listener(
+                                    Arc::clone(&shared),
+                                    tx.clone(),
+                                    Arc::clone(&stop),
+                                ));
+                                shared.log("info", "FlexRadio discovery capture started.");
+                                shared.emit(StationEvent::FlexDiscovery { enabled: true });
+                            } else if !has_flex {
+                                if let Some(task) = flex_task.take() {
+                                    task.abort();
+                                    shared.emit(StationEvent::FlexDiscovery { enabled: false });
+                                }
+                            }
+                        }
+                        Ok(Some(_)) => {} // the Station ignores other message types
+                        Ok(None) => {
+                            shared.log("warn", "Control channel ended by the client.");
+                            break;
+                        }
+                        Err(e) => {
+                            shared.log("warn", format!("Control channel read failed: {e}"));
+                            break;
+                        }
+                    },
+                }
             }
-        }
-        if let Some(task) = flex_task.take() {
-            task.abort();
+            if let Some(task) = flex_task.take() {
+                task.abort();
+                shared.emit(StationEvent::FlexDiscovery { enabled: false });
+            }
+            shared.log("warn", "Control channel closed; waiting for the client to redial.");
         }
     })
 }
@@ -931,7 +1066,7 @@ fn spawn_control_task(
 /// forwards each raw packet to the Client over `link` as a base64 `DiscoveryAnnounce`.
 fn spawn_flex_listener(
     shared: Arc<Shared>,
-    link: Arc<tokio::sync::Mutex<ControlLink>>,
+    outgoing: tokio::sync::mpsc::UnboundedSender<ControlMessage>,
     stop: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -952,8 +1087,8 @@ fn spawn_flex_listener(
             match captured {
                 Ok(Some(packet)) => {
                     let payload = base64_encode(&packet);
-                    let guard = link.lock().await;
-                    let _ = guard.send(&ControlMessage::DiscoveryAnnounce { payload }).await;
+                    // A closed queue means the link ended; the control task aborts this listener then.
+                    let _ = outgoing.send(ControlMessage::DiscoveryAnnounce { payload });
                 }
                 Ok(None) => {} // not a Flex packet, ignore
                 Err(_) => {}   // timeout or transient error: loop and re-check the stop flag
@@ -987,6 +1122,35 @@ impl Drop for StationController {
     fn drop(&mut self) {
         self.disconnect();
     }
+}
+
+/// PTT never shares the key line: if the two match, PTT is dropped (the key line wins).
+fn ptt_line_for(key: KeyingLine, ptt: Option<KeyingLine>) -> Option<KeyingLine> {
+    match ptt {
+        Some(p) if p == key => None,
+        other => other,
+    }
+}
+
+/// A short, human-sharable pairing token: twelve hex characters from a fresh CSPRNG identity.
+/// The Station shows it and the Client types it, so it only needs to be unguessable for the
+/// short pairing window.
+fn generate_token() -> String {
+    let bytes: Vec<u8> = Config::new(Role::Station)
+        .ok()
+        .and_then(|c| c.identity.public_key_base64().ok())
+        .and_then(|b64| base64_decode(&b64).ok())
+        .filter(|b| b.len() >= 6)
+        .map(|b| b[..6].to_vec())
+        .unwrap_or_else(|| {
+            // Extremely unlikely fallback: time-seeded so the UI still gets a token.
+            let n = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            n.to_be_bytes()[2..8].to_vec()
+        });
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Whether `selected` names a port that is not in `present` (and is `Some`).
@@ -1091,15 +1255,16 @@ mod tests {
     }
 
     #[test]
-    fn listen_without_a_keying_port_reports_disconnected() {
+    fn listen_without_a_keying_port_still_starts_pairing() {
+        // A keying port is optional: pairing starts with none selected (the LEDs follow the
+        // Client), so the controller reports connecting rather than refusing.
         let (sink, events) = recording_sink();
         let controller = controller(sink);
         controller.listen("127.0.0.1:9999", "code");
         let ok = wait_for(&events, Duration::from_secs(1), |evs| {
-            evs.iter().any(|e| matches!(e, StationEvent::Connection { state, .. } if state == "disconnected"))
-                && evs.iter().any(|e| matches!(e, StationEvent::Log { .. }))
+            evs.iter().any(|e| matches!(e, StationEvent::Connection { state, .. } if state == "connecting"))
         });
-        assert!(ok, "pairing without a keying port must report disconnected + a log line");
+        assert!(ok, "pairing without a keying port must start (connecting)");
     }
 
     #[test]

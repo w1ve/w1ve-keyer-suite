@@ -279,7 +279,12 @@ impl StationTcpResponder {
                 Err(_) => continue,
             };
             let _ = lan.set_nodelay(true);
-            relay_conn_to_host(conn, lan).await;
+            // Stop the relay too when the forward is shut down: a rule change waits for this task,
+            // and a live connection must not hold it up.
+            tokio::select! {
+                () = relay_conn_to_host(conn, lan) => {}
+                _ = shutdown.changed() => return Ok(()),
+            }
         }
     }
 }

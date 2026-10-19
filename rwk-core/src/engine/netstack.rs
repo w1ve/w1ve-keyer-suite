@@ -326,6 +326,11 @@ impl NetStack {
         Ok(UdpHandle(self.sockets.add(socket)))
     }
 
+    /// Releases a UDP socket from [`open_udp`](Self::open_udp), freeing its port for a later open.
+    pub fn close_udp(&mut self, handle: UdpHandle) {
+        let _ = self.sockets.remove(handle.0);
+    }
+
     /// Opens an unconnected TCP socket, for either [`listen`](Self::tcp_listen) or
     /// [`connect`](Self::tcp_connect).
     #[must_use]

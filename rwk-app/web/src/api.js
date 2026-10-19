@@ -54,6 +54,15 @@ export const api = {
       stationPort,
       stationTargetAddress,
     }),
+  updateForwardRule: (id, name, protocol, clientPort, stationPort, stationTargetAddress) =>
+    invoke("update_forward_rule", {
+      id,
+      name,
+      protocol,
+      clientPort,
+      stationPort,
+      stationTargetAddress,
+    }),
   removeForwardRule: (id) => invoke("remove_forward_rule", { id }),
   setForwardRuleEnabled: (id, enabled) =>
     invoke("set_forward_rule_enabled", { id, enabled }),

@@ -1,332 +1,284 @@
 import { useEffect, useState } from "react";
 import { stationApi as api } from "./station-api.js";
+import TransportSlider from "./TransportSlider.jsx";
+import RadarSweep from "./RadarSweep.jsx";
 
-// The Station tab: KEY/PTT indicators, the keying output configuration (port + control
-// lines), and the Pair-with-Client panel. On WAN the Station is the responder — it waits for
-// the operating position to connect with the shared relay + code. On LAN the roles reverse:
-// the Station browses the keyers advertising themselves on the local network and the operator
-// picks one from the list, so no relay or pairing code is needed.
+// The Station body: keying status (KEY/PTT and the fail-safe banner), keying output (the rig's
+// serial port, its key and PTT lines, the PTT hang, and the logger's WinKeyer COM port), the
+// port-forward table the Operator pushes (read-only), and the pairing panel. Nothing here is
+// gated on a keying port: with none selected the KEY/PTT LEDs still follow the Client.
 export default function StationTab({
   settings,
+  setSettings,
   connection,
   keyDown,
   pttOn,
-  loggerSending,
   lastFailSafe,
-  lanPeers = [],
-  ports = [],
-  errors = {},
+  lanPeers,
+  ports,
+  errors,
+  rules,
+  onListen,
 }) {
-  const [keyingPort, setKeyingPort] = useState(settings.keyingPort || "");
-  const [keyLine, setKeyLine] = useState(settings.keyLine || "dtr");
-  const [pttLine, setPttLine] = useState(settings.pttLine || "rts");
-  const [loggerPort, setLoggerPort] = useState(settings.loggerPort || "");
-  const [loggerEnabled, setLoggerEnabled] = useState(settings.loggerEnabled || false);
-
-  const [relay, setRelay] = useState(settings.relay || "107.172.138.103:9000");
-  const [code, setCode] = useState(settings.pairingCode || "");
-  const [transport, setTransport] = useState(settings.transport || "wan");
+  const running = connection.state === "connected";
+  const connecting = connection.state === "connecting";
   const [pickedKey, setPickedKey] = useState("");
+  // The keying port, key/PTT lines and PTT hang are bound when a pairing starts, so they are
+  // locked while paired (stop the link to change them).
+  const locked = running || connecting;
 
-  // Reflect backend-echoed settings into local state.
+  // Keep the picked keyer valid as the live list changes.
   useEffect(() => {
-    setKeyingPort(settings.keyingPort || "");
-    setKeyLine(settings.keyLine || "dtr");
-    setPttLine(settings.pttLine || "rts");
-    setLoggerPort(settings.loggerPort || "");
-    setLoggerEnabled(settings.loggerEnabled || false);
-    if (settings.relay) setRelay(settings.relay);
-    if (settings.pairingCode) setCode(settings.pairingCode);
-    if (settings.transport) setTransport(settings.transport);
-  }, [settings]);
-
-  // Ports are pushed from the backend (StationApp forwards the Ports event); no polling.
-
-  // Keep the picked keyer valid: default to the first peer, and drop the selection if the
-  // advertised keyer we had chosen has aged out of the list.
-  useEffect(() => {
-    if (lanPeers.length === 0) {
-      if (pickedKey) setPickedKey("");
-      return;
-    }
-    if (!lanPeers.some((p) => p.key === pickedKey)) {
+    if (pickedKey && !lanPeers.some((p) => p.key === pickedKey)) {
+      setPickedKey(lanPeers[0]?.key || "");
+    } else if (!pickedKey && lanPeers.length > 0) {
       setPickedKey(lanPeers[0].key);
     }
-  }, [lanPeers]);
-
-  const paired = connection.state === "connected";
-  const connecting = connection.state === "connecting";
-  const canPair = !!keyingPort && !!code.trim() && !!relay.trim();
-  const picked = lanPeers.find((p) => p.key === pickedKey) || null;
-  const canConnectLan = !!keyingPort && !!picked;
-
-  function selectTransport(next) {
-    setTransport(next);
-    api.setTransport(next);
-    if (next === "lan") api.lanBrowse();
-  }
+  }, [lanPeers, pickedKey]);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <div className="panel-row" style={{ gridTemplateColumns: "1fr 1fr" }}>
-        {/* ─── Status: KEY / PTT indicators ──────────────── */}
-        <div className="panel">
-          <h3>Keying Status</h3>
-          <div className="row" style={{ gap: 24, justifyContent: "center", padding: "8px 0" }}>
-            <Indicator label="KEY" on={keyDown} onColor="var(--key-on)" />
-            <Indicator label="PTT" on={pttOn} onColor="var(--ptt-on)" />
-            <Indicator label="LOGGER" on={loggerSending} onColor="var(--accent)" />
-          </div>
-          {lastFailSafe ? (
-            <div
-              style={{
-                marginTop: 8,
-                padding: "8px 10px",
-                borderRadius: 6,
-                background: "#3a2323",
-                border: "1px solid var(--bad)",
-                color: "var(--bad)",
-                fontSize: 13,
-              }}
-            >
-              Fail-safe F{lastFailSafe.code}: {lastFailSafe.message}
+    <div className="tabbody">
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div className="panel-row" style={{ gridTemplateColumns: "1fr 1fr" }}>
+          <div className="panel">
+            <h3>Keying Status</h3>
+            <div className="row" style={{ gap: 24, justifyContent: "center", padding: "8px 0" }}>
+              <Indicator label="KEY" on={keyDown} onColor="var(--key-on)" />
+              <Indicator label="PTT" on={pttOn} onColor="var(--ptt-on)" />
             </div>
-          ) : (
-            <p style={{ color: "var(--text-dim)", fontSize: 12, textAlign: "center", margin: 0 }}>
-              {paired ? "Replaying keyed edges onto the radio." : "Not paired."}
+            {lastFailSafe ? (
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: "8px 10px",
+                  borderRadius: 6,
+                  background: "#3a2323",
+                  border: "1px solid var(--bad)",
+                  color: "var(--bad)",
+                  fontSize: 13,
+                }}
+              >
+                Fail-safe F{lastFailSafe.code}: {lastFailSafe.message}
+              </div>
+            ) : (
+              <p style={{ color: "var(--text-dim)", fontSize: 12, textAlign: "center", margin: 0 }}>
+                {running ? "Keying the radio from the Client." : "Not running."}
+              </p>
+            )}
+          </div>
+
+          <div className="panel">
+            <h3>Keying Output</h3>
+            <PortSelect
+              label="Serial port (rig key line)"
+              value={settings.keyingPort || ""}
+              ports={ports}
+              error={errors.keying}
+              onChange={(p) => api.selectKeyingPort(p || null)}
+              disabled={locked}
+            />
+            <div className="row" style={{ gap: 10 }}>
+              <div className="field" style={{ flex: 1, marginBottom: 0 }}>
+                <label>Key line</label>                  <select
+                    value={settings.keyLine}
+                    disabled={locked}
+                    onChange={(e) => api.setKeyLine(e.target.value)}
+                  >
+                  <option value="dtr" disabled={settings.pttLine === "dtr"}>DTR</option>
+                  <option value="rts" disabled={settings.pttLine === "rts"}>RTS</option>
+                </select>
+              </div>
+              <div className="field" style={{ flex: 1, marginBottom: 0 }}>
+                <label>PTT line</label>
+                <select
+                  value={settings.pttLine}
+                  disabled={locked}
+                  onChange={(e) => api.setPttLine(e.target.value)}
+                >
+                  <option value="rts" disabled={settings.keyLine === "rts"}>RTS</option>
+                  <option value="dtr" disabled={settings.keyLine === "dtr"}>DTR</option>
+                  <option value="none">None</option>
+                </select>
+              </div>
+            </div>
+            <div className="field" style={{ marginTop: 8 }}>
+              <label>PTT hang: {settings.pttHangMs} ms</label>
+              <input
+                type="range"
+                min={75}
+                max={600}
+                step={5}
+                value={settings.pttHangMs}
+                disabled={locked}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  setSettings((s) => ({ ...s, pttHangMs: v }));
+                }}
+                onPointerUp={(e) => api.setPttHang(Number(e.currentTarget.value))}
+                onKeyUp={(e) => api.setPttHang(Number(e.currentTarget.value))}
+              />
+            </div>
+            <PortSelect
+              label="Logger COM port (WinKeyer, optional)"
+              value={settings.loggerPort || ""}
+              ports={ports}
+              error={errors.logger}
+              onChange={(p) => api.setLoggerPort(p || null)}
+              disabled={locked}
+            />
+            {locked && (
+              <p style={{ color: "var(--text-dim)", fontSize: 12, margin: "8px 0 0" }}>
+                Keying output and PTT are fixed for this pairing. Stop the link to change them.
+              </p>
+            )}
+          </div>
+        </div>
+
+        {/* ─── Port forwards pushed from the Operator (read-only) ───────── */}
+        <div className="panel">
+          <h3>Port Forwards (from Operator)</h3>
+          {rules.length === 0 ? (
+            <p style={{ color: "var(--text-dim)", fontSize: 13, margin: 0 }}>
+              No port forwards yet. Rules are set on the Operator's Ham Router tab and sent here
+              automatically when you pair.
             </p>
+          ) : (
+            <table className="rules">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Protocol</th>
+                  <th>Operator port</th>
+                  <th>Station target</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rules.map((r) => (
+                  <tr key={r.id}>
+                    <td>{r.name}</td>
+                    <td>{String(r.protocol).toUpperCase()}</td>
+                    <td>{r.client_port}</td>
+                    <td>
+                      {r.station_target_address}:{r.station_port}
+                    </td>
+                    <td style={{ color: r.enabled ? "var(--good)" : "var(--text-dim)" }}>
+                      {r.enabled ? "Enabled" : "Disabled"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           )}
         </div>
 
-        {/* ─── Keying output configuration ───────────────── */}
+        {/* ─── Pairing ───────────────────────────────────────── */}
         <div className="panel">
-          <h3>Keying Output</h3>
-          <div className="field">
-            <label>Serial port (rig key line)</label>
-            <select
-              value={keyingPort}
-              disabled={paired || connecting}
-              onChange={(e) => {
-                setKeyingPort(e.target.value);
-                api.selectKeyingPort(e.target.value || null);
-              }}
-            >
-              <option value="">(None)</option>
-              {(keyingPort && !ports.includes(keyingPort) ? [...ports, keyingPort] : ports).map(
-                (p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
-                ),
-              )}
-            </select>
-            <ErrorLine msg={errors.keying} />
-          </div>
-          <div className="row" style={{ gap: 10 }}>
-            <div className="field" style={{ flex: 1, marginBottom: 0 }}>
-              <label>Key line</label>
-              <select
-                value={keyLine}
-                disabled={paired || connecting}
-                onChange={(e) => {
-                  setKeyLine(e.target.value);
-                  api.setKeyLine(e.target.value);
+          <h3>Pairing</h3>
+          <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+            <div>
+              <label style={{ display: "block", fontSize: 12, color: "var(--text-dim)", marginBottom: 4 }}>
+                Transport
+              </label>
+              <TransportSlider
+                value={settings.transport}
+                disabled={running || connecting}
+                onChange={(t) => {
+                  setSettings((s) => ({ ...s, transport: t }));
+                  api.setTransport(t);
+                  if (t === "lan") api.lanBrowse();
                 }}
-              >
-                <option value="dtr">DTR</option>
-                <option value="rts">RTS</option>
-              </select>
+              />
             </div>
-            <div className="field" style={{ flex: 1, marginBottom: 0 }}>
-              <label>PTT line</label>
-              <select
-                value={pttLine}
-                disabled={paired || connecting}
-                onChange={(e) => {
-                  setPttLine(e.target.value);
-                  api.setPttLine(e.target.value);
-                }}
-              >
-                <option value="rts">RTS</option>
-                <option value="dtr">DTR</option>
-                <option value="none">None</option>
-              </select>
-            </div>
-          </div>
-          <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0, marginTop: 10 }}>
-            The port opens when pairing starts and is held for the session.
-          </p>
-        </div>
-      </div>
 
-      {/* ─── Logger (WinKeyer) input ────────────────────── */}
-      <div className="panel">
-        <h3>Logger Input (WinKeyer)</h3>
-        <div className="row" style={{ gap: 14, flexWrap: "wrap", alignItems: "flex-end" }}>
-          <label className="row" style={{ gap: 6 }}>
-            <input
-              type="checkbox"
-              checked={loggerEnabled}
-              disabled={paired || connecting}
-              onChange={(e) => {
-                setLoggerEnabled(e.target.checked);
-                api.setLoggerEnabled(e.target.checked);
-              }}
-            />
-            Enable logger input
-          </label>
-          <div className="field" style={{ marginBottom: 0, minWidth: 180 }}>
-            <label>Logger COM port</label>
-            <select
-              value={loggerPort}
-              disabled={paired || connecting || !loggerEnabled}
-              onChange={(e) => {
-                setLoggerPort(e.target.value);
-                api.setLoggerPort(e.target.value || null);
-              }}
-            >
-              <option value="">(None)</option>
-              {(loggerPort && !ports.includes(loggerPort) ? [...ports, loggerPort] : ports)
-                .filter((p) => p !== keyingPort)
-                .map((p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
-                ))}
-            </select>
-            <ErrorLine msg={errors.logger} />
-          </div>
-        </div>
-        <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0, marginTop: 10 }}>
-          A logging program running at the radio site can send CW macros over this port
-          (WinKeyer2 protocol). Local CW takes priority over remote paddle keying. The keying
-          output port is excluded from the list.
-        </p>
-      </div>
-
-      {/* ─── Pair with Client ───────────────────────────── */}
-      <div className="panel">
-        <h3>Pair with Client</h3>
-        <div className="row" style={{ gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
-          <div>
-            <label style={{ display: "block", fontSize: 12, color: "var(--text-dim)", marginBottom: 4 }}>
-              Transport
-            </label>
-            <div className="segmented" style={paired || connecting ? { opacity: 0.5, pointerEvents: "none" } : null}>
-              <button
-                className={transport === "wan" ? "active" : ""}
-                onClick={() => selectTransport("wan")}
-              >
-                WAN (Relay)
-              </button>
-              <button
-                className={transport === "lan" ? "active" : ""}
-                onClick={() => selectTransport("lan")}
-              >
-                LAN
-              </button>
-            </div>
-          </div>
-
-          {transport === "wan" ? (
-            <>
-              <div className="field" style={{ marginBottom: 0 }}>
-                <label>Relay (host:port)</label>
-                <input
-                  type="text"
-                  value={relay}
-                  onChange={(e) => setRelay(e.target.value)}
-                  disabled={paired || connecting}
-                  style={{ width: 200 }}
-                />
-              </div>
-              <div className="field" style={{ marginBottom: 0 }}>
-                <label>Pairing code</label>
-                <input
-                  type="text"
-                  value={code}
-                  onChange={(e) => setCode(e.target.value)}
-                  placeholder="shared code"
-                  disabled={paired || connecting}
-                  style={{ width: 160 }}
-                />
-              </div>
-              <div style={{ alignSelf: "flex-end" }}>
-                {paired || connecting ? (
-                  <button onClick={() => api.disconnect()} style={{ background: "#5a2d2d" }}>
-                    {connecting ? "Cancel" : "Unpair"}
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => api.listen(relay, code)}
-                    disabled={!canPair}
-                    style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
-                  >
-                    Wait for Client
-                  </button>
-                )}
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="field" style={{ marginBottom: 0, minWidth: 220 }}>
-                <label>Available keyers</label>
-                <select
-                  value={pickedKey}
-                  disabled={paired || connecting || lanPeers.length === 0}
-                  onChange={(e) => setPickedKey(e.target.value)}
-                >
-                  {lanPeers.length === 0 ? (
-                    <option value="">(searching…)</option>
+            {settings.transport === "wan" ? (
+              <>
+                <div>
+                  <label style={{ display: "block", fontSize: 12, color: "var(--text-dim)", marginBottom: 4 }}>
+                    Pairing token (give this to the Client)
+                  </label>
+                  <div className="row" style={{ gap: 8 }}>
+                    <span className="token">{settings.pairingCode || "…"}</span>
+                    <button onClick={() => navigator.clipboard?.writeText(settings.pairingCode || "")} title="Copy">
+                      Copy
+                    </button>
+                    <button onClick={() => api.regenerateToken()} disabled={running || connecting}>
+                      New
+                    </button>
+                  </div>
+                </div>
+                <div style={{ alignSelf: "flex-end" }}>
+                  {running || connecting ? (
+                    <button onClick={() => api.disconnect()} style={{ background: "#5a2d2d" }}>
+                      {connecting ? "Cancel" : "Stop"}
+                    </button>
                   ) : (
-                    lanPeers.map((p) => (
+                    <button
+                      onClick={() => onListen()}
+                      disabled={!settings.pairingCode}
+                      style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
+                    >
+                      Start
+                    </button>
+                  )}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="field" style={{ marginBottom: 0, minWidth: 220 }}>
+                  <label>Available keyers</label>
+                  <select value={pickedKey} disabled={running || connecting} onChange={(e) => setPickedKey(e.target.value)}>
+                    {lanPeers.length === 0 && <option value="">(searching…)</option>}
+                    {lanPeers.map((p) => (
                       <option key={p.key} value={p.key}>
                         {p.name}
                       </option>
-                    ))
+                    ))}
+                  </select>
+                </div>
+                <div style={{ alignSelf: "flex-end" }}>
+                  <button onClick={() => api.lanBrowse()} disabled={running || connecting}>
+                    Refresh
+                  </button>
+                </div>
+                <div style={{ alignSelf: "flex-end" }}>
+                  {running || connecting ? (
+                    <button onClick={() => api.disconnect()} style={{ background: "#5a2d2d" }}>
+                      {connecting ? "Cancel" : "Stop"}
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => {
+                        const peer = lanPeers.find((p) => p.key === pickedKey);
+                        if (peer) api.connectLan(peer.key, peer.endpoint);
+                      }}
+                      disabled={!pickedKey}
+                      style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
+                    >
+                      Connect
+                    </button>
                   )}
-                </select>
+                </div>
+              </>
+            )}
+            {connecting && !running && (
+              <div className="row" style={{ gap: 8, alignSelf: "flex-end" }}>
+                <RadarSweep size={56} />
+                <span style={{ fontSize: 13, color: "var(--text-dim)" }}>Pairing...</span>
               </div>
-              <div style={{ alignSelf: "flex-end", display: "flex", gap: 8 }}>
-                <button onClick={() => api.lanBrowse()} disabled={paired || connecting}>
-                  Refresh
-                </button>
-                {paired || connecting ? (
-                  <button onClick={() => api.disconnect()} style={{ background: "#5a2d2d" }}>
-                    {connecting ? "Cancel" : "Unpair"}
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => picked && api.connectLan(picked.key, picked.endpoint)}
-                    disabled={!canConnectLan}
-                    style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
-                  >
-                    Connect
-                  </button>
-                )}
-              </div>
-            </>
-          )}
+            )}
+          </div>
+          <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0, marginTop: 8 }}>
+            {settings.transport === "wan"
+              ? "Start and give the token to the Client. A keying port is optional — without one the KEY LED still follows the Client. Choose the keying port and PTT line before you pair."
+              : "Pick a keyer advertising on your LAN, then Connect. A keying port is optional and is chosen before you pair. No relay, no internet."}
+          </p>
         </div>
-        <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0 }}>
-          {transport === "wan"
-            ? "Enter the same relay and pairing code as the operating position, then wait for it to connect. Select a keying output port first."
-            : "Pick the advertised keyer from the list and connect — no relay, no internet. Select a keying output port first."}
-        </p>
       </div>
     </div>
   );
 }
 
-// A short red error line shown under a control (empty message renders nothing).
-function ErrorLine({ msg }) {
-  if (!msg) return null;
-  return (
-    <div style={{ color: "var(--bad, #e06c6c)", fontSize: 12, marginTop: 4 }}>{msg}</div>
-  );
-}
-
-// A labelled round LED that glows `onColor` when active and sits dim otherwise.
 function Indicator({ label, on, onColor }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
@@ -341,9 +293,28 @@ function Indicator({ label, on, onColor }) {
           transition: "background 40ms, box-shadow 40ms",
         }}
       />
-      <span style={{ fontSize: 13, fontWeight: 700, color: on ? onColor : "var(--text-dim)" }}>
-        {label}
-      </span>
+      <span style={{ fontSize: 13, fontWeight: 700, color: on ? onColor : "var(--text-dim)" }}>{label}</span>
     </div>
   );
 }
+
+// A serial-port picker with "(None)" first. A selected port that is not in the live list (busy or
+// hidden) stays visible so the operator can see what is chosen.
+function PortSelect({ label, value, ports, error, onChange, disabled }) {
+  const list = value && !ports.includes(value) ? [...ports, value] : ports;
+  return (
+    <div className="field" style={{ marginBottom: 0 }}>
+      <label>{label}</label>
+      <select value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
+        <option value="">(None)</option>
+        {list.map((p) => (
+          <option key={p} value={p}>
+            {p}
+          </option>
+        ))}
+      </select>
+      {error && <div style={{ color: "var(--bad, #e06c6c)", fontSize: 12, marginTop: 4 }}>{error}</div>}
+    </div>
+  );
+}
+

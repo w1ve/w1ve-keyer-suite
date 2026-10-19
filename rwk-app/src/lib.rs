@@ -112,6 +112,7 @@ pub fn run_client() {
             forward_rules_refresh,
             add_forward_rule,
             remove_forward_rule,
+            update_forward_rule,
             set_forward_rule_enabled,
             set_flex_discovery,
         ])
@@ -285,6 +286,26 @@ fn add_forward_rule(
 }
 
 #[tauri::command]
+fn update_forward_rule(
+    state: State<'_, ClientState>,
+    id: String,
+    name: String,
+    protocol: String,
+    client_port: u16,
+    station_port: u16,
+    station_target_address: String,
+) {
+    state.controller.update_forward_rule(
+        &id,
+        &name,
+        &protocol,
+        client_port,
+        station_port,
+        &station_target_address,
+    );
+}
+
+#[tauri::command]
 fn remove_forward_rule(state: State<'_, ClientState>, id: String) {
     state.controller.remove_forward_rule(&id);
 }
@@ -356,6 +377,8 @@ pub fn run_station() {
             station_set_ptt_line,
             station_set_logger_port,
             station_set_logger_enabled,
+            station_set_ptt_hang,
+            station_regenerate_token,
             station_set_transport,
             station_lan_browse,
             station_connect_lan,
@@ -413,6 +436,16 @@ fn station_set_logger_port(state: State<'_, StationState>, port: Option<String>)
 #[tauri::command]
 fn station_set_logger_enabled(state: State<'_, StationState>, enabled: bool) {
     state.controller.set_logger_enabled(enabled);
+}
+
+#[tauri::command]
+fn station_set_ptt_hang(state: State<'_, StationState>, ms: u32) {
+    state.controller.set_ptt_hang(ms);
+}
+
+#[tauri::command]
+fn station_regenerate_token(state: State<'_, StationState>) {
+    state.controller.regenerate_token();
 }
 
 #[tauri::command]

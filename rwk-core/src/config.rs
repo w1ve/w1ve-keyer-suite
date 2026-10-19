@@ -238,6 +238,9 @@ pub struct StationSettings {
     /// Whether the logger input is enabled.
     #[serde(default)]
     pub logger_enabled: bool,
+    /// How long PTT is held after key-up, in ms. Empty ⇒ the Station's default (200 ms).
+    #[serde(default)]
+    pub ptt_hang_ms: Option<u64>,
 }
 
 impl Config {

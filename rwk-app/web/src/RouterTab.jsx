@@ -8,6 +8,8 @@ import { WIZARD_CATALOG } from "./wizardCatalog.js";
 export default function RouterTab({ rules, flexEnabled, connected }) {
   const [wizardOpen, setWizardOpen] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
+  // The rule being edited in the form, or null when adding a new one.
+  const [editRule, setEditRule] = useState(null);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -16,7 +18,14 @@ export default function RouterTab({ rules, flexEnabled, connected }) {
           <h3 style={{ margin: 0 }}>Port Forwarding</h3>
           <div className="row" style={{ gap: 8 }}>
             <button onClick={() => setWizardOpen(true)}>Wizard…</button>
-            <button onClick={() => setManualOpen(true)}>Add Rule…</button>
+            <button
+              onClick={() => {
+                setEditRule(null);
+                setManualOpen(true);
+              }}
+            >
+              Add Rule…
+            </button>
           </div>
         </div>
 
@@ -57,6 +66,16 @@ export default function RouterTab({ rules, flexEnabled, connected }) {
                   </td>
                   <td>
                     <button
+                      onClick={() => {
+                        setEditRule(r);
+                        setManualOpen(true);
+                      }}
+                      style={{ padding: "2px 8px", marginRight: 4 }}
+                      title="Edit rule"
+                    >
+                      Edit
+                    </button>
+                    <button
                       onClick={() => api.removeForwardRule(r.id)}
                       style={{ padding: "2px 8px", background: "#5a2d2d" }}
                       title="Remove rule"
@@ -95,7 +114,15 @@ export default function RouterTab({ rules, flexEnabled, connected }) {
       </div>
 
       {wizardOpen && <Wizard onClose={() => setWizardOpen(false)} />}
-      {manualOpen && <ManualRule onClose={() => setManualOpen(false)} />}
+      {manualOpen && (
+        <ManualRule
+          rule={editRule}
+          onClose={() => {
+            setManualOpen(false);
+            setEditRule(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -164,27 +191,35 @@ function Wizard({ onClose }) {
   );
 }
 
-// A single hand-entered forward rule.
-function ManualRule({ onClose }) {
-  const [name, setName] = useState("");
-  const [proto, setProto] = useState("tcp");
-  const [clientPort, setClientPort] = useState(8000);
-  const [stationPort, setStationPort] = useState(8000);
-  const [target, setTarget] = useState("127.0.0.1");
+// A single hand-entered forward rule. With `rule` it edits that rule in place; the edit is pushed
+// to the Station live, whether or not the link is up.
+function ManualRule({ rule, onClose }) {
+  const editing = Boolean(rule);
+  const [name, setName] = useState(rule?.name ?? "");
+  const [proto, setProto] = useState(rule?.protocol ?? "tcp");
+  const [clientPort, setClientPort] = useState(rule?.clientPort ?? 8000);
+  const [stationPort, setStationPort] = useState(rule?.stationPort ?? 8000);
+  const [target, setTarget] = useState(rule?.stationTargetAddress ?? "127.0.0.1");
 
-  function create() {
-    api.addForwardRule(
-      name || `${proto.toUpperCase()}-${clientPort}`,
-      proto,
-      Number(clientPort),
-      Number(stationPort),
-      target,
-    );
+  function save() {
+    const finalName = name || `${proto.toUpperCase()}-${clientPort}`;
+    if (editing) {
+      api.updateForwardRule(
+        rule.id,
+        finalName,
+        proto,
+        Number(clientPort),
+        Number(stationPort),
+        target,
+      );
+    } else {
+      api.addForwardRule(finalName, proto, Number(clientPort), Number(stationPort), target);
+    }
     onClose();
   }
 
   return (
-    <Modal title="Add Forward Rule" onClose={onClose} width={460}>
+    <Modal title={editing ? "Edit Forward Rule" : "Add Forward Rule"} onClose={onClose} width={460}>
       <div className="field">
         <label>Name</label>
         <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="optional" />
@@ -221,11 +256,11 @@ function ManualRule({ onClose }) {
       <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
         <button onClick={onClose}>Cancel</button>
         <button
-          onClick={create}
+          onClick={save}
           disabled={!target.trim()}
           style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
         >
-          Add
+          {editing ? "Save" : "Add"}
         </button>
       </div>
     </Modal>

@@ -443,7 +443,8 @@ fn publish_detail(bus: &Option<EventBus>, condition: FailSafeCondition, detail: 
 /// The output is driven with both the key and the PTT state together, because PTT lead
 /// and tail are computed by the replayer and handed over one line at a time.
 pub struct SerialKeyingAdapter {
-    output: SerialKeyingOutput,
+    /// The open port, or `None` for an LED-only adapter that tracks state but writes nowhere.
+    output: Option<SerialKeyingOutput>,
     key_down: bool,
     ptt: bool,
     /// The first fault since the last poll, surfaced as F6 by the replay thread.
@@ -454,27 +455,36 @@ impl SerialKeyingAdapter {
     /// Wraps an open keying output.
     #[must_use]
     pub fn new(output: SerialKeyingOutput) -> Self {
-        Self { output, key_down: false, ptt: false, fault: None }
+        Self { output: Some(output), key_down: false, ptt: false, fault: None }
+    }
+
+    /// An adapter with no serial port. Key and PTT state are still tracked (so the arbiter's
+    /// observer and the KEY/PTT indicators follow the keyer), but nothing is written to hardware.
+    #[must_use]
+    pub fn led_only() -> Self {
+        Self { output: None, key_down: false, ptt: false, fault: None }
     }
 
     /// The port name, for logging.
     #[must_use]
     pub fn port_name(&self) -> String {
-        self.output.port_name().to_string()
+        self.output.as_ref().map(|o| o.port_name().to_string()).unwrap_or_default()
     }
 
-    /// Returns the underlying output, so the caller can close it explicitly.
+    /// Returns the underlying output, so the caller can close it explicitly. `None` for an
+    /// LED-only adapter.
     #[must_use]
-    pub fn into_inner(self) -> SerialKeyingOutput {
+    pub fn into_inner(self) -> Option<SerialKeyingOutput> {
         self.output
     }
 
     fn apply(&mut self) {
+        let Some(output) = self.output.as_mut() else { return };
         // `set_key` has no error channel, so the failure is latched for the driver to
         // poll and turn into F6, exactly as the .NET Station did. A latched fault is only
         // observed on a write, so a cable pulled while the key is idle is caught by the
         // F1/F2 heartbeat watchdogs rather than F6.
-        if let Err(error) = self.output.apply(self.key_down, self.ptt) {
+        if let Err(error) = output.apply(self.key_down, self.ptt) {
             if self.fault.is_none() {
                 self.fault = Some(error.to_string());
             }

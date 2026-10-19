@@ -17,6 +17,10 @@ export const stationApi = {
   selectKeyingPort: (port) => invoke("station_select_keying_port", { port }),
   setKeyLine: (line) => invoke("station_set_key_line", { line }),
   setPttLine: (line) => invoke("station_set_ptt_line", { line }),
+  setPttHang: (ms) => invoke("station_set_ptt_hang", { ms }),
+
+  // Pairing token (the Station shows it; the Client types it)
+  regenerateToken: () => invoke("station_regenerate_token"),
 
   // Logger (WinKeyer) input
   setLoggerPort: (port) => invoke("station_set_logger_port", { port }),

@@ -254,6 +254,9 @@ pub enum ClientEvent {
     KeyState { down: bool },
     /// The link to the station changed. `path` is "none" | "direct" | "relay".
     Connection { state: String, path: String },
+    /// The round-trip time to the Station in ms, refreshed about once a second while paired.
+    /// `None` until measured (and when unpaired).
+    Rtt { ms: Option<u32> },
     /// A human-readable log line for the Log tab.
     Log { level: String, message: String },
     /// A keyer/sidetone setting changed and the UI should reflect it (echo for confirmation).
@@ -276,6 +279,8 @@ pub enum ClientEvent {
         transport: String,
         callsign: String,
         keyer_id: String,
+        /// The relay address used for WAN pairing (empty until one is set).
+        relay: String,
         /// The logger has host mode open and owns the speed; the Keyer's slider is locked.
         speed_locked: bool,
     },
@@ -431,9 +436,11 @@ struct Shared {
     speed_from_logger: AtomicBool,
     /// The running LAN advertiser task (operating-position side), present while advertising.
     advertise: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// The control channel to the Station, present only while paired. Used to push the
-    /// forward-rule table and to receive FlexRadio discovery announcements.
-    control: tokio::sync::Mutex<Option<ControlLink>>,
+    /// Queue into the control channel to the Station, present only while that channel is up.
+    /// The control task owns the link, so a push is queued here rather than sent under a lock.
+    control_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<ControlMessage>>>,
+    /// The task that keeps the control channel dialled while paired; aborted on unpair.
+    control_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The live session, so the Client can restart its own forwards on a rule change. Shared
     /// (rather than held only on the controller) so command handlers reach it.
     session: tokio::sync::Mutex<Option<Session>>,
@@ -482,6 +489,14 @@ impl Shared {
             transport: s.transport.as_str().into(),
             callsign: s.callsign.clone(),
             keyer_id: s.keyer_id.clone(),
+            relay: self
+                .config
+                .lock()
+                .unwrap()
+                .relay
+                .as_ref()
+                .map(|r| r.address.to_string())
+                .unwrap_or_default(),
             speed_locked: self.speed_from_logger.load(Ordering::SeqCst),
         });
     }
@@ -598,7 +613,8 @@ impl ClientController {
             logger: Mutex::new(None),
             speed_from_logger: AtomicBool::new(false),
             advertise: tokio::sync::Mutex::new(None),
-            control: tokio::sync::Mutex::new(None),
+            control_tx: Mutex::new(None),
+            control_task: Mutex::new(None),
             session: tokio::sync::Mutex::new(None),
             flex_emitter: Mutex::new(None),
             config: Mutex::new(config),
@@ -870,6 +886,23 @@ impl ClientController {
     /// `None` to release it. This drives the physical key line in lock-step with the keyer,
     /// so a local rig keys alongside the remote one.
     pub fn select_keying_port(&self, port: Option<String>) {
+        if let Some(p) = &port {
+            let clash = {
+                let s = self.shared.settings.lock().unwrap();
+                held_by_other(
+                    p,
+                    &[(&s.paddle_port, "the paddle port"), (&s.winkeyer_port, "the WinKeyer port")],
+                )
+            };
+            if let Some(label) = clash {
+                self.shared.fail(
+                    control::KEYING,
+                    format!("{p} is {label}"),
+                    format!("{p} is already {label}; a port can serve one job."),
+                );
+                return;
+            }
+        }
         self.shared.settings.lock().unwrap().keying_port = port.clone();
         {
             let mut guard = self.shared.keying.lock().unwrap();
@@ -910,6 +943,23 @@ impl ClientController {
     /// uses. This matches the C# `PaddleInputPoller`: 1 ms poll, raised priority, DTR asserted
     /// as the contact voltage source, so it works on native UARTs and USB-to-serial alike.
     pub fn select_paddle_port(&self, port: Option<String>) {
+        if let Some(p) = &port {
+            let clash = {
+                let s = self.shared.settings.lock().unwrap();
+                held_by_other(
+                    p,
+                    &[(&s.keying_port, "the keying port"), (&s.winkeyer_port, "the WinKeyer port")],
+                )
+            };
+            if let Some(label) = clash {
+                self.shared.fail(
+                    control::PADDLE,
+                    format!("{p} is {label}"),
+                    format!("{p} is already {label}; a port can serve one job."),
+                );
+                return;
+            }
+        }
         self.shared.settings.lock().unwrap().paddle_port = port.clone();
         // Stop any running poller first (changing ports is a normal operation).
         *self.shared.paddle.lock().unwrap() = None;
@@ -944,6 +994,23 @@ impl ClientController {
     /// Selects the WinKeyer port: a logging program on it is served as a WinKeyer host, and its
     /// text is keyed through the send buffer (sidetone, key line, tunnel).
     pub fn select_winkeyer_port(&self, port: Option<String>) {
+        if let Some(p) = &port {
+            let clash = {
+                let s = self.shared.settings.lock().unwrap();
+                held_by_other(
+                    p,
+                    &[(&s.keying_port, "the keying port"), (&s.paddle_port, "the paddle port")],
+                )
+            };
+            if let Some(label) = clash {
+                self.shared.fail(
+                    control::WINKEYER,
+                    format!("{p} is {label}"),
+                    format!("{p} is already {label}; a port can serve one job."),
+                );
+                return;
+            }
+        }
         // Replacing the handle drops the previous host, which stops its threads and frees the port.
         *self.shared.logger.lock().unwrap() = None;
         self.shared.speed_from_logger.store(false, Ordering::SeqCst);
@@ -1049,6 +1116,52 @@ impl ClientController {
                 enabled: false,
                 station_target_address: station_target_address.to_string(),
             });
+        }
+        self.shared.persist_config();
+        self.shared.emit_forward_rules();
+        self.push_and_apply_rules();
+    }
+
+    /// Replaces the fields of the rule `id` with the edited values, keeping its id and enabled
+    /// state. The table is pushed to the Station and the Client's forwards restart to match, so
+    /// the edit takes effect while paired.
+    pub fn update_forward_rule(
+        &self,
+        id: &str,
+        name: &str,
+        protocol: &str,
+        client_port: u16,
+        station_port: u16,
+        station_target_address: &str,
+    ) {
+        let proto = if protocol.eq_ignore_ascii_case("udp") { "udp" } else { "tcp" };
+        if is_reserved_port(client_port) || is_reserved_port(station_port) {
+            self.shared.log("warn", "That port is reserved for RWK control traffic.");
+            return;
+        }
+        {
+            let mut config = self.shared.config.lock().unwrap();
+            if !config.forwards.iter().any(|r| r.id == id) {
+                drop(config);
+                self.shared.log("warn", "That forward rule no longer exists.");
+                return;
+            }
+            if config
+                .forwards
+                .iter()
+                .any(|r| r.id != id && r.protocol == proto && r.client_port == client_port)
+            {
+                drop(config);
+                self.shared.log("warn", format!("A {proto} rule already uses client port {client_port}."));
+                return;
+            }
+            if let Some(rule) = config.forwards.iter_mut().find(|r| r.id == id) {
+                rule.name = name.to_string();
+                rule.protocol = proto.to_string();
+                rule.client_port = client_port;
+                rule.station_port = station_port;
+                rule.station_target_address = station_target_address.to_string();
+            }
         }
         self.shared.persist_config();
         self.shared.emit_forward_rules();
@@ -1191,7 +1304,14 @@ impl ClientController {
 
             let connected = match tunnel::connect(&config).await {
                 Ok(c) => c,
-                Err(e) => return fail(&shared, format!("link failed: {e}")),
+                Err(e) => {
+                    // The relay did not answer: ask the operator for a relay address.
+                    shared.emit(ClientEvent::Error {
+                        control: "relay".into(),
+                        message: "Relay not reachable".into(),
+                    });
+                    return fail(&shared, format!("link failed: {e}"));
+                }
             };
             bring_up_client(&shared, connected).await;
         });
@@ -1207,16 +1327,75 @@ impl ClientController {
             if let Some(task) = shared.advertise.lock().await.take() {
                 task.abort();
             }
-            *shared.control.lock().await = None;
+            if let Some(task) = shared.control_task.lock().unwrap().take() {
+                task.abort();
+            }
+            *shared.control_tx.lock().unwrap() = None;
             if let Some(mut session) = shared.session.lock().await.take() {
                 session.shutdown().await;
             }
         });
         self.shared.emit(ClientEvent::Advertising { active: false });
+        self.shared.emit(ClientEvent::Rtt { ms: None });
         self.shared
             .emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
         self.shared.log("info", "Unpaired.");
     }
+}
+
+/// Liveness heartbeat and round-trip probe for a paired link. Each tick it sends a heartbeat
+/// (so the Station's watchdogs see the Client alive) and a ping the Station answers; every
+/// fourth tick it reports the RTT to the UI. It runs only while `transport` is still the live
+/// one, so it stops by itself once the pairing ends.
+fn spawn_rtt_heartbeat(shared: Arc<Shared>, transport: Arc<EdgeTransport>) {
+    // The Client only sends, so nothing else reads the link. Drain inbound datagrams here so the
+    // Station's pong to each ping is processed (that is what sets the round trip).
+    {
+        let shared = Arc::clone(&shared);
+        let transport = Arc::clone(&transport);
+        tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), transport.recv_edge()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) => return,
+                    Err(_) => {
+                        let live = shared
+                            .transport
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|t| Arc::ptr_eq(t, &transport));
+                        if !live {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        let mut beats: u32 = 0;
+        loop {
+            tick.tick().await;
+            let live = shared
+                .transport
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|t| Arc::ptr_eq(t, &transport));
+            if !live {
+                return;
+            }
+            let _ = transport.send_heartbeat().await;
+            let _ = transport.send_ping().await;
+            beats = beats.wrapping_add(1);
+            if beats % 4 == 0 {
+                let ms = transport.rtt().map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
+                shared.emit(ClientEvent::Rtt { ms });
+            }
+        }
+    });
 }
 
 /// Shared post-connect wiring for the Client (operating position), used by both the WAN
@@ -1242,26 +1421,28 @@ async fn bring_up_client(shared: &Arc<Shared>, connected: tunnel::Connected) {
     );
     transport.set_peer(peer).await;
 
-    // Open the control channel to the Station and push the current forward rules.
+    // Keep the control channel to the Station dialled for the whole pairing: it carries the
+    // forward rules out and FlexRadio discovery announcements back.
     let station_inner = std::net::IpAddr::V4(Role::Client.peer_inner_address());
-    match ControlLink::connect(&net, station_inner).await {
-        Ok(link) => {
-            let rules = shared.config.lock().unwrap().forwards.clone();
-            if let Err(e) = link.send(&ControlMessage::ForwardRules { rules }).await {
-                shared.log("warn", format!("Could not push forward rules: {e}"));
-            }
-            *shared.control.lock().await = Some(link);
-            spawn_discovery_receiver(Arc::clone(shared));
-        }
-        Err(e) => shared.log("warn", format!("Control channel unavailable: {e}")),
+    // Retire the previous pairing's control link first. Left running, its task keeps redialling
+    // a dead netstack, and when it ends it clears `control_tx`, which silently drops rule pushes
+    // on the new link. The LAN responder re-pairs without a disconnect, so this path matters.
+    if let Some(old) = shared.control_task.lock().unwrap().take() {
+        old.abort();
     }
+    *shared.control_tx.lock().unwrap() = None;
+    let control = spawn_control_link(Arc::clone(shared), net.clone(), station_inner);
+    *shared.control_task.lock().unwrap() = Some(control);
 
     // A new pairing restarts the edge stream at sequence 0 and starts its ordered tunnel FIFO.
     // The Station builds a fresh replayer per session, so it accepts the restart.
     shared.edge.begin(*shared.epoch.lock().unwrap(), MonotonicClock.now(), Arc::clone(&transport));
     *shared.transport.lock().unwrap() = Some(Arc::clone(&transport));
+    spawn_rtt_heartbeat(Arc::clone(shared), Arc::clone(&transport));
 
-    *shared.session.lock().await = Some(session);
+    if let Some(mut old) = shared.session.lock().await.replace(session) {
+        old.shutdown().await;
+    }
     // The epoch is intentionally NOT bumped here. Both edge sources (the paddle poller and
     // the type-ahead send worker) sample `shared.epoch` independently, so a bump would make
     // them disagree and the Station would F4 whichever source sent second. The station adopts
@@ -1326,11 +1507,17 @@ async fn lan_advertise_and_await(shared: Arc<Shared>) {
 /// Pushes `rules` to the Station over the control channel (if paired) and restarts the
 /// Client's own forward tasks to match. Safe to call when not paired (does nothing).
 async fn push_rules(shared: &Arc<Shared>, rules: &[ForwardRuleConfig]) {
-    // Push to the Station.
-    if let Some(link) = shared.control.lock().await.as_ref() {
-        if let Err(e) = link.send(&ControlMessage::ForwardRules { rules: rules.to_vec() }).await {
-            shared.log("warn", format!("Could not push forward rules: {e}"));
+    // Queue the push for the Station. While the control channel is down nothing is queued: the
+    // next dial sends the rules from the config.
+    match shared.control_tx.lock().unwrap().as_ref() {
+        Some(tx) => {
+            let _ = tx.send(ControlMessage::ForwardRules { rules: rules.to_vec() });
         }
+        None if shared.transport.lock().unwrap().is_some() => shared.log(
+            "warn",
+            "Control channel is down; rule change not sent to the Station.",
+        ),
+        None => {}
     }
     // Restart the Client's own forwards (binds local ports for enabled rules).
     if let Some(session) = shared.session.lock().await.as_mut() {
@@ -1339,31 +1526,68 @@ async fn push_rules(shared: &Arc<Shared>, rules: &[ForwardRuleConfig]) {
     }
 }
 
-/// Spawns a task that receives FlexRadio discovery announcements on the control channel and
-/// re-broadcasts them on the Client LAN. Runs until the control channel closes.
-fn spawn_discovery_receiver(shared: Arc<Shared>) {
+/// How long the Client waits before redialling the control channel. The delay doubles from the
+/// minimum up to the maximum while dials keep failing, and resets once a dial succeeds.
+const CONTROL_REDIAL_MIN: std::time::Duration = std::time::Duration::from_millis(500);
+const CONTROL_REDIAL_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Keeps the control channel to the Station up for the whole pairing. The Station listens for it
+/// only after its own pairing setup, so an early dial can be refused, and a dropped link is never
+/// revived by itself. Each connection queues the current forward rules, carries pushes out and
+/// FlexRadio announcements back, and is redialled when it ends.
+fn spawn_control_link(
+    shared: Arc<Shared>,
+    net: rwk_core::engine::netstack_driver::NetStackHandle,
+    station_inner: std::net::IpAddr,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut delay = CONTROL_REDIAL_MIN;
         loop {
-            // Take the recv side under the lock for one message, then release so sends can
-            // interleave. The control link is single-reader (this task), single-writer.
-            let message = {
-                let mut guard = shared.control.lock().await;
-                match guard.as_mut() {
-                    Some(link) => link.recv().await,
-                    None => return, // disconnected
+            match ControlLink::connect(&net, station_inner).await {
+                Ok(mut link) => {
+                    delay = CONTROL_REDIAL_MIN;
+                    shared.log("info", "Control channel dialled.");
+                    let (tx, mut outgoing) = tokio::sync::mpsc::unbounded_channel();
+                    // Queue the current rules first; they go out once the link is up.
+                    let rules = shared.config.lock().unwrap().forwards.clone();
+                    let _ = tx.send(ControlMessage::ForwardRules { rules });
+                    *shared.control_tx.lock().unwrap() = Some(tx);
+                    loop {
+                        tokio::select! {
+                            queued = outgoing.recv() => match queued {
+                                Some(message) => {
+                                    if let Err(e) = link.send(&message).await {
+                                        shared.log("warn", format!("Control channel send failed: {e}"));
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            },
+                            incoming = link.recv() => match incoming {
+                                Ok(Some(ControlMessage::DiscoveryAnnounce { payload })) => {
+                                    handle_discovery_announce(&shared, &payload);
+                                }
+                                Ok(Some(_)) => {} // the Client ignores other message types
+                                Ok(None) => {
+                                    shared.log("warn", "Control channel ended by the station.");
+                                    break;
+                                }
+                                Err(e) => {
+                                    shared.log("warn", format!("Control channel read failed: {e}"));
+                                    break;
+                                }
+                            },
+                        }
+                    }
+                    *shared.control_tx.lock().unwrap() = None;
+                    shared.log("warn", "Control channel to the station closed; redialling.");
                 }
-            };
-            match message {
-                Ok(Some(ControlMessage::DiscoveryAnnounce { payload })) => {
-                    handle_discovery_announce(&shared, &payload);
-                }
-                Ok(Some(_)) => {} // the Client ignores other message types
-                Ok(None) | Err(_) => return, // closed or error
+                Err(e) => shared.log("warn", format!("Control channel unavailable: {e}")),
             }
-            // Small yield so a concurrent send can grab the lock.
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(CONTROL_REDIAL_MAX);
         }
-    });
+    })
 }
 
 /// Rewrites a captured Flex discovery packet to the local forwarded endpoint and re-broadcasts
@@ -1727,6 +1951,15 @@ fn port_missing(selected: &Option<String>, present: &[String]) -> bool {
     matches!(selected, Some(name) if !present.iter().any(|p| p == name))
 }
 
+/// The label of the other Client port that already holds `port`, if any. One port serves one
+/// job, so a picker refuses a port another selector is using.
+fn held_by_other(port: &str, others: &[(&Option<String>, &'static str)]) -> Option<&'static str> {
+    others
+        .iter()
+        .find(|(p, _)| p.as_deref() == Some(port))
+        .map(|(_, label)| *label)
+}
+
 /// Maps a UI mode name to a [`KeyerMode`], defaulting to Iambic B.
 fn parse_mode(name: &str) -> KeyerMode {
     match name {
@@ -1824,6 +2057,26 @@ mod tests {
             states.len() >= 2 && states.first() == Some(&true) && states.last() == Some(&false)
         });
         assert!(ok, "send_cw(\"E\") must key down then up, ending key-up");
+    }
+
+    #[test]
+    fn update_forward_rule_edits_in_place_and_keeps_id() {
+        let (sink, _events) = recording_sink();
+        let controller = ClientController::start_with_config(sink, None);
+        controller.add_forward_rule("K4", "tcp", 9100, 9100, "127.0.0.1");
+        let id = controller.shared.config.lock().unwrap().forwards[0].id.clone();
+        controller.set_forward_rule_enabled(&id, true);
+        controller.update_forward_rule(&id, "K4 remote", "udp", 9101, 9102, "10.0.0.5");
+        let config = controller.shared.config.lock().unwrap();
+        assert_eq!(config.forwards.len(), 1);
+        let rule = &config.forwards[0];
+        assert_eq!(rule.id, id);
+        assert_eq!(rule.name, "K4 remote");
+        assert_eq!(rule.protocol, "udp");
+        assert_eq!(rule.client_port, 9101);
+        assert_eq!(rule.station_port, 9102);
+        assert_eq!(rule.station_target_address, "10.0.0.5");
+        assert!(rule.enabled, "editing must keep the enabled state");
     }
 
     #[test]

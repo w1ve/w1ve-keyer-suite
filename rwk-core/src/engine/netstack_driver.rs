@@ -335,6 +335,9 @@ struct TcpEntry {
     /// not-active socket is still *connecting*, not closed — distinguishing the two is what
     /// stops the driver from tearing a stream down before it is even up.
     established: bool,
+    /// Bytes the user sent that the stack has not accepted yet. A write issued while the handshake
+    /// is still in progress waits here instead of being dropped.
+    pending: Vec<u8>,
     /// Set once smoltcp reports the socket closed, so its FIN is forwarded exactly once by
     /// dropping the inbound sender.
     closed: bool,
@@ -423,6 +426,8 @@ impl NetDriver {
     fn handle_command(&mut self, command: Command) {
         match command {
             Command::OpenUdp { port, outbound, inbound, reply } => {
+                // A forward that ended may not have been reaped yet; free its port first.
+                self.reap_closed_udp();
                 match self.stack.open_udp(port) {
                     Ok(handle) => {
                         let id = self.alloc_id();
@@ -441,7 +446,14 @@ impl NetDriver {
                         let id = self.alloc_id();
                         self.tcp.insert(
                             id,
-                            TcpEntry { handle, outbound, inbound, established: false, closed: false },
+                            TcpEntry {
+                                handle,
+                                outbound,
+                                inbound,
+                                established: false,
+                                closed: false,
+                                pending: Vec::new(),
+                            },
                         );
                         let _ = reply.send(Ok(()));
                     }
@@ -457,7 +469,14 @@ impl NetDriver {
                         let id = self.alloc_id();
                         self.tcp.insert(
                             id,
-                            TcpEntry { handle, outbound, inbound, established: false, closed: false },
+                            TcpEntry {
+                                handle,
+                                outbound,
+                                inbound,
+                                established: false,
+                                closed: false,
+                                pending: Vec::new(),
+                            },
                         );
                         let _ = reply.send(Ok(()));
                     }
@@ -482,8 +501,38 @@ impl NetDriver {
         self.flush_outbound().await;
     }
 
+    /// Releases UDP sockets whose user side has gone, so their ports can be bound again.
+    ///
+    /// A user that drops its socket may have just queued a last datagram (a reply, say). That
+    /// datagram is handed to the stack and framed before the socket is removed, or it is lost.
+    fn reap_closed_udp(&mut self) {
+        let closed: Vec<usize> = self
+            .udp
+            .iter()
+            .filter(|(_, entry)| entry.inbound.is_closed())
+            .map(|(id, _)| *id)
+            .collect();
+        if closed.is_empty() {
+            return;
+        }
+        for id in &closed {
+            if let Some(entry) = self.udp.get_mut(id) {
+                while let Ok((data, to)) = entry.outbound.try_recv() {
+                    let _ = self.stack.udp_send(entry.handle, to, &data);
+                }
+            }
+        }
+        self.stack.poll();
+        for id in closed {
+            if let Some(entry) = self.udp.remove(&id) {
+                self.stack.close_udp(entry.handle);
+            }
+        }
+    }
+
     /// Moves datagrams between each UDP socket and its channels.
     fn pump_udp(&mut self) {
+        self.reap_closed_udp();
         for entry in self.udp.values_mut() {
             // User -> stack: send everything queued, as long as the socket can take it.
             while let Ok((data, to)) = entry.outbound.try_recv() {
@@ -502,14 +551,24 @@ impl NetDriver {
     /// Moves bytes between each TCP socket and its channels, and forwards a close.
     fn pump_tcp(&mut self) {
         for entry in self.tcp.values_mut() {
-            // User -> stack: write queued bytes while the send buffer has room.
+            // User -> stack: queue what the user sent, then write while the send buffer has room.
             while let Ok(data) = entry.outbound.try_recv() {
-                let mut offset = 0;
-                while offset < data.len() {
-                    match self.stack.tcp_send(entry.handle, &data[offset..]) {
-                        Ok(0) => break, // send buffer full; the rest waits for the next pass.
-                        Ok(n) => offset += n,
-                        Err(_) => break, // not sendable (closing); drop the remainder.
+                entry.pending.extend_from_slice(&data);
+            }
+            while !entry.pending.is_empty() {
+                match self.stack.tcp_send(entry.handle, &entry.pending) {
+                    Ok(0) => break, // send buffer full; the rest waits for the next pass.
+                    Ok(n) => {
+                        entry.pending.drain(..n);
+                    }
+                    Err(_) => {
+                        // Not sendable yet while the handshake is in progress: keep the bytes for
+                        // the next pass. A socket that is no longer active can never send them.
+                        let socket = self.stack.tcp(entry.handle);
+                        if !(socket.is_active() && !socket.may_send()) {
+                            entry.pending.clear();
+                        }
+                        break;
                     }
                 }
             }
@@ -641,6 +700,27 @@ mod tests {
             .expect("reply did not cross back")
             .expect("channel closed");
         assert_eq!(reply, b"ack");
+    }
+
+    #[tokio::test]
+    async fn a_udp_port_reopens_after_its_socket_is_dropped() {
+        let (a, b) = linked_drivers().await;
+
+        // A forward that ends drops its socket. Re-opening the same port must deliver to the new
+        // socket, not to a stale one left in the stack, as happens when a rule is restarted.
+        drop(a.open_udp(4991).await.unwrap());
+        let mut reopened = a.open_udp(4991).await.unwrap();
+
+        let sender = b.open_udp(5000).await.unwrap();
+        sender
+            .send(b"after-restart".to_vec(), (IpAddr::V4(A_IP), 4991))
+            .await
+            .unwrap();
+        let (payload, _) = tokio::time::timeout(Duration::from_secs(5), reopened.recv())
+            .await
+            .expect("datagram never reached the reopened socket")
+            .expect("channel closed");
+        assert_eq!(payload, b"after-restart");
     }
 
     #[tokio::test]
