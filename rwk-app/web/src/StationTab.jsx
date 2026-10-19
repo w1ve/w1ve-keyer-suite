@@ -23,9 +23,9 @@ export default function StationTab({
   const running = connection.state === "connected";
   const connecting = connection.state === "connecting";
   const [pickedKey, setPickedKey] = useState("");
-  // The keying port, key/PTT lines and PTT hang are bound when a pairing starts, so they are
-  // locked while paired (stop the link to change them).
-  const locked = running || connecting;
+  // The PTT hang is bound when a pairing starts, so it is locked while linked. Ports and lines
+  // take effect at once.
+  const hangLocked = running || connecting;
 
   // Keep the picked keyer valid as the live list changes.
   useEffect(() => {
@@ -75,13 +75,11 @@ export default function StationTab({
               ports={ports}
               error={errors.keying}
               onChange={(p) => api.selectKeyingPort(p || null)}
-              disabled={locked}
             />
             <div className="row" style={{ gap: 10 }}>
               <div className="field" style={{ flex: 1, marginBottom: 0 }}>
                 <label>Key line</label>                  <select
                     value={settings.keyLine}
-                    disabled={locked}
                     onChange={(e) => api.setKeyLine(e.target.value)}
                   >
                   <option value="dtr" disabled={settings.pttLine === "dtr"}>DTR</option>
@@ -92,7 +90,6 @@ export default function StationTab({
                 <label>PTT line</label>
                 <select
                   value={settings.pttLine}
-                  disabled={locked}
                   onChange={(e) => api.setPttLine(e.target.value)}
                 >
                   <option value="rts" disabled={settings.keyLine === "rts"}>RTS</option>
@@ -109,7 +106,7 @@ export default function StationTab({
                 max={600}
                 step={5}
                 value={settings.pttHangMs}
-                disabled={locked}
+                disabled={hangLocked}
                 onChange={(e) => {
                   const v = Number(e.target.value);
                   setSettings((s) => ({ ...s, pttHangMs: v }));
@@ -124,11 +121,10 @@ export default function StationTab({
               ports={ports}
               error={errors.logger}
               onChange={(p) => api.setLoggerPort(p || null)}
-              disabled={locked}
             />
-            {locked && (
+            {hangLocked && (
               <p style={{ color: "var(--text-dim)", fontSize: 12, margin: "8px 0 0" }}>
-                Keying output and PTT are fixed for this pairing. Stop the link to change them.
+                PTT hang applies at the next pairing.
               </p>
             )}
           </div>

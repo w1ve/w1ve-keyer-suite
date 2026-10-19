@@ -150,6 +150,20 @@ impl KeyingArbiter {
         Self { inner: Arc::new(Mutex::new(inner)) }
     }
 
+    /// Replaces the real output while a session runs, for a port or line change. The old adapter
+    /// is dropped first (a serial port opens only once), then `build` opens the new one. The
+    /// current key and PTT state is driven onto the new output straight away.
+    pub fn replace_adapter_with(&self, build: impl FnOnce() -> SerialKeyingAdapter) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::mem::replace(&mut inner.adapter, SerialKeyingAdapter::led_only());
+        drop(old);
+        inner.adapter = build();
+        // Force the next apply to write the new output, even when the state has not changed.
+        inner.last_key = None;
+        inner.last_ptt = None;
+        inner.apply();
+    }
+
     /// The remote sink to move into the replay driver (`spawn_driver`'s `KeyingOutput`).
     #[must_use]
     pub fn remote_output(&self) -> RemoteKeyingOutput {

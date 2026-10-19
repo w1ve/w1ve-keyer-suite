@@ -87,15 +87,17 @@ lineage.
 
 > **Layout.** Each project keeps its own directory. The shared engine, the relay, the CLI and
 > the Router share a root Cargo workspace (`Cargo.toml`). The two standalone apps are their own
-> workspaces and reach the engine through `../rwk-core`.
+> workspaces and reach the engine through `../common/rwk-core`.
 
 ```
 w1ve-keyer-suite/
   Cargo.toml          root workspace: rwk-core, rwk, rwk-relay, rwk-app
-  rwk-core/           the shared engine: keyer timing, serial keying, sidetone,
+  common/rwk-core/    the shared engine: keyer timing, serial keying, sidetone,
                       paddle decode, WinKeyer2 host, WireGuard tunnel, relay, netstack
   rwk-app/            W1VE Remote Keyer-Router (Client + Station + Ham Router)
   rwk-relay/          the relay server + dashboard
+  linux/rwk-relay/    relay Dockerfile + compose (Linux server image)
+  windows/rwk-relay/  relay deploy scripts (run from Windows)
   rwk/                an engine CLI (keygen, connect, selftest, …)
   W1VE-Keyer/         W1VE Keyer (standalone, no networking); crates/wk-app
   W1VE-Remote-Keyer/  W1VE Remote Keyer (Client + Station); crates/wrk-app

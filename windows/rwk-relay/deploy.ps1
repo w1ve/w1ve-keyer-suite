@@ -1,8 +1,8 @@
-# Ships the rust/ workspace to the VPS and builds + runs the relay with Docker there.
+# Ships the suite workspace to the VPS and builds + runs the relay with Docker there.
 # Run from the suite root (w1ve-keyer-suite/) AFTER install-key.ps1 has installed the deploy key.
 #
 # Usage (from the suite root):
-#   .\rwk-relay\deploy\deploy.ps1 -VpsHost 203.0.113.10 -VpsUser ubuntu `
+#   .\windows\rwk-relay\deploy.ps1 -VpsHost 203.0.113.10 -VpsUser ubuntu `
 #       -AdminPassword 'strong-pw' -JwtSecret (python -c "import secrets;print(secrets.token_hex(32))")
 #
 # If -JwtSecret is omitted a strong one is generated and printed (save it — it must stay
@@ -49,7 +49,7 @@ $tarArgs = @(
 & tar @tarArgs | ssh @ssh "${VpsUser}@${VpsHost}" "tar -xzf - -C $RemoteDir"
 
 Write-Host "3/4  Building the Docker image on the VPS (this can take several minutes)" -ForegroundColor Cyan
-ssh @ssh "${VpsUser}@${VpsHost}" "cd $RemoteDir && docker build -f rwk-relay/Dockerfile -t rwk-relay:latest ."
+ssh @ssh "${VpsUser}@${VpsHost}" "cd $RemoteDir && docker build -f linux/rwk-relay/Dockerfile -t rwk-relay:latest ."
 
 Write-Host "4/4  Starting the relay container" -ForegroundColor Cyan
 # Write an env file on the VPS (chmod 600) rather than putting secrets on the command line,

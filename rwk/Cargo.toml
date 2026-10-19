@@ -12,5 +12,5 @@ name = "rwk"
 path = "src/main.rs"
 
 [dependencies]
-rwk-core = { path = "../rwk-core" }
+rwk-core = { path = "../common/rwk-core" }
 tokio = { workspace = true }

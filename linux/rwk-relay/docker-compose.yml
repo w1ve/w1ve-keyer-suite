@@ -7,13 +7,13 @@
 #
 # Usage:
 #   cd w1ve-keyer-suite
-#   RWK_ADMIN_PASSWORD=... RWK_JWT_SECRET=... docker compose -f rwk-relay/docker-compose.yml up -d --build
+#   RWK_ADMIN_PASSWORD=... RWK_JWT_SECRET=... docker compose -f linux/rwk-relay/docker-compose.yml up -d --build
 
 services:
   rwk-relay:
     build:
-      context: ..               # the suite root (the Cargo workspace)
-      dockerfile: rwk-relay/Dockerfile
+      context: ../..            # the suite root (the Cargo workspace)
+      dockerfile: linux/rwk-relay/Dockerfile
     image: rwk-relay:latest
     container_name: rwk-relay
     restart: unless-stopped

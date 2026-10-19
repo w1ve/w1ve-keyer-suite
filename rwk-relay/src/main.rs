@@ -107,11 +107,27 @@ async fn run() -> Result<(), String> {
 
 /// Where the built React bundle lives.
 ///
-/// `RWK_WEB_ROOT` overrides it (the Docker image sets it); otherwise it defaults to `web/dist`
-/// relative to the working directory, which is where a local `vite build` lands.
+/// `RWK_WEB_ROOT` overrides it (the Docker image sets it). Otherwise it uses `web/dist` in the
+/// working directory (where a local `vite build` lands), then `web/dist` beside the executable
+/// (a shipped bundle next to the binary). If neither exists, it returns the working-directory
+/// path, so the startup log names a sensible location.
 fn web_root() -> PathBuf {
-    match std::env::var("RWK_WEB_ROOT") {
-        Ok(v) if !v.is_empty() => PathBuf::from(v),
-        _ => PathBuf::from("web/dist"),
+    if let Ok(v) = std::env::var("RWK_WEB_ROOT") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
     }
+    let cwd = PathBuf::from("web/dist");
+    if cwd.is_dir() {
+        return cwd;
+    }
+    if let Some(beside) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("web/dist")))
+    {
+        if beside.is_dir() {
+            return beside;
+        }
+    }
+    cwd
 }

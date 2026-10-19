@@ -22,7 +22,7 @@ path = "src/main_station.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-rwk-core = { path = "../rwk-core" }
+rwk-core = { path = "../common/rwk-core" }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tokio = { workspace = true }

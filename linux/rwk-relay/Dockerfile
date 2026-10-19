@@ -6,7 +6,7 @@
 # and the metrics dashboard in a single process.
 #
 # Build context is the suite root (so the build can see the whole Cargo workspace):
-#   docker build -f rwk-relay/Dockerfile -t rwk-relay .
+#   docker build -f linux/rwk-relay/Dockerfile -t rwk-relay .
 
 # ---- Stage 1: build the dashboard ----
 FROM node:22-bookworm-slim AS web

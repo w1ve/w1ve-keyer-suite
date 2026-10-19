@@ -14,8 +14,8 @@ repository = "https://github.com/w1ve/w1ve-remote-keyer"
 # (WireGuard tunnel, relay, keyer timing, serial keying, sidetone, paddle input) rather than
 # forking any of it — the Remote Keyer is the Keyer-Router's keying path without the router.
 #
-# The engine is the suite's sibling directory `rwk-core/` (W1VE-Keyer-Suite layout).
-rwk-core = { path = "../rwk-core" }
+# The engine is the suite's `common/rwk-core/` (W1VE-Keyer-Suite layout).
+rwk-core = { path = "../common/rwk-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

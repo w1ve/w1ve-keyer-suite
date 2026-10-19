@@ -25,7 +25,7 @@ The Server shows a short **pairing token**; the Client enters it. No key copying
 
 ```
 W1VE-Remote-Keyer/
-  Cargo.toml                     workspace (reuses ../RWK-Rust/rust/crates/rwk-core)
+  Cargo.toml                     workspace (reuses ../common/rwk-core)
   crates/wrk-app/
     src/pairing.rs               WAN/LAN transport + pairing token → rwk-core Config
     src/client_controller.rs     Client: keyer, sidetone, paddle, send edges over the tunnel

@@ -260,8 +260,8 @@ struct ActiveSession {
     /// The logger-WinKeyer host, if the operator enabled it for this session. Dropped (and
     /// its port released) when the session ends.
     logger: Option<StationWinKeyerHost>,
-    /// Held so the arbiter (and the serial port it owns) lives for the session.
-    _arbiter: Arc<KeyingArbiter>,
+    /// The arbiter that owns the serial output. Swapped in place when the port or its lines change.
+    arbiter: Arc<KeyingArbiter>,
 }
 
 impl StationController {
@@ -403,6 +403,43 @@ impl StationController {
         self.shared.emit_settings();
     }
 
+    /// Reopens the keying output on the running session, so a changed port or line takes effect
+    /// without dropping the tunnel. The old output is released before the new one opens.
+    fn apply_keying_live(&self) {
+        let arbiter = match self.active.lock().unwrap().as_ref() {
+            Some(active) => Arc::clone(&active.arbiter),
+            None => return,
+        };
+        let (port, key_line, ptt_line) = {
+            let s = self.shared.settings.lock().unwrap();
+            (s.keying_port.clone(), s.key_line, s.ptt_line)
+        };
+        let ptt_line = ptt_line_for(key_line, ptt_line);
+        let shared = Arc::clone(&self.shared);
+        arbiter.replace_adapter_with(move || keying_adapter(&shared, port, key_line, ptt_line));
+    }
+
+    /// Restarts the logger input on the running session for the current port and enable state.
+    /// The old host is stopped first, so its port is free before the new one opens.
+    fn apply_logger_live(&self) {
+        let arbiter = match self.active.lock().unwrap().as_ref() {
+            Some(active) => Arc::clone(&active.arbiter),
+            None => return,
+        };
+        let old = self.active.lock().unwrap().as_mut().and_then(|a| a.logger.take());
+        if let Some(mut host) = old {
+            host.stop();
+        }
+        let (port, enabled) = {
+            let s = self.shared.settings.lock().unwrap();
+            (s.logger_port.clone(), s.logger_enabled)
+        };
+        let logger = open_logger(&self.shared, &arbiter, port, enabled);
+        if let Some(active) = self.active.lock().unwrap().as_mut() {
+            active.logger = logger;
+        }
+    }
+
     /// Selects the serial port that keys the radio, or `None` to clear it. The port is opened
     /// when pairing starts, so the replay driver owns it for the session; changing it while
     /// paired takes effect on the next pairing.
@@ -420,13 +457,19 @@ impl StationController {
         }
         self.shared.settings.lock().unwrap().keying_port = port.clone();
         self.shared.clear_error(control::KEYING);
-        match port {
+        match &port {
             Some(name) => self.shared.log("info", format!("Keying output set to {name}.")),
             None => self.shared.log("info", "Keying output cleared."),
         }
         self.shared.persist();
         self.emit_ports();
         self.shared.emit_settings();
+        if self.is_paired() {
+            self.apply_keying_live();
+        } else if let Some(name) = &port {
+            // Not paired, so nothing is open yet. Check the port now, not at pairing.
+            probe_keying_port(&self.shared, name);
+        }
     }
 
     /// Sets which control line keys the radio ("dtr" or "rts").
@@ -435,6 +478,9 @@ impl StationController {
         self.shared.settings.lock().unwrap().key_line = parsed;
         self.shared.persist();
         self.shared.emit_settings();
+        if self.is_paired() {
+            self.apply_keying_live();
+        }
     }
 
     /// Sets which control line asserts PTT ("dtr", "rts", or "none").
@@ -442,6 +488,9 @@ impl StationController {
         self.shared.settings.lock().unwrap().ptt_line = parse_line(line);
         self.shared.persist();
         self.shared.emit_settings();
+        if self.is_paired() {
+            self.apply_keying_live();
+        }
     }
 
     /// Sets the PTT hang time (how long PTT is held after key-up), clamped to the valid range.
@@ -479,13 +528,18 @@ impl StationController {
             s.logger_enabled = port.is_some();
         }
         self.shared.clear_error(control::LOGGER);
-        match port {
+        match &port {
             Some(name) => self.shared.log("info", format!("Logger input port set to {name}.")),
             None => self.shared.log("info", "Logger input port cleared."),
         }
         self.shared.persist();
         self.emit_ports();
         self.shared.emit_settings();
+        if self.is_paired() {
+            self.apply_logger_live();
+        } else if let Some(name) = &port {
+            probe_logger_port(&self.shared, name);
+        }
     }
 
     /// Enables or disables the logger input. Takes effect on the next pairing (the logger
@@ -495,6 +549,9 @@ impl StationController {
         self.shared.log("info", if enabled { "Logger input enabled." } else { "Logger input disabled." });
         self.shared.persist();
         self.shared.emit_settings();
+        if self.is_paired() {
+            self.apply_logger_live();
+        }
     }
 
     // ─── Pairing ──────────────────────────────────────────────────────────────
@@ -742,6 +799,102 @@ fn load_or_create(path: &Option<std::path::PathBuf>) -> (Config, Settings) {
     (config, settings)
 }
 
+/// The keying output for `port` with the given lines: a serial adapter when a port is chosen and
+/// opens, otherwise LED-only (the KEY/PTT indicators still follow). A port that will not open is
+/// reported on the keying control rather than failing the pairing.
+fn keying_adapter(
+    shared: &Arc<Shared>,
+    port: Option<String>,
+    key_line: KeyingLine,
+    ptt_line: Option<KeyingLine>,
+) -> SerialKeyingAdapter {
+    let Some(port_name) = port else {
+        shared.clear_error(control::KEYING);
+        shared.log("info", "No keying port selected — keying the LED only.");
+        return SerialKeyingAdapter::led_only();
+    };
+    let cfg = KeyingOutputConfig {
+        port_name: port_name.clone(),
+        key_line,
+        ptt_line: ptt_line.unwrap_or(KeyingLine::None),
+        ..Default::default()
+    };
+    match SerialKeyingOutput::open(cfg) {
+        Ok(out) => {
+            shared.clear_error(control::KEYING);
+            shared.log("info", format!("Keying output open on {port_name}."));
+            SerialKeyingAdapter::new(out)
+        }
+        Err(e) => {
+            shared.fail(
+                control::KEYING,
+                format!("{port_name} not available"),
+                format!("keying port {port_name} failed: {e}. Keying the LED only; pick an available port to drive the radio."),
+            );
+            SerialKeyingAdapter::led_only()
+        }
+    }
+}
+
+/// Opens `port` once to confirm it exists and is free, then closes it. A failure is reported on
+/// the keying control. Pairing opens the port for real, so this only checks the selection early.
+fn probe_keying_port(shared: &Arc<Shared>, port: &str) {
+    let cfg = KeyingOutputConfig { port_name: port.to_string(), ..Default::default() };
+    match SerialKeyingOutput::open(cfg) {
+        Ok(_out) => shared.clear_error(control::KEYING),
+        Err(e) => shared.fail(
+            control::KEYING,
+            format!("{port} not available"),
+            format!("keying port {port} failed: {e}. Pick an available port to drive the radio."),
+        ),
+    }
+}
+
+/// Opens the logger port once to confirm it exists and is free, then closes it. A failure is
+/// reported on the logger control. The logger host opens the port for real at pairing.
+fn probe_logger_port(shared: &Arc<Shared>, port: &str) {
+    match serialport::new(port, 1200).timeout(std::time::Duration::from_millis(5)).open() {
+        Ok(_handle) => shared.clear_error(control::LOGGER),
+        Err(e) => shared.fail(
+            control::LOGGER,
+            format!("{port} not available"),
+            format!("logger port {port} failed: {e}. Pick an available port for the logger input."),
+        ),
+    }
+}
+
+/// Opens the logger input on `port` when it is enabled, reporting the outcome on the logger control.
+fn open_logger(
+    shared: &Arc<Shared>,
+    arbiter: &Arc<KeyingArbiter>,
+    port: Option<String>,
+    enabled: bool,
+) -> Option<StationWinKeyerHost> {
+    if !enabled {
+        return None;
+    }
+    let Some(lp) = port else {
+        shared.log("warn", "Logger input enabled but no port selected.");
+        return None;
+    };
+    let reporter: HostReporter = make_host_reporter(Arc::clone(shared));
+    match StationWinKeyerHost::open(&lp, arbiter.local_handle(), reporter) {
+        Ok(host) => {
+            shared.clear_error(control::LOGGER);
+            shared.log("info", format!("Logger input active on {}.", host.port_name()));
+            Some(host)
+        }
+        Err(e) => {
+            shared.fail(
+                control::LOGGER,
+                format!("{lp} not available"),
+                format!("Logger input unavailable: {e}"),
+            );
+            None
+        }
+    }
+}
+
 /// Builds the arbiter's line observer: emits KEY/PTT to the UI only on an actual change,
 /// using interior state so it satisfies the `Fn` observer contract.
 fn make_line_observer(shared: Arc<Shared>) -> LineObserver {
@@ -837,42 +990,8 @@ async fn bring_up_station(
 
     // The serial output is optional: with no keying port (or one that will not open) the Station
     // still runs and the KEY/PTT LEDs follow the Client. Nothing is wired to the radio then.
-    let serial = match keying_port {
-        Some(port_name) => {
-            let cfg = KeyingOutputConfig {
-                port_name: port_name.clone(),
-                key_line,
-                ptt_line: ptt_line.unwrap_or(KeyingLine::None),
-                ..Default::default()
-            };
-            match SerialKeyingOutput::open(cfg) {
-                Ok(out) => {
-                    shared.clear_error(control::KEYING);
-                    shared.log("info", format!("Keying output open on {port_name}."));
-                    Some(out)
-                }
-                Err(e) => {
-                    shared.fail(
-                        control::KEYING,
-                        format!("{port_name} not available"),
-                        format!("keying port {port_name} failed: {e}. Keying the LED only; pick an available port to drive the radio."),
-                    );
-                    None
-                }
-            }
-        }
-        None => {
-            shared.clear_error(control::KEYING);
-            shared.log("info", "No keying port selected — keying the LED only.");
-            None
-        }
-    };
-
     let arbiter = Arc::new(KeyingArbiter::with_observer(
-        match serial {
-            Some(out) => SerialKeyingAdapter::new(out),
-            None => SerialKeyingAdapter::led_only(),
-        },
+        keying_adapter(shared, keying_port, key_line, ptt_line),
         Some(make_line_observer(Arc::clone(shared))),
     ));
 
@@ -896,34 +1015,7 @@ async fn bring_up_station(
         Some(path_health),
     );
 
-    let logger = if logger_enabled {
-        match logger_port {
-            Some(lp) => {
-                let reporter: HostReporter = make_host_reporter(Arc::clone(shared));
-                match StationWinKeyerHost::open(&lp, arbiter.local_handle(), reporter) {
-                    Ok(host) => {
-                        shared.clear_error(control::LOGGER);
-                        shared.log("info", format!("Logger input active on {}.", host.port_name()));
-                        Some(host)
-                    }
-                    Err(e) => {
-                        shared.fail(
-                            control::LOGGER,
-                            format!("{lp} not available"),
-                            format!("Logger input unavailable: {e}"),
-                        );
-                        None
-                    }
-                }
-            }
-            None => {
-                shared.log("warn", "Logger input enabled but no port selected.");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let logger = open_logger(shared, &arbiter, logger_port, logger_enabled);
 
     let stop_bus = Arc::new(AtomicBool::new(false));
     spawn_bus_forwarder(bus, Arc::clone(shared), Arc::clone(&stop_bus));
@@ -945,7 +1037,7 @@ async fn bring_up_station(
         control,
         stop_bus,
         logger,
-        _arbiter: arbiter,
+        arbiter,
     });
 
     shared.emit(StationEvent::Connection { state: "connected".into(), path: path.clone() });

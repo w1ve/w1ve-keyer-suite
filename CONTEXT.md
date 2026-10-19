@@ -9,7 +9,7 @@ here. Keep it current when the layout, the shared engine, or the verification st
 w1ve-keyer-suite/
   Cargo.toml          root workspace: rwk-core, rwk, rwk-relay, rwk-app
   Cargo.lock          local only (gitignored), copied from RWK-Rust to keep versions pinned
-  rwk-core/           shared engine (keyer timing, serial keying, sidetone, paddle decode,
+  common/rwk-core/    shared engine (keyer timing, serial keying, sidetone, paddle decode,
                       WinKeyer2 host, WireGuard tunnel, relay client, netstack)
   rwk-app/            W1VE Remote Keyer-Router: Client (w1ve-rkr) + Station (w1ve-rkr-station)
                       + Ham Router (port forwarding, Flex VITA-49 relay, SSB PTT)
@@ -39,7 +39,7 @@ They still hold the C# RWK code, `docs/`, and the macOS provisioning notes, whic
 ## Shared WinKeyer logger host (the main recent change)
 
 Logger input (N1MM+, DXLog and similar, speaking WinKeyer2) is implemented once, in
-`rwk-core/src/engine/logger_host.rs`, and used by:
+`common/rwk-core/src/engine/logger_host.rs`, and used by:
 
 - the Router's Station (`rwk-app/src/station_winkeyer.rs` re-exports it),
 - the Router's Client (`rwk-app/src/controller.rs`, `select_winkeyer_port`),
@@ -84,7 +84,7 @@ Not verified:
 
 ## Known open items
 
-1. Done: `rwk-relay` builds from the suite root (`docker build -f rwk-relay/Dockerfile .`, or `docker compose -f rwk-relay/docker-compose.yml up -d --build`). Verified on the build box (Docker 29.8.2): the image builds, and the container serves `/api/health` and the dashboard. `deploy/deploy.ps1` now runs from the suite root; its tar step was checked locally, but it has not been run against a VPS.
+1. Done: `rwk-relay` builds from the suite root (`docker build -f linux/rwk-relay/Dockerfile .`, or `docker compose -f linux/rwk-relay/docker-compose.yml up -d --build`). Verified on the build box (Docker 29.8.2): the image builds, and the container serves `/api/health` and the dashboard. `windows/rwk-relay/deploy.ps1` now runs from the suite root; its tar step was checked locally, but it has not been run against a VPS.
 2. `RWK-Rust/docs/mac/provision.sh` (macOS) clones the sibling repos into one parent. The suite layout changes that; update the script when the macOS build is next used.
 3. The duplicated sending logic: the Remote Keyer Client and the Router Client both use the send buffer, but the Router's buffer was changed to carry WPM per character to match the Client. Keep the two in step if the send worker changes.
 4. Uncommitted, not ours (left alone): `RWK-Rust/CONTEXT.md` (modified), `W1VE-Remote-Keyer/w1ve_keyer.svg` (untracked).

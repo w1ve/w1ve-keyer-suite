@@ -2,7 +2,7 @@
 resolver = "2"
 # The shared engine and the Router's crates. W1VE-Keyer and W1VE-Remote-Keyer are standalone
 # workspaces in their own directories; they reach rwk-core through the path below.
-members = ["rwk-core", "rwk", "rwk-relay", "rwk-app"]
+members = ["common/rwk-core", "rwk", "rwk-relay", "rwk-app"]
 
 [workspace.package]
 version = "0.1.0"

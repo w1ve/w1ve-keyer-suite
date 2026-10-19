@@ -209,6 +209,8 @@ pub struct SidetoneEngine {
     volume: f64,
     stream: Option<cpal::Stream>,
     device_name: Option<String>,
+    /// Set by the stream's error callback when the device stops rendering.
+    failed: Arc<AtomicBool>,
 }
 
 impl SidetoneEngine {
@@ -227,6 +229,7 @@ impl SidetoneEngine {
             volume: clamp_volume(volume),
             stream: None,
             device_name: None,
+            failed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -318,6 +321,7 @@ impl SidetoneEngine {
     /// cannot be built. Callers treat this as a warning and continue without sidetone.
     pub fn start_on(&mut self, device_name: Option<&str>) -> Result<()> {
         self.stop();
+        self.failed.store(false, Ordering::Release);
 
         let host = cpal::default_host();
         // Resolve the requested device by name, falling back to the default output device.
@@ -340,43 +344,79 @@ impl SidetoneEngine {
         let sample_format = supported.sample_format();
         let stream_config: cpal::StreamConfig = supported.config();
         let channels = stream_config.channels as usize;
+        // Render at the device's own rate. A mismatch plays the tone at the wrong pitch.
+        self.sample_rate = stream_config.sample_rate.0;
 
-        let (mut generator, key) =
-            KeyedSineGenerator::new(self.sample_rate, self.frequency_hz, self.volume)?;
-        self.key = key;
-
-        let err_fn = |e| eprintln!("sidetone stream error: {e}");
-
-        let stream = match sample_format {
-            cpal::SampleFormat::F32 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _| fill_channels(&mut generator, data, channels),
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::I16 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [i16], _| fill_channels_i16(&mut generator, data, channels),
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::U16 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [u16], _| fill_channels_u16(&mut generator, data, channels),
-                err_fn,
-                None,
-            ),
-            other => {
-                return Err(crate::Error::Audio(format!("unsupported sample format {other:?}")))
+        // Ask for a short device period. The envelope only changes at a callback boundary, so a
+        // long period delays each key-down by up to a whole period (this is the measured jitter).
+        let short_period = match supported.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => {
+                let wanted = (self.sample_rate * constants::BUFFER_MILLISECONDS / 1000).max(1);
+                // Round down to a power of two: some ALSA devices reject sizes such as 882 frames.
+                let pow2 = 1u32 << (31 - wanted.leading_zeros());
+                Some(cpal::BufferSize::Fixed(pow2.clamp(*min, *max)))
             }
-        }
-        .map_err(|e| crate::Error::Audio(format!("build output stream: {e}")))?;
+            cpal::SupportedBufferSize::Unknown => None,
+        };
+        let stream = match short_period {
+            Some(buffer_size) => {
+                let short = cpal::StreamConfig { buffer_size, ..stream_config.clone() };
+                match self.open_stream(&device, &short, sample_format, channels) {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        eprintln!("sidetone: short buffer refused ({e}); using device default");
+                        self.open_stream(&device, &stream_config, sample_format, channels)?
+                    }
+                }
+            }
+            None => self.open_stream(&device, &stream_config, sample_format, channels)?,
+        };
 
         stream.play().map_err(|e| crate::Error::Audio(format!("start stream: {e}")))?;
 
         self.stream = Some(stream);
         self.device_name = Some(device_name);
         Ok(())
+    }
+
+    /// Builds an output stream in the device's sample format that renders this engine's tone.
+    fn open_stream(
+        &self,
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        sample_format: cpal::SampleFormat,
+        channels: usize,
+    ) -> Result<cpal::Stream> {
+        // A fresh generator per attempt. It shares the engine's key handle, so a handle the
+        // keyer already holds keeps working after a restart.
+        let (mut generator, _) =
+            KeyedSineGenerator::new(self.sample_rate, self.frequency_hz, self.volume)?;
+        generator.key_down = Arc::clone(&self.key.key_down);
+
+        let stream = match sample_format {
+            cpal::SampleFormat::F32 => build_stream::<f32>(device, config, generator, channels, Arc::clone(&self.failed)),
+            cpal::SampleFormat::F64 => build_stream::<f64>(device, config, generator, channels, Arc::clone(&self.failed)),
+            cpal::SampleFormat::I8 => build_stream::<i8>(device, config, generator, channels, Arc::clone(&self.failed)),
+            cpal::SampleFormat::I16 => build_stream::<i16>(device, config, generator, channels, Arc::clone(&self.failed)),
+            cpal::SampleFormat::I32 => build_stream::<i32>(device, config, generator, channels, Arc::clone(&self.failed)),
+            cpal::SampleFormat::I64 => build_stream::<i64>(device, config, generator, channels, Arc::clone(&self.failed)),
+            cpal::SampleFormat::U8 => build_stream::<u8>(device, config, generator, channels, Arc::clone(&self.failed)),
+            cpal::SampleFormat::U16 => build_stream::<u16>(device, config, generator, channels, Arc::clone(&self.failed)),
+            cpal::SampleFormat::U32 => build_stream::<u32>(device, config, generator, channels, Arc::clone(&self.failed)),
+            cpal::SampleFormat::U64 => build_stream::<u64>(device, config, generator, channels, Arc::clone(&self.failed)),
+            other => {
+                return Err(crate::Error::Audio(format!("unsupported sample format {other:?}")))
+            }
+        }
+        .map_err(|e| crate::Error::Audio(format!("build output stream: {e}")))?;
+        Ok(stream)
+    }
+
+    /// True when the output stream reported an error (for example, the device was unplugged)
+    /// and stopped rendering. Call [`Self::start_on`] again to recover.
+    #[must_use]
+    pub fn has_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
     }
 
     /// Requests key-down on the sidetone.
@@ -407,40 +447,51 @@ impl Drop for SidetoneEngine {
     }
 }
 
-/// Renders `generator` into an interleaved f32 buffer, duplicating mono samples across
-/// every output channel.
-fn fill_channels(generator: &mut KeyedSineGenerator, data: &mut [f32], channels: usize) {
-    let frames = data.len() / channels.max(1);
-    let mut scratch = vec![0.0f32; frames];
-    generator.generate(&mut scratch);
-    for (frame, sample) in scratch.iter().enumerate() {
-        for channel in 0..channels {
-            data[frame * channels + channel] = *sample;
-        }
-    }
+/// Opens an output stream that renders sidetone in sample type `T`.
+///
+/// Every cpal sample format is handled through this one generic path, so devices that
+/// report 32-bit integer, 8-bit, 64-bit or float output all work, not only F32/I16/U16.
+fn build_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    mut generator: KeyedSineGenerator,
+    channels: usize,
+    failed: Arc<AtomicBool>,
+) -> std::result::Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let err_fn = move |e| {
+        failed.store(true, Ordering::Release);
+        eprintln!("sidetone stream error: {e}");
+    };
+    // Owned by the callback and reused, so the render path does not allocate per period.
+    let mut scratch: Vec<f32> = Vec::new();
+    device.build_output_stream(
+        config,
+        move |data: &mut [T], _| fill_channels(&mut generator, &mut scratch, data, channels),
+        err_fn,
+        None,
+    )
 }
 
-/// As [`fill_channels`], for 16-bit signed integer output.
-fn fill_channels_i16(generator: &mut KeyedSineGenerator, data: &mut [i16], channels: usize) {
-    let frames = data.len() / channels.max(1);
-    let mut scratch = vec![0.0f32; frames];
-    generator.generate(&mut scratch);
+/// Renders `generator` into an interleaved buffer of sample type `T`, duplicating mono
+/// samples across every output channel. The float signal is clamped to -1.0..=1.0 before
+/// conversion, so integer formats never receive out-of-range values.
+fn fill_channels<T>(
+    generator: &mut KeyedSineGenerator,
+    scratch: &mut Vec<f32>,
+    data: &mut [T],
+    channels: usize,
+) where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let channels = channels.max(1);
+    let frames = data.len() / channels;
+    scratch.resize(frames, 0.0);
+    generator.generate(scratch);
     for (frame, sample) in scratch.iter().enumerate() {
-        let value = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
-        for channel in 0..channels {
-            data[frame * channels + channel] = value;
-        }
-    }
-}
-
-/// As [`fill_channels`], for 16-bit unsigned integer output.
-fn fill_channels_u16(generator: &mut KeyedSineGenerator, data: &mut [u16], channels: usize) {
-    let frames = data.len() / channels.max(1);
-    let mut scratch = vec![0.0f32; frames];
-    generator.generate(&mut scratch);
-    for (frame, sample) in scratch.iter().enumerate() {
-        let scaled = (sample.clamp(-1.0, 1.0) + 1.0) * 0.5 * f32::from(u16::MAX);
-        let value = scaled as u16;
+        let value = <T as cpal::FromSample<f32>>::from_sample_(sample.clamp(-1.0, 1.0));
         for channel in 0..channels {
             data[frame * channels + channel] = value;
         }
@@ -545,6 +596,22 @@ mod tests {
         assert!(key.is_key_down());
         key.key_up();
         assert!(!key.is_key_down());
+    }
+
+    #[test]
+    fn integer_output_stays_in_range_and_reaches_full_scale() {
+        // 32-bit integer output (the I32 format that previously failed) must not overflow
+        // and should reach a large fraction of full scale when keyed down.
+        let (mut gen, key) = KeyedSineGenerator::new(48_000, 700, 1.0).unwrap();
+        key.key_down();
+        let mut buf = vec![0i32; 960 * 2];
+        fill_channels(&mut gen, &mut Vec::new(), &mut buf, 2);
+        let peak = buf.iter().map(|s| i64::from(*s).abs()).max().unwrap_or(0);
+        assert!(peak > i64::from(i32::MAX) / 2, "peak {peak} too small");
+        // -1.0 maps to i32::MIN (|-2^31|), which is valid, so the bound is the full i32 range.
+        assert!(peak <= 1i64 << 31, "peak exceeded the i32 range");
+        // Mono content is duplicated across both channels.
+        assert!(buf.chunks(2).all(|frame| frame[0] == frame[1]));
     }
 
     #[test]

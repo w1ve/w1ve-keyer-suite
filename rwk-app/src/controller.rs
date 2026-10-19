@@ -98,7 +98,15 @@ impl Sidetone {
             .spawn(move || {
                 // The engine (and its cpal stream) lives entirely on this thread.
                 let mut engine = build_engine(hz, volume, &device, &shared);
+                // The settings the engine was last built with, so a failed stream can be rebuilt.
+                let (mut built_hz, mut built_volume) = (hz, volume);
+                let mut built_device = device.clone();
                 while let Ok(cmd) = rx.recv() {
+                    // A stream that errored (device unplugged, backend reset) renders nothing.
+                    // Rebuild it before handling the command, so the tone returns without a setting change.
+                    if engine.as_ref().is_some_and(SidetoneEngine::has_failed) {
+                        engine = build_engine(built_hz, built_volume, &built_device, &shared);
+                    }
                     match cmd {
                         ToneCmd::Key(true) => {
                             if let Some(e) = engine.as_ref() {
@@ -111,6 +119,9 @@ impl Sidetone {
                             }
                         }
                         ToneCmd::Reconfigure { hz, volume, device } => {
+                            built_hz = hz;
+                            built_volume = volume;
+                            built_device = device.clone();
                             engine = build_engine(hz, volume, &device, &shared);
                         }
                     }
@@ -1343,6 +1354,26 @@ impl ClientController {
     }
 }
 
+/// How long the Client waits without any inbound datagram from the Station before it declares the
+/// pairing lost. The Station answers every 250 ms, so five seconds is ample.
+const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The Station stopped answering: tear the pairing down as Unpair does, then report disconnected.
+async fn drop_lost_peer(shared: &Arc<Shared>) {
+    *shared.transport.lock().unwrap() = None;
+    shared.edge.detach();
+    if let Some(task) = shared.control_task.lock().unwrap().take() {
+        task.abort();
+    }
+    *shared.control_tx.lock().unwrap() = None;
+    if let Some(mut session) = shared.session.lock().await.take() {
+        session.shutdown().await;
+    }
+    shared.emit(ClientEvent::Rtt { ms: None });
+    shared.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
+    shared.log("warn", "The Station stopped responding; unpaired.");
+}
+
 /// Liveness heartbeat and round-trip probe for a paired link. Each tick it sends a heartbeat
 /// (so the Station's watchdogs see the Client alive) and a ping the Station answers; every
 /// fourth tick it reports the RTT to the UI. It runs only while `transport` is still the live
@@ -1354,21 +1385,26 @@ fn spawn_rtt_heartbeat(shared: Arc<Shared>, transport: Arc<EdgeTransport>) {
         let shared = Arc::clone(&shared);
         let transport = Arc::clone(&transport);
         tokio::spawn(async move {
+            // Any inbound datagram (the Station heartbeat or a pong) proves the Station is there.
+            let mut last_heard = std::time::Instant::now();
             loop {
                 match tokio::time::timeout(std::time::Duration::from_secs(1), transport.recv_edge()).await {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => last_heard = std::time::Instant::now(),
                     Ok(Err(_)) => return,
-                    Err(_) => {
-                        let live = shared
-                            .transport
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .is_some_and(|t| Arc::ptr_eq(t, &transport));
-                        if !live {
-                            return;
-                        }
-                    }
+                    Err(_) => {}
+                }
+                let live = shared
+                    .transport
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|t| Arc::ptr_eq(t, &transport));
+                if !live {
+                    return;
+                }
+                if last_heard.elapsed() >= PEER_TIMEOUT {
+                    drop_lost_peer(&shared).await;
+                    return;
                 }
             }
         });
