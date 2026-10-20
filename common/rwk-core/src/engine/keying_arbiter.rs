@@ -275,6 +275,40 @@ mod tests {
     }
 
     #[test]
+    fn replacing_the_output_redrives_the_current_state() {
+        let seen = Arc::new(Mutex::new(Vec::<LineUpdate>::new()));
+        let sink = Arc::clone(&seen);
+        let observer: LineObserver = Arc::new(move |u| sink.lock().unwrap().push(u));
+        let arbiter = KeyingArbiter::with_observer(SerialKeyingAdapter::led_only(), Some(observer));
+        let mut remote = arbiter.remote_output();
+        remote.set_key(true);
+        let before = seen.lock().unwrap().len();
+
+        arbiter.replace_adapter_with(SerialKeyingAdapter::led_only);
+
+        // The key is still down, so the new output must be driven and reported again.
+        let updates = seen.lock().unwrap();
+        assert!(updates.len() > before, "swap should re-notify the line state");
+        assert!(updates.last().unwrap().key_down);
+        assert_eq!(arbiter.active_source(), KeySource::Remote);
+    }
+
+    #[test]
+    fn local_priority_survives_an_output_swap() {
+        let arbiter = KeyingArbiter::new(SerialKeyingAdapter::led_only());
+        let local = arbiter.local_handle();
+        let mut remote = arbiter.remote_output();
+        remote.set_key(true);
+        local.set_key(true);
+
+        arbiter.replace_adapter_with(SerialKeyingAdapter::led_only);
+
+        assert_eq!(arbiter.active_source(), KeySource::Local);
+        local.set_key(false);
+        assert_eq!(arbiter.active_source(), KeySource::Remote);
+    }
+
+    #[test]
     fn remote_drives_the_line_when_local_is_idle() {
         assert_eq!(decide(true, true, false, false, false), (true, true));
         assert_eq!(decide(false, false, false, false, false), (false, false));

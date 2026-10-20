@@ -1358,6 +1358,11 @@ impl ClientController {
 /// pairing lost. The Station answers every 250 ms, so five seconds is ample.
 const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Whether the Station has been silent for at least [`PEER_TIMEOUT`] as of `now`.
+fn peer_silent(last_heard: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(last_heard) >= PEER_TIMEOUT
+}
+
 /// The Station stopped answering: tear the pairing down as Unpair does, then report disconnected.
 async fn drop_lost_peer(shared: &Arc<Shared>) {
     *shared.transport.lock().unwrap() = None;
@@ -1402,7 +1407,7 @@ fn spawn_rtt_heartbeat(shared: Arc<Shared>, transport: Arc<EdgeTransport>) {
                 if !live {
                     return;
                 }
-                if last_heard.elapsed() >= PEER_TIMEOUT {
+                if peer_silent(last_heard, std::time::Instant::now()) {
                     drop_lost_peer(&shared).await;
                     return;
                 }
@@ -2045,6 +2050,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         pred(&events.lock().unwrap())
+    }
+
+    #[test]
+    fn peer_is_lost_only_after_the_full_timeout() {
+        let heard = Instant::now();
+        assert!(!peer_silent(heard, heard));
+        assert!(!peer_silent(heard, heard + PEER_TIMEOUT - Duration::from_millis(1)));
+        assert!(peer_silent(heard, heard + PEER_TIMEOUT));
+        assert!(peer_silent(heard, heard + Duration::from_secs(30)));
     }
 
     #[test]
