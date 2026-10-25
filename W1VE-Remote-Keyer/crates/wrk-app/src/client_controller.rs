@@ -56,11 +56,15 @@ const RTT_EVERY_TICKS: u32 = 4;
 /// How long the Client waits without ANY inbound traffic from the Player (heartbeats or any
 /// datagram) before declaring the peer lost and reconnecting. Five seconds rides out a brief
 /// relay/roaming hiccup while still catching a Player that was closed.
-const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PEER_TIMEOUT: std::time::Duration = rwk_core::engine::reconnect::PEER_SILENCE_TIMEOUT;
 
 /// Consecutive failed reconnect attempts after which the Client gives up and stays
 /// disconnected (the operator must reconnect manually).
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+
+/// Budget for re-establishing a lost link (shared policy): after this long the Keyer gives up
+/// and reports disconnected.
+const RECONNECT_BUDGET: std::time::Duration = rwk_core::engine::reconnect::RECONNECT_WINDOW;
 
 /// Control identifiers for inline error messages in the UI.
 mod control {
@@ -817,7 +821,23 @@ impl ClientController {
             // stops heartbeating (closed, or the link dropped), reconnect automatically with the
             // same token, up to MAX_RECONNECT_ATTEMPTS consecutive failures before giving up.
             let mut attempts: u32 = 0;
+            // Opened when a link is lost; the Keyer retries within it, then reports disconnected.
+            let mut budget: Option<rwk_core::engine::reconnect::ReconnectWindow> = None;
             loop {
+                let window = *budget.get_or_insert_with(|| {
+                    rwk_core::engine::reconnect::ReconnectWindow::open(std::time::Instant::now())
+                });
+                let remaining = window.remaining(std::time::Instant::now());
+                if remaining.is_zero() {
+                    fail(
+                        &shared,
+                        format!(
+                            "Could not reach the Player within {}s; disconnected. Reconnect to try again.",
+                            RECONNECT_BUDGET.as_secs()
+                        ),
+                    );
+                    return;
+                }
                 let base = shared.config.lock().unwrap().clone();
                 let config =
                     match pairing::build_config(&base, Role::Client, transport, &token, &relay) {
@@ -825,11 +845,15 @@ impl ClientController {
                         Err(e) => return fail(&shared, e),
                     };
 
-                match tunnel::connect(&config).await {
-                    Ok(connected) => {
+                // Each attempt is capped by the budget left, so pairing cannot hang past it.
+                let attempt = tokio::time::timeout(remaining, tunnel::connect(&config)).await;
+                match attempt {
+                    Err(_) => shared.log("warn", "link failed: reconnect budget elapsed"),
+                    Ok(Ok(connected)) => {
                         if let Some(edge) = bring_up_keying(&shared, connected).await {
                             // Connected: a successful pairing clears the failure budget.
                             attempts = 0;
+                            budget = None;
                             let outcome = watch_edge_liveness(edge, Arc::clone(&shared)).await;
                             // Tear the dead session down before retrying.
                             teardown_session(&shared).await;
@@ -837,6 +861,7 @@ impl ClientController {
                                 // A deliberate local teardown (unpair) ends the supervisor.
                                 return;
                             }
+                            // Link lost: a fresh reconnect window opens on the next pass.
                             shared.log("warn", "Player stopped responding; reconnecting…");
                             shared.emit(ClientEvent::Connection {
                                 state: "connecting".into(),
@@ -846,7 +871,7 @@ impl ClientController {
                         }
                         // bring_up failed after a link came up; count it as an attempt.
                     }
-                    Err(e) => shared.log("warn", format!("link failed: {e}")),
+                    Ok(Err(e)) => shared.log("warn", format!("link failed: {e}")),
                 }
 
                 attempts += 1;

@@ -34,6 +34,15 @@ pub struct RelayClient {
     peer_key: [u8; KEY_LEN],
     /// Datagrams delivered by the relay, filled by the reader task.
     inbound: mpsc::Receiver<Vec<u8>>,
+    /// The reader task. Aborted on drop so the read half (and with it the socket) is released
+    /// even while a `RelaySender` clone still holds the write half.
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RelayClient {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 /// The peer the relay introduced us to, from a [`pair`] rendezvous.
@@ -124,7 +133,7 @@ impl RelayClient {
         write_half.write_all(&Frame::Register { key: my_key }.encode()).await?;
 
         let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(INBOUND_DEPTH);
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             loop {
                 match read_frame(&mut read_half).await {
                     // Deliver a received datagram; stop if the consumer is gone.
@@ -141,7 +150,7 @@ impl RelayClient {
             }
         });
 
-        Ok(Self { writer: Arc::new(Mutex::new(write_half)), peer_key, inbound: in_rx })
+        Ok(Self { writer: Arc::new(Mutex::new(write_half)), peer_key, inbound: in_rx, reader })
     }
 
     /// Sends one datagram to the peer, over the relay.
@@ -260,6 +269,31 @@ mod tests {
             .expect("reply did not arrive")
             .expect("relay connection closed");
         assert_eq!(reply, b"handshake-response");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_client_releases_its_relay_route() {
+        let server = RelayServer::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let metrics = server.metrics();
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        let a = RelayClient::connect(addr, A_KEY, B_KEY).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(metrics.active(), 1);
+        drop(a);
+        // The relay must see EOF and drop the route, so `active` returns to zero.
+        for _ in 0..50 {
+            if metrics.active() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(metrics.active(), 0, "dropped client must release its registration");
+        // And the same node can pair again afterwards.
+        let again = RelayClient::connect(addr, A_KEY, B_KEY).await;
+        assert!(again.is_ok());
     }
 
     #[tokio::test]

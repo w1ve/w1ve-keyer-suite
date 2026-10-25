@@ -445,7 +445,10 @@ async fn handle_pair(
         }
     }
 
-    match table.remove(code) {
+    // A waiter whose connection has closed can never answer. Discard it rather than introduce
+    // this node to a dead partner; this node then parks as the new waiter.
+    let live = table.remove(code).filter(|partner| !partner.out.is_closed());
+    match live {
         // A partner is already waiting: introduce the two and clear the code.
         Some(partner) => {
             // Tell the partner about us…
@@ -539,7 +542,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::relay::RelayClient;
+    use crate::engine::relay::{pair, RelayClient};
     use std::time::Duration;
 
     const A: [u8; KEY_LEN] = [0xA1; KEY_LEN];
@@ -596,6 +599,19 @@ mod tests {
         let mut budget = RateBudget::new(10);
         assert!(budget.allow(10), "first datagram fits the budget");
         assert!(!budget.allow(1), "the next byte is over budget this window");
+    }
+
+    #[tokio::test]
+    async fn a_closed_pairing_waiter_is_not_handed_out() {
+        let (addr, _metrics) = spawn(RelayLimits::unlimited()).await;
+        // A waits on a code, then gives up (its connection closes).
+        let abandoned = pair(addr, A, 1, "STALE", Duration::from_millis(100)).await;
+        assert!(abandoned.is_err());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // B arriving on the same code must not be introduced to the dead A; it parks instead,
+        // so it times out rather than receiving a bogus peer.
+        let b = pair(addr, B, 2, "STALE", Duration::from_millis(300)).await;
+        assert!(b.is_err(), "a dead waiter must not satisfy a new pairing");
     }
 
     #[tokio::test]

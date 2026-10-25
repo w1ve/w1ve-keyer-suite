@@ -16,6 +16,7 @@
 //! * [`tunnel_forward`] — port forwarders whose far leg is a tunnel socket (ride WireGuard).
 //! * [`relay`] — a minimal packet relay (NAT-traversal fallback) keyed by public key.
 //! * [`session`] — a running session: netstack + forwarders wired over a connected tunnel.
+//! * [`reconnect`] — peer-silence and reconnect-window policy shared by every link end.
 //! * [`replay`] — the Station edge replayer: jitter buffer, fail-safes, watchdogs.
 //! * [`control`] — the Client↔Station control channel (forward rules, discovery announce).
 //! * [`flex_discovery`] — FlexRadio VITA-49 LAN capture + re-broadcast.
@@ -37,6 +38,7 @@ pub mod keying_arbiter;
 pub mod netstack;
 pub mod paddle;
 pub mod paddle_input;
+pub mod reconnect;
 pub mod netstack_driver;
 pub mod network;
 pub mod relay;

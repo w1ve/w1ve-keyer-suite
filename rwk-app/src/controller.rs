@@ -1356,7 +1356,7 @@ impl ClientController {
 
 /// How long the Client waits without any inbound datagram from the Station before it declares the
 /// pairing lost. The Station answers every 250 ms, so five seconds is ample.
-const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PEER_TIMEOUT: std::time::Duration = rwk_core::engine::reconnect::PEER_SILENCE_TIMEOUT;
 
 /// Whether the Station has been silent for at least [`PEER_TIMEOUT`] as of `now`.
 fn peer_silent(last_heard: std::time::Instant, now: std::time::Instant) -> bool {
