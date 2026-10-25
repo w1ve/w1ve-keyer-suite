@@ -299,6 +299,8 @@ pub struct EdgeTransport {
     health: PathHealth,
     /// The latest round-trip time in nanoseconds, from a pong. `0` means no sample yet.
     rtt_nanos: AtomicU64,
+    /// Monotonic nanoseconds of the last datagram accepted from the peer. See [`Self::peer_silent_for`].
+    last_heard_nanos: AtomicU64,
 }
 
 impl EdgeTransport {
@@ -332,6 +334,7 @@ impl EdgeTransport {
             stats: Arc::new(EdgeStats::default()),
             health: PathHealth::new(),
             rtt_nanos: AtomicU64::new(0),
+            last_heard_nanos: AtomicU64::new(monotonic_nanos()),
         }
     }
 
@@ -371,6 +374,16 @@ impl EdgeTransport {
     /// The configured peer, if any.
     pub async fn peer(&self) -> Option<SocketAddr> {
         *self.peer.lock().await
+    }
+
+    /// How long it has been since the peer last sent an accepted datagram: a frame, heartbeat,
+    /// ping or pong from the configured source. Starts counting when the transport is created.
+    /// The Player's silence watchdog reads this to detect a Keyer that has gone away.
+    #[must_use]
+    pub fn peer_silent_for(&self) -> Duration {
+        Duration::from_nanos(
+            monotonic_nanos().saturating_sub(self.last_heard_nanos.load(Ordering::Relaxed)),
+        )
     }
 
     /// Sends one edge frame to the configured peer.
@@ -564,6 +577,9 @@ impl EdgeTransport {
                 return Ok(None);
             }
         }
+
+        // Any datagram from the configured peer proves it is alive.
+        self.last_heard_nanos.store(monotonic_nanos(), Ordering::Relaxed);
 
         // A heartbeat is the exact 4-byte magic and nothing more: classify it first, since it
         // is shorter than any frame and would otherwise be counted as malformed.
@@ -984,6 +1000,21 @@ mod tests {
         assert_eq!(a.recv_edge().await.unwrap(), Some(EdgeInbound::Control));
         let rtt = a.rtt().expect("a pong sets the round trip");
         assert!(rtt < Duration::from_secs(5), "loopback RTT was {rtt:?}");
+    }
+
+    #[tokio::test]
+    async fn peer_silence_resets_on_any_accepted_datagram() {
+        let a = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = EdgeTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        a.set_peer(b.local_addr().unwrap()).await;
+        b.set_peer(a.local_addr().unwrap()).await;
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(a.peer_silent_for() >= Duration::from_millis(50));
+
+        b.send_heartbeat().await.unwrap();
+        assert_eq!(a.recv_edge().await.unwrap(), Some(EdgeInbound::Heartbeat));
+        assert!(a.peer_silent_for() < Duration::from_millis(50));
     }
 
     #[tokio::test]

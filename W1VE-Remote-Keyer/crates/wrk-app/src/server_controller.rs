@@ -15,6 +15,7 @@ use rwk_core::engine::bus::{CoreEvent, EventBus};
 use rwk_core::engine::edge_station::{pump_edges, tunnel_replayer};
 use rwk_core::engine::keying_arbiter::{KeyingArbiter, LineObserver, LineUpdate};
 use rwk_core::engine::network::EdgeTransport;
+use rwk_core::engine::reconnect::PEER_SILENCE_TIMEOUT;
 use rwk_core::engine::replay::{spawn_driver, EdgeJitterProfile, SerialKeyingAdapter};
 use rwk_core::engine::serial::{
     enumerate_ports, natural_port_key, KeyingOutputConfig, PttTiming, SerialKeyingOutput,
@@ -745,6 +746,31 @@ impl Drop for ServerController {
     }
 }
 
+/// The Client stopped sending: end the pairing as `disconnect` does, then report disconnected.
+///
+/// The session is taken out of the slot first, so a later `listen` or `connect_lan` can start at
+/// once. The keying output is forced up by the session's shutdown and the replay driver's own
+/// fail-safes, so the radio is never left keyed. A session already removed by an operator Stop is
+/// left alone, which keeps teardown idempotent.
+async fn drop_lost_peer(shared: &Arc<Shared>, slot: &Arc<Mutex<Option<ActiveSession>>>) {
+    let Some(mut active) = slot.lock().unwrap().take() else {
+        return;
+    };
+    active.stop_bus.store(true, Ordering::SeqCst);
+    if let Some(mut logger) = active.logger.take() {
+        logger.stop();
+    }
+    // The heartbeat task is the caller and returns right after this, so it is not aborted here.
+    active.pump.abort();
+    active.session.shutdown().await;
+    shared.emit(ServerEvent::KeyState { down: false });
+    shared.emit(ServerEvent::Ptt { asserted: false });
+    shared.emit(ServerEvent::LoggerSending { active: false });
+    shared.emit(ServerEvent::Rtt { ms: None });
+    shared.emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
+    shared.log("warn", "The Client stopped responding; disconnected.");
+}
+
 /// The edge's round-trip time in whole milliseconds, or [`None`] before the first pong.
 fn rtt_millis(edge: &EdgeTransport) -> Option<u32> {
     edge.rtt().map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
@@ -803,11 +829,19 @@ async fn bring_up_replay(
     // the UI shows.
     let hb_edge = Arc::clone(&edge);
     let rtt_shared = Arc::clone(shared);
+    let watch_slot = Arc::clone(active_slot);
+    let watch_edge = Arc::clone(&edge);
     let heartbeat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
         let mut beats: u32 = 0;
         loop {
             tick.tick().await;
+            // Silence watchdog: the Client's heartbeats and pings arrive on the same edge, so a
+            // long gap means it has closed or lost its link. Tear the pairing down now.
+            if watch_edge.peer_silent_for() >= PEER_SILENCE_TIMEOUT {
+                drop_lost_peer(&rtt_shared, &watch_slot).await;
+                return;
+            }
             if hb_edge.send_heartbeat().await.is_err() {
                 // A failed heartbeat is already folded into PathHealth/F9; keep beaconing.
             }
