@@ -1313,7 +1313,14 @@ impl ClientController {
             // Remember the relay + code for next launch.
             shared.persist_pairing(relay_addr, &code);
 
-            let connected = match tunnel::connect(&config).await {
+            // The first rendezvous can race the relay or the peer's arrival; retry once before
+            // reporting the relay as unreachable.
+            let mut attempt = tunnel::connect(&config).await;
+            if attempt.is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                attempt = tunnel::connect(&config).await;
+            }
+            let connected = match attempt {
                 Ok(c) => c,
                 Err(e) => {
                     // The relay did not answer: ask the operator for a relay address.
@@ -1371,12 +1378,13 @@ async fn drop_lost_peer(shared: &Arc<Shared>) {
         task.abort();
     }
     *shared.control_tx.lock().unwrap() = None;
-    if let Some(mut session) = shared.session.lock().await.take() {
-        session.shutdown().await;
-    }
+    // Report the teardown before awaiting the session, so the UI cannot stay on a live pairing.
     shared.emit(ClientEvent::Rtt { ms: None });
     shared.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
     shared.log("warn", "The Station stopped responding; unpaired.");
+    if let Some(mut session) = shared.session.lock().await.take() {
+        session.shutdown().await;
+    }
 }
 
 /// Liveness heartbeat and round-trip probe for a paired link. Each tick it sends a heartbeat

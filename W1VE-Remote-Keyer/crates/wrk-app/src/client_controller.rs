@@ -902,6 +902,12 @@ impl ClientController {
         // Ends the pairing's ordered tunnel FIFO; the next pairing starts a fresh one.
         self.shared.edge.detach();
         let shared = Arc::clone(&self.shared);
+        // Report the teardown before blocking on the session, so the UI cannot stay on a live
+        // pairing behind a stuck shutdown.
+        self.shared.emit(ClientEvent::Advertising { active: false });
+        self.shared
+            .emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
+        self.shared.log("info", "Unpaired.");
         self.runtime.block_on(async move {
             if let Some(task) = shared.supervisor.lock().await.take() {
                 task.abort();
@@ -913,10 +919,6 @@ impl ClientController {
                 session.shutdown().await;
             }
         });
-        self.shared.emit(ClientEvent::Advertising { active: false });
-        self.shared
-            .emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
-        self.shared.log("info", "Unpaired.");
     }
 }
 

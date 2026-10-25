@@ -727,8 +727,8 @@ impl ServerController {
             }
             active.heartbeat.abort();
             active.pump.abort();
-            let mut session = active.session;
-            self.runtime.block_on(async { session.shutdown().await });
+            // Report the teardown before blocking on the session, so the UI cannot stay on a
+            // live link behind a stuck shutdown.
             self.shared.emit(ServerEvent::KeyState { down: false });
             self.shared.emit(ServerEvent::Ptt { asserted: false });
             self.shared.emit(ServerEvent::LoggerSending { active: false });
@@ -736,6 +736,8 @@ impl ServerController {
             self.shared
                 .emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
             self.shared.log("info", "Stopped.");
+            let mut session = active.session;
+            self.runtime.block_on(async { session.shutdown().await });
         }
     }
 }
@@ -762,13 +764,15 @@ async fn drop_lost_peer(shared: &Arc<Shared>, slot: &Arc<Mutex<Option<ActiveSess
     }
     // The heartbeat task is the caller and returns right after this, so it is not aborted here.
     active.pump.abort();
-    active.session.shutdown().await;
+    // Report the teardown before awaiting the session, so the UI cannot stay on a live link
+    // behind a blocked shutdown.
     shared.emit(ServerEvent::KeyState { down: false });
     shared.emit(ServerEvent::Ptt { asserted: false });
     shared.emit(ServerEvent::LoggerSending { active: false });
     shared.emit(ServerEvent::Rtt { ms: None });
     shared.emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
     shared.log("warn", "The Client stopped responding; disconnected.");
+    active.session.shutdown().await;
 }
 
 /// The edge's round-trip time in whole milliseconds, or [`None`] before the first pong.

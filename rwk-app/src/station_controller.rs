@@ -1049,8 +1049,16 @@ async fn bring_up_station(
     let logger = open_logger(shared, &arbiter, logger_port, logger_enabled);
 
     let stop_bus = Arc::new(AtomicBool::new(false));
-    spawn_bus_forwarder(bus, Arc::clone(shared), Arc::clone(&stop_bus));
-    spawn_rtt_probe(Arc::clone(shared), Arc::clone(&transport), Arc::clone(&stop_bus));
+    // Set when the replay stack closes the session (F2), so the watchdog can unpair.
+    let session_closed = Arc::new(AtomicBool::new(false));
+    spawn_bus_forwarder(bus, Arc::clone(shared), Arc::clone(&stop_bus), Arc::clone(&session_closed));
+    spawn_rtt_probe(
+        Arc::clone(shared),
+        Arc::clone(&transport),
+        Arc::clone(&stop_bus),
+        Arc::clone(active_slot),
+        Arc::clone(&session_closed),
+    );
 
     let pump = tokio::spawn(pump_edges(Arc::clone(&transport), driver));
 
@@ -1078,13 +1086,48 @@ async fn bring_up_station(
 /// Heartbeat and round-trip probe for the Station's link. Each quarter second it sends a heartbeat
 /// and a ping (the Client answers, and its pong sets the round trip); every fourth tick it reports
 /// the RTT to the UI. It stops when the session's stop flag is set.
-fn spawn_rtt_probe(shared: Arc<Shared>, transport: Arc<EdgeTransport>, stop: Arc<AtomicBool>) {
+fn spawn_rtt_probe(
+    shared: Arc<Shared>,
+    transport: Arc<EdgeTransport>,
+    stop: Arc<AtomicBool>,
+    active_slot: Arc<Mutex<Option<ActiveSession>>>,
+    session_closed: Arc<AtomicBool>,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         let mut beats: u32 = 0;
         loop {
             tick.tick().await;
             if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            // The Client has gone silent, or the replay stack closed the session (F2): tear the
+            // pairing down so the UI returns to Start.
+            let closed = session_closed.load(Ordering::SeqCst);
+            if closed || transport.peer_silent_for() >= rwk_core::engine::reconnect::PEER_SILENCE_TIMEOUT {
+                let taken = active_slot.lock().unwrap().take();
+                if let Some(mut active) = taken {
+                    active.stop_bus.store(true, Ordering::SeqCst);
+                    if let Some(mut logger) = active.logger.take() {
+                        logger.stop();
+                    }
+                    active.pump.abort();
+                    active.control.abort();
+                    // Report the teardown before awaiting the session, so the UI can never be
+                    // left showing a live pairing behind a blocked shutdown.
+                    shared.emit(StationEvent::KeyState { down: false });
+                    shared.emit(StationEvent::Ptt { asserted: false });
+                    shared.emit(StationEvent::LoggerSending { active: false });
+                    shared.emit(StationEvent::ForwardRules { rules: Vec::new() });
+                    shared.emit(StationEvent::FlexDiscovery { enabled: false });
+                    shared.emit(StationEvent::Rtt { ms: None });
+                    shared.emit(StationEvent::Connection {
+                        state: "disconnected".into(),
+                        path: "none".into(),
+                    });
+                    shared.log("warn", "The Client stopped responding; unpaired.");
+                    active.session.lock().await.shutdown().await;
+                }
                 return;
             }
             let _ = transport.send_heartbeat().await;
@@ -1222,7 +1265,7 @@ fn spawn_flex_listener(
 
 /// Forwards fail-safe events published on the replay driver's bus to the UI sink until
 /// `stop` is set. Runs on a blocking thread because the bus receiver is synchronous.
-fn spawn_bus_forwarder(bus: EventBus, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
+fn spawn_bus_forwarder(bus: EventBus, shared: Arc<Shared>, stop: Arc<AtomicBool>, closed: Arc<AtomicBool>) {
     std::thread::Builder::new()
         .name("rwk-station-bus".into())
         .spawn(move || {
@@ -1230,6 +1273,10 @@ fn spawn_bus_forwarder(bus: EventBus, shared: Arc<Shared>, stop: Arc<AtomicBool>
             while !stop.load(Ordering::SeqCst) {
                 match rx.try_recv() {
                     Ok(CoreEvent::FailSafe { code, message }) => {
+                        // F2 closes the session; the watchdog unpairs when it sees this flag.
+                        if code == 2 {
+                            closed.store(true, Ordering::SeqCst);
+                        }
                         shared.emit(StationEvent::FailSafe { code, message: message.clone() });
                         shared.log("warn", format!("Fail-safe F{code}: {message}"));
                     }
