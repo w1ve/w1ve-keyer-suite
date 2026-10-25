@@ -350,6 +350,10 @@ pub fn run_station() {
                 let _ = window.set_title(
                     "W1VE Remote Keyer-Router Station — Any Rig, Any Internet, Anytime",
                 );
+                // A compact site window: about half of a 1024x768 screen. The shared config's
+                // 980x640 window (minimum 900x560) is too wide for a Station, so override it here.
+                let _ = window.set_min_size(Some(tauri::LogicalSize::new(480.0, 560.0)));
+                let _ = window.set_size(tauri::LogicalSize::new(512.0, 700.0));
                 window_handle_isize(&window)
             } else {
                 None

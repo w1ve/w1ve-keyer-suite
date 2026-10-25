@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+default-run = "w1ve-rkr"
 
 # The Client (operating-position) binary.
 [[bin]]

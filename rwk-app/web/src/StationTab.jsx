@@ -26,6 +26,8 @@ export default function StationTab({
   // The PTT hang is bound when a pairing starts, so it is locked while linked. Ports and lines
   // take effect at once.
   const hangLocked = running || connecting;
+  const pttNone = settings.pttLine === "none";
+  const hangDisabled = hangLocked || pttNone;
 
   // Keep the picked keyer valid as the live list changes.
   useEffect(() => {
@@ -38,11 +40,18 @@ export default function StationTab({
 
   return (
     <div className="tabbody">
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <div className="panel-row" style={{ gridTemplateColumns: "1fr 1fr" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, position: "relative", minHeight: "100%" }}>
+        <div style={{ position: "relative", display: "flex", flexDirection: "column", gap: 12, flex: 1, minHeight: 0 }}>
+        {!running && (
+          <div
+            aria-hidden="true"
+            style={{ position: "absolute", inset: 0, zIndex: 1, background: "rgba(255, 255, 255, 0.5)", borderRadius: 6 }}
+          />
+        )}
+        <div className="station-row">
           <div className="panel">
             <h3>Keying Status</h3>
-            <div className="row" style={{ gap: 24, justifyContent: "center", padding: "8px 0" }}>
+            <div className="row" style={{ gap: 18, justifyContent: "center", padding: "2px 0" }}>
               <Indicator label="KEY" on={keyDown} onColor="var(--key-on)" />
               <Indicator label="PTT" on={pttOn} onColor="var(--ptt-on)" />
             </div>
@@ -69,14 +78,16 @@ export default function StationTab({
 
           <div className="panel">
             <h3>Keying Output</h3>
-            <PortSelect
-              label="Serial port (rig key line)"
-              value={settings.keyingPort || ""}
-              ports={ports}
-              error={errors.keying}
-              onChange={(p) => api.selectKeyingPort(p || null)}
-            />
-            <div className="row" style={{ gap: 10 }}>
+            <div className="row" style={{ gap: 10, alignItems: "flex-end" }}>
+              <div style={{ flex: 1.6 }}>
+                <PortSelect
+                  label="Serial port (rig key line)"
+                  value={settings.keyingPort || ""}
+                  ports={ports}
+                  error={errors.keying}
+                  onChange={(p) => api.selectKeyingPort(p || null)}
+                />
+              </div>
               <div className="field" style={{ flex: 1, marginBottom: 0 }}>
                 <label>Key line</label>                  <select
                     value={settings.keyLine}
@@ -97,8 +108,7 @@ export default function StationTab({
                   <option value="none">None</option>
                 </select>
               </div>
-            </div>
-            <div className="field" style={{ marginTop: 8 }}>
+              <div className="field" style={{ flex: "0 0 170px", marginBottom: 0, opacity: pttNone ? 0.45 : 1 }}>
               <label>PTT hang: {settings.pttHangMs} ms</label>
               <input
                 type="range"
@@ -106,7 +116,7 @@ export default function StationTab({
                 max={600}
                 step={5}
                 value={settings.pttHangMs}
-                disabled={hangLocked}
+                disabled={hangDisabled}
                 onChange={(e) => {
                   const v = Number(e.target.value);
                   setSettings((s) => ({ ...s, pttHangMs: v }));
@@ -114,6 +124,7 @@ export default function StationTab({
                 onPointerUp={(e) => api.setPttHang(Number(e.currentTarget.value))}
                 onKeyUp={(e) => api.setPttHang(Number(e.currentTarget.value))}
               />
+              </div>
             </div>
             <PortSelect
               label="Logger COM port (WinKeyer, optional)"
@@ -131,13 +142,12 @@ export default function StationTab({
         </div>
 
         {/* ─── Port forwards pushed from the Operator (read-only) ───────── */}
-        <div className="panel">
+        <div className="panel" style={{ flex: 1, minHeight: 120, overflowY: "auto", display: "flex", flexDirection: "column" }}>
           <h3>Port Forwards (from Operator)</h3>
           {rules.length === 0 ? (
-            <p style={{ color: "var(--text-dim)", fontSize: 13, margin: 0 }}>
-              No port forwards yet. Rules are set on the Operator's Ham Router tab and sent here
-              automatically when you pair.
-            </p>
+            <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-dim)", fontSize: 13 }}>
+              (Port Forwards show here.)
+            </div>
           ) : (
             <table className="rules">
               <thead>
@@ -168,8 +178,10 @@ export default function StationTab({
           )}
         </div>
 
-        {/* ─── Pairing ───────────────────────────────────────── */}
-        <div className="panel">
+        </div>
+
+        {/* ─── Pairing (first on the page; overlays the rest until linked) ─── */}
+        <div className="panel" style={{ order: -1, position: "relative", zIndex: 2, background: "var(--bg-panel)" }}>
           <h3>Pairing</h3>
           <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
             <div>
@@ -280,8 +292,8 @@ function Indicator({ label, on, onColor }) {
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
       <div
         style={{
-          width: 44,
-          height: 44,
+          width: 26,
+          height: 26,
           borderRadius: "50%",
           background: on ? onColor : "var(--bg-panel-2)",
           border: `2px solid ${on ? onColor : "var(--border)"}`,
@@ -289,7 +301,7 @@ function Indicator({ label, on, onColor }) {
           transition: "background 40ms, box-shadow 40ms",
         }}
       />
-      <span style={{ fontSize: 13, fontWeight: 700, color: on ? onColor : "var(--text-dim)" }}>{label}</span>
+      <span style={{ fontSize: 11, fontWeight: 700, color: on ? onColor : "var(--text-dim)" }}>{label}</span>
     </div>
   );
 }

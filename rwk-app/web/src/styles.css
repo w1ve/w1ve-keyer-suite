@@ -268,6 +268,46 @@ input[type="range"] {
 }
 
 /* Status strip */
+.splash {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  background: #000;
+}
+
+/* The hero spans 75% of the window width and keeps its aspect ratio, centred. */
+.splash-frame {
+  position: relative;
+  width: 75%;
+}
+
+.splash-hero {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.splash-title {
+  position: absolute;
+  top: 6%;
+  left: 4%;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.splash-name {
+  font-size: 16px;
+  font-weight: 700;
+  color: #b6fcfe;
+}
+
+.splash-version {
+  font-size: 11px;
+  color: #fff;
+}
+
 .statusbar {
   display: flex;
   align-items: center;
@@ -357,6 +397,68 @@ table.rules code {
 .segmented button.active {
   background: var(--accent-dim);
   color: var(--text);
+}
+
+/* Station window (StationApp.jsx): a compact single column that fits about half a 1024x768 screen. */
+.app.station {
+  font-size: 12px;
+}
+
+.app.station .statusbar {
+  padding: 3px 8px;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.app.station .tab {
+  padding: 3px 12px;
+  font-size: 12px;
+}
+
+.app.station .tabbody {
+  padding: 6px;
+}
+
+.app.station .station-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.app.station .panel {
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+
+.app.station .panel h3 {
+  margin: 0 0 4px;
+  font-size: 10px;
+}
+
+.app.station .field {
+  margin-bottom: 6px;
+}
+
+.app.station .field label {
+  font-size: 10px;
+  margin-bottom: 2px;
+}
+
+.app.station select,
+.app.station input[type="text"],
+.app.station input[type="number"] {
+  padding: 2px 6px;
+  font-size: 11px;
+}
+
+.app.station button {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+.app.station .log-entries {
+  font-size: 10px;
+  max-height: none;
 }
 
 /* Pairing token readout (Server) */

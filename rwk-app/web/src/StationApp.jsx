@@ -3,6 +3,10 @@ import { onRwkEvent, stationApi } from "./station-api.js";
 import StationTab from "./StationTab.jsx";
 import RelayDialog, { DEFAULT_WAN_RELAY } from "./RelayDialog.jsx";
 import { LogEntries } from "./LogPanel.jsx";
+import ConnectionsTab from "./ConnectionsTab.jsx";
+import SplashScreen from "./SplashScreen.jsx";
+
+const SPLASH_MS = 5000;
 
 const DEFAULT_SETTINGS = {
   keyingPort: null,
@@ -15,9 +19,9 @@ const DEFAULT_SETTINGS = {
   transport: "wan",
 };
 
-// The Station application shell: the Remote Keyer Player's status bar (RTT, then Disconnected /
-// Pairing / Direct / DERP at the top right), the station body, and a log drawer. The bottom strip
-// shows the KEY and PTT state. It shares the `rwk://event` stream with the Client.
+// The Station application shell: a compact window with a Main tab (keying, forwards, pairing) and
+// a Log tab. The header shows the link state and the bottom strip shows KEY and PTT on both tabs.
+// It shares the `rwk://event` stream with the Client.
 export default function StationApp() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [connection, setConnection] = useState({ state: "disconnected", path: "none" });
@@ -31,9 +35,15 @@ export default function StationApp() {
   const [rules, setRules] = useState([]); // port forwards pushed from the Operator (read-only)
   const [flexEnabled, setFlexEnabled] = useState(false); // FlexRadio discovery is being relayed
   const [log, setLog] = useState([]);
-  const [logOpen, setLogOpen] = useState(false);
+  const [tab, setTab] = useState("main"); // "main" | "log"
   const [relayPrompt, setRelayPrompt] = useState(false);
   const unlisten = useRef(null);
+  const [splash, setSplash] = useState(true);
+
+  useEffect(() => {
+    const t = setTimeout(() => setSplash(false), SPLASH_MS);
+    return () => clearTimeout(t);
+  }, []);
 
   useEffect(() => {
     onRwkEvent((ev) => {
@@ -129,54 +139,60 @@ export default function StationApp() {
       : "Disconnected";
   const linkColor = running ? "var(--good)" : connecting ? "var(--warn)" : "var(--text-dim)";
 
+  if (splash) return <SplashScreen />;
+
   return (
-    <div className="app">
-      <div className="statusbar" style={{ borderTop: "none", borderBottom: "1px solid var(--border)" }}>
-        <strong style={{ color: "var(--accent)" }}>W1VE Remote Keyer-Router — Station</strong>
+    <div className="app station">
+      <div className="statusbar">
+        <strong style={{ color: "var(--accent)" }}>RWK Station</strong>
         <span className="spring" />
         {running && <span>RTT {rtt ?? "—"} ms</span>}
-        {running && <span style={{ margin: "0 8px", color: "var(--text-dim)" }}>|</span>}
         <span className="led" style={{ color: linkColor }}>
           ●
         </span>
         <span>{pathText}</span>
       </div>
 
-      <StationTab
-        settings={settings}
-        setSettings={setSettings}
-        connection={connection}
-        keyDown={keyDown}
-        pttOn={pttOn}
-        lastFailSafe={lastFailSafe}
-        lanPeers={lanPeers}
-        ports={ports}
-        errors={errors}
-        rules={rules}
-        onListen={onListen}
-      />
+      <div className="tabbar">
+        <button type="button" className={`tab${tab === "main" ? " active" : ""}`} onClick={() => setTab("main")}>
+          Main
+        </button>
+        <button type="button" className={`tab${tab === "connections" ? " active" : ""}`} onClick={() => setTab("connections")}>
+          Connections
+        </button>
+        <button type="button" className={`tab${tab === "log" ? " active" : ""}`} onClick={() => setTab("log")}>
+          Log
+        </button>
+      </div>
 
-      {/* The log opens above the status bar and only then adds height. */}
-      {logOpen && (
-        <div className="panel log-drawer">
-          <LogEntries log={log} />
+      {tab === "connections" ? (
+        <ConnectionsTab />
+      ) : tab === "main" ? (
+        <StationTab
+          settings={settings}
+          setSettings={setSettings}
+          connection={connection}
+          keyDown={keyDown}
+          pttOn={pttOn}
+          lastFailSafe={lastFailSafe}
+          lanPeers={lanPeers}
+          ports={ports}
+          errors={errors}
+          rules={rules}
+          onListen={onListen}
+        />
+      ) : (
+        <div className="tabbody">
+          <div className="panel">
+            <LogEntries log={log} fill />
+          </div>
         </div>
       )}
 
       <div className="statusbar">
-        <button
-          type="button"
-          className="log-toggle"
-          aria-expanded={logOpen}
-          onClick={() => setLogOpen((o) => !o)}
-          style={{ width: "auto" }}
-        >
-          <span>Log</span>
-          <span className="log-glyph">{logOpen ? "v" : "^"}</span>
-        </button>
         {flexEnabled && (
           <span style={{ color: "var(--good)" }} title="FlexRadio VITA-49 discovery is being relayed to the Client">
-            ● FlexRadio discovery on
+            ● FlexRadio
           </span>
         )}
         <span className="spring" />

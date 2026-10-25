@@ -1,15 +1,17 @@
 import { useState } from "react";
 
 // The scrolling list of log entries, shared by the Keyer and the Player.
-export function LogEntries({ log }) {
+// `fill` lets the list take the height of its tab instead of the 140px drawer height.
+export function LogEntries({ log, fill = false }) {
   return (
     <div
+      className={fill ? "log-entries" : undefined}
       style={{
         fontFamily: "Consolas, monospace",
         fontSize: 12,
         whiteSpace: "pre-wrap",
         color: "var(--text-dim)",
-        maxHeight: 140,
+        maxHeight: fill ? undefined : 140,
         overflow: "auto",
       }}
     >
