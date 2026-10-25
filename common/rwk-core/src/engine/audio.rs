@@ -280,19 +280,20 @@ impl SidetoneEngine {
     pub fn output_devices_marked() -> Vec<(String, bool)> {
         let host = cpal::default_host();
         let default_name = host.default_output_device().and_then(|d| d.name().ok());
-        let mut names: Vec<String> = match host.output_devices() {
-            Ok(devices) => devices.filter_map(|d| d.name().ok()).collect(),
+        let mut entries: Vec<(String, bool)> = match host.output_devices() {
+            Ok(devices) => devices
+                .filter_map(|d| d.name().ok())
+                .filter(|name| listed_in_picker(name))
+                .map(|name| {
+                    let is_default = default_name.as_deref() == Some(name.as_str());
+                    (device_label(&name), is_default)
+                })
+                .collect(),
             Err(_) => Vec::new(),
         };
-        names.sort();
-        names.dedup();
-        names
-            .into_iter()
-            .map(|name| {
-                let is_default = default_name.as_deref() == Some(name.as_str());
-                (name, is_default)
-            })
-            .collect()
+        entries.sort();
+        entries.dedup_by(|a, b| a.0 == b.0);
+        entries
     }
 
     /// Starts (or restarts) the output stream on the default output device.
@@ -329,7 +330,7 @@ impl SidetoneEngine {
             Some(wanted) => host
                 .output_devices()
                 .ok()
-                .and_then(|mut devs| devs.find(|d| d.name().map(|n| n == wanted).unwrap_or(false)))
+                .and_then(|mut devs| devs.find(|d| d.name().map(|n| n == wanted || device_label(&n) == wanted).unwrap_or(false)))
                 .or_else(|| host.default_output_device())
                 .ok_or_else(|| crate::Error::Audio("no output device".into()))?,
             None => host
@@ -498,9 +499,82 @@ fn fill_channels<T>(
     }
 }
 
+/// Whether an output device name belongs in the picker. ALSA on Linux lists each card many times
+/// (`hw:`, `plughw:`, `front:`, `surround…`, `dmix:`); only the `sysdefault:` entry per card is
+/// shown. Names without a card, such as the `default` alias or devices from other hosts, are always
+/// shown.
+fn listed_in_picker(name: &str) -> bool {
+    !name.contains("CARD=") || name.starts_with("sysdefault:CARD=")
+}
+
+/// The name a person sees for an output device. An ALSA name such as `sysdefault:CARD=Device` is
+/// shown as the card's name from `/proc/asound/cards` (for example `USB PnP Audio Device`), the
+/// name the desktop sound panel uses. Any other name is returned unchanged. The device is still
+/// opened by its raw name; [`SidetoneEngine::start_on`] accepts either form.
+#[must_use]
+pub fn device_label(name: &str) -> String {
+    match alsa_card_id(name) {
+        Some(card) => card_longname(&card).unwrap_or(card),
+        None => name.to_string(),
+    }
+}
+
+/// The card id in an ALSA name, e.g. `Device` from `sysdefault:CARD=Device,DEV=0`.
+fn alsa_card_id(name: &str) -> Option<String> {
+    let rest = name.split_once("CARD=")?.1;
+    let id = rest.split(',').next()?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The display name of a card in the text of `/proc/asound/cards`, e.g. `USB PnP Audio Device`
+/// for card `Device`.
+fn longname_from_cards(text: &str, card: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let open = line.find('[')?;
+        let close = line.find(']')?;
+        if line[open + 1..close].trim() != card {
+            return None;
+        }
+        let (_, name) = line[close..].split_once(" - ")?;
+        Some(name.trim().to_string())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn card_longname(card: &str) -> Option<String> {
+    let text = std::fs::read_to_string("/proc/asound/cards").ok()?;
+    longname_from_cards(&text, card)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn card_longname(_card: &str) -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alsa_names_are_listed_once_per_card_with_card_names() {
+        assert!(listed_in_picker("sysdefault:CARD=Device"));
+        assert!(!listed_in_picker("front:CARD=Device,DEV=0"));
+        assert!(!listed_in_picker("hw:CARD=PCH,DEV=0"));
+        assert!(listed_in_picker("default"));
+        assert!(listed_in_picker("Speakers (Realtek High Definition Audio)"));
+        assert_eq!(alsa_card_id("sysdefault:CARD=Device"), Some("Device".to_string()));
+        assert_eq!(alsa_card_id("front:CARD=Device,DEV=0"), Some("Device".to_string()));
+        assert_eq!(alsa_card_id("default"), None);
+    }
+
+    #[test]
+    fn card_longname_comes_from_proc_asound_cards() {
+        let cards = " 0 [PCH            ]: HDA-Intel - HDA Intel PCH\n                      HDA Intel PCH at 0xa0820000 irq 124\n 3 [Device         ]: USB-Audio - USB PnP Audio Device\n                      USB PnP Audio Device at usb-0000:12:00.0-2.1.3, full speed\n";
+        assert_eq!(longname_from_cards(cards, "Device").as_deref(), Some("USB PnP Audio Device"));
+        assert_eq!(longname_from_cards(cards, "PCH").as_deref(), Some("HDA Intel PCH"));
+        assert_eq!(longname_from_cards(cards, "HDMI"), None);
+        assert_eq!(device_label("Speakers (Realtek)"), "Speakers (Realtek)");
+    }
 
     #[test]
     fn frequency_and_volume_are_clamped() {

@@ -475,7 +475,20 @@ impl StationController {
     /// Sets which control line keys the radio ("dtr" or "rts").
     pub fn set_key_line(&self, line: &str) {
         let parsed = parse_line(line).unwrap_or(KeyingLine::Dtr);
+        let ptt = self.shared.settings.lock().unwrap().ptt_line;
+        if ptt == Some(parsed) {
+            self.shared.fail(
+                control::KEYING,
+                format!("{} is the PTT line", line_name(parsed).to_uppercase()),
+                format!(
+                    "Key and PTT must be on different lines; {} is already the PTT line.",
+                    line_name(parsed).to_uppercase()
+                ),
+            );
+            return;
+        }
         self.shared.settings.lock().unwrap().key_line = parsed;
+        self.shared.clear_error(control::KEYING);
         self.shared.persist();
         self.shared.emit_settings();
         if self.is_paired() {
@@ -485,7 +498,21 @@ impl StationController {
 
     /// Sets which control line asserts PTT ("dtr", "rts", or "none").
     pub fn set_ptt_line(&self, line: &str) {
-        self.shared.settings.lock().unwrap().ptt_line = parse_line(line);
+        let ptt = parse_line(line);
+        let key = self.shared.settings.lock().unwrap().key_line;
+        if ptt == Some(key) {
+            self.shared.fail(
+                control::KEYING,
+                format!("{} is the key line", line_name(key).to_uppercase()),
+                format!(
+                    "Key and PTT must be on different lines; {} is already the key line.",
+                    line_name(key).to_uppercase()
+                ),
+            );
+            return;
+        }
+        self.shared.settings.lock().unwrap().ptt_line = ptt;
+        self.shared.clear_error(control::KEYING);
         self.shared.persist();
         self.shared.emit_settings();
         if self.is_paired() {
@@ -776,15 +803,20 @@ fn load_or_create(path: &Option<std::path::PathBuf>) -> (Config, Settings) {
         }
     };
 
+    let key_line = config
+        .station
+        .key_line
+        .as_deref()
+        .and_then(parse_line)
+        .unwrap_or(KeyingLine::Dtr);
+    let ptt_line = match config.station.ptt_line.as_deref() {
+        Some(s) => ptt_line_for(key_line, parse_line(s)),
+        None => ptt_line_for(key_line, Some(KeyingLine::Rts)),
+    };
     let settings = Settings {
         keying_port: config.station.keying_port.clone(),
-        key_line: config
-            .station
-            .key_line
-            .as_deref()
-            .and_then(parse_line)
-            .unwrap_or(KeyingLine::Dtr),
-        ptt_line: config.station.ptt_line.as_deref().and_then(parse_line),
+        key_line,
+        ptt_line,
         logger_port: config.station.logger_port.clone(),
         logger_enabled: config.station.logger_enabled,
         relay: config.relay.as_ref().map(|r| r.address.to_string()),
@@ -1006,13 +1038,12 @@ async fn bring_up_station(
     replayer.begin_session(1);
 
     let bus = EventBus::new();
-    let path_health = rwk_core::engine::network::PathHealth::new();
     let driver = spawn_driver(
         replayer,
         Box::new(arbiter.remote_output()),
         Arc::clone(&clock),
         Some(bus.clone()),
-        Some(path_health),
+        Some(transport.health()),
     );
 
     let logger = open_logger(shared, &arbiter, logger_port, logger_enabled);
@@ -1328,8 +1359,8 @@ mod tests {
     fn line_setters_parse_and_store() {
         let (sink, _events) = recording_sink();
         let controller = controller(sink);
-        controller.set_key_line("rts");
         controller.set_ptt_line("none");
+        controller.set_key_line("rts");
         let s = controller.shared.settings.lock().unwrap();
         assert_eq!(s.key_line, KeyingLine::Rts);
         assert_eq!(s.ptt_line, None);

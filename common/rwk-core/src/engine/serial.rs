@@ -275,7 +275,7 @@ impl SerialKeyingOutput {
 
         let mut output = Self { config, port: Some(port) };
         // Start from a known state: nothing keyed, no PTT.
-        output.apply(true, false)?;
+        output.apply(false, false)?;
         Ok(output)
     }
 

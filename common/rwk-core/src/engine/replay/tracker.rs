@@ -225,8 +225,9 @@ impl EdgeSequenceTracker {
 
     /// Validates every edge in `frame` in ascending sequence order.
     ///
-    /// Results are oldest-first, ready to schedule. An epoch mismatch is decided from
-    /// the frame header and yields a single [`EdgeValidationOutcome::EpochMismatch`].
+    /// Results are oldest-first, ready to schedule, except before a baseline exists: then the
+    /// frame is walked newest-first (see below). An epoch mismatch is decided from the frame
+    /// header and yields a single [`EdgeValidationOutcome::EpochMismatch`].
     #[must_use]
     pub fn validate_frame(&mut self, frame: &RwkPaddleFrame) -> Vec<EdgeValidationResult> {
         if frame.epoch != self.epoch {
@@ -244,6 +245,15 @@ impl EdgeSequenceTracker {
                 j -= 1;
             }
             ordered[j] = current;
+        }
+
+        // Before any edge has been applied, the first edge validated becomes the baseline and is
+        // scheduled as "now". A frame's older entries are redundant copies of edges keyed
+        // earlier, possibly long ago, because the sender's ring is sized by count, not by age.
+        // So the newest edge must be the baseline: walked newest-first, the older copies fall
+        // below it and are discarded as duplicates.
+        if !self.has_applied {
+            ordered.reverse();
         }
 
         ordered.into_iter().map(|edge| self.validate(frame.epoch, edge)).collect()
@@ -346,6 +356,23 @@ mod tests {
         assert_eq!(r.outcome, EdgeValidationOutcome::TimestampRegression);
         assert_eq!(r.fail_safe(), Some(FailSafeTrigger::F5));
         assert_eq!(t.last_sequence(), 1, "a regressed edge must not advance the baseline");
+    }
+
+    #[test]
+    fn fresh_session_baselines_on_the_newest_edge_not_a_redundant_copy() {
+        let mut t = EdgeSequenceTracker::new(1);
+        // The first frame a fresh replayer sees: the edge just keyed (seq 4) plus three older
+        // edges carried redundantly from earlier in the session.
+        let frame = RwkPaddleFrame::try_new(1, &[down(4, 400), up(3, 300), down(2, 200), up(1, 100)]).unwrap();
+        let results = t.validate_frame(&frame);
+        let accepted: Vec<u32> = results.iter().filter(|r| r.applied).map(|r| r.edge.sequence).collect();
+        assert_eq!(accepted, vec![4], "only the newest edge may be scheduled as now");
+        assert_eq!(
+            results.iter().filter(|r| r.outcome == EdgeValidationOutcome::DuplicateDiscarded).count(),
+            3
+        );
+        assert_eq!(t.last_sequence(), 4);
+        assert!(t.last_key_down());
     }
 
     #[test]

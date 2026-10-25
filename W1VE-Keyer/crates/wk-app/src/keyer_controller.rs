@@ -284,8 +284,10 @@ impl SendBuffer {
 struct Shared {
     settings: Mutex<Settings>,
     sidetone: Mutex<Option<Sidetone>>,
-    /// The arbiter owning the keying output, present while a keying port is open.
+    /// The arbiter owning the keying output (LED-only when no keying port is open).
     arbiter: Mutex<Option<Arc<KeyingArbiter>>>,
+    /// True while `arbiter` currently holds an open hardware serial port.
+    keying_open: AtomicBool,
     /// The paddle/type-ahead sink (arbiter's remote source), present with the arbiter.
     paddle_sink: Mutex<Option<Arc<Mutex<RemoteKeyingOutput>>>>,
     /// The running paddle poller, present while a paddle port is open.
@@ -375,6 +377,7 @@ impl KeyerController {
             settings: Mutex::new(settings.clone()),
             sidetone: Mutex::new(None),
             arbiter: Mutex::new(None),
+            keying_open: AtomicBool::new(false),
             paddle_sink: Mutex::new(None),
             paddle: Mutex::new(None),
             logger: Mutex::new(None),
@@ -383,6 +386,14 @@ impl KeyerController {
             config_path,
             sink,
         });
+
+        let observer: LineObserver = make_line_observer(Arc::clone(&shared));
+        let arbiter = Arc::new(KeyingArbiter::with_observer(
+            SerialKeyingAdapter::led_only(),
+            Some(observer),
+        ));
+        *shared.paddle_sink.lock().unwrap() = Some(Arc::new(Mutex::new(arbiter.remote_output())));
+        *shared.arbiter.lock().unwrap() = Some(arbiter);
 
         let device = ToneDevice::from_setting(&settings.audio_device);
         let sidetone =
@@ -527,7 +538,7 @@ impl KeyerController {
                 held.push(p.clone());
             }
         }
-        if self.shared.arbiter.lock().unwrap().is_some() {
+        if self.shared.keying_open.load(Ordering::Relaxed) {
             if let Some(p) = &s.keying_port {
                 held.push(p.clone());
             }
@@ -561,55 +572,50 @@ impl KeyerController {
         self.shared.emit_settings();
     }
 
-    /// Opens (or re-opens) the keying output and rebuilds the arbiter around it. Clearing the
-    /// port tears the arbiter down. The logger is re-attached to the new arbiter afterwards.
+    /// Swaps the keying output adapter inside the persistent [`KeyingArbiter`] in place.
+    /// Clearing the port installs an LED-only adapter so the logger host and paddle sink keep
+    /// running uninterrupted.
     fn open_keying_port(&self, port: Option<String>) {
-        // Drop the old arbiter + logger first (releases the port handles).
-        *self.shared.logger.lock().unwrap() = None;
-        *self.shared.paddle_sink.lock().unwrap() = None;
-        *self.shared.arbiter.lock().unwrap() = None;
-
-        let Some(name) = port else {
-            self.shared.clear_error(control::KEYING);
-            self.shared.log("info", "Keying output cleared.");
-            return;
+        let arbiter = match self.shared.arbiter.lock().unwrap().as_ref() {
+            Some(a) => Arc::clone(a),
+            None => return,
         };
-
         let (key_line, ptt_line) = {
             let s = self.shared.settings.lock().unwrap();
             (parse_line(&s.key_line), parse_line(&s.ptt_line))
         };
-        let cfg = KeyingOutputConfig {
-            port_name: name.clone(),
-            key_line: key_line.unwrap_or(KeyingLine::Dtr),
-            ptt_line: ptt_line.unwrap_or(KeyingLine::None),
-            ..Default::default()
-        };
-        let serial = match SerialKeyingOutput::open(cfg) {
-            Ok(out) => out,
-            Err(e) => {
-                self.shared.fail(
-                    control::KEYING,
-                    format!("{name} not available"),
-                    format!("Keying port {name} failed: {e}"),
-                );
-                return;
+        let shared = Arc::clone(&self.shared);
+        arbiter.replace_adapter_with(move || {
+            let Some(name) = port else {
+                shared.keying_open.store(false, Ordering::Relaxed);
+                shared.clear_error(control::KEYING);
+                shared.log("info", "Keying output cleared.");
+                return SerialKeyingAdapter::led_only();
+            };
+            let cfg = KeyingOutputConfig {
+                port_name: name.clone(),
+                key_line: key_line.unwrap_or(KeyingLine::Dtr),
+                ptt_line: ptt_line.unwrap_or(KeyingLine::None),
+                ..Default::default()
+            };
+            match SerialKeyingOutput::open(cfg) {
+                Ok(out) => {
+                    shared.keying_open.store(true, Ordering::Relaxed);
+                    shared.clear_error(control::KEYING);
+                    shared.log("info", format!("Keying output on {name}."));
+                    SerialKeyingAdapter::new(out)
+                }
+                Err(e) => {
+                    shared.keying_open.store(false, Ordering::Relaxed);
+                    shared.fail(
+                        control::KEYING,
+                        format!("{name} not available"),
+                        format!("Keying port {name} failed: {e}"),
+                    );
+                    SerialKeyingAdapter::led_only()
+                }
             }
-        };
-
-        let observer: LineObserver = make_line_observer(Arc::clone(&self.shared));
-        let arbiter = Arc::new(KeyingArbiter::with_observer(
-            SerialKeyingAdapter::new(serial),
-            Some(observer),
-        ));
-        let sink = Arc::new(Mutex::new(arbiter.remote_output()));
-        *self.shared.paddle_sink.lock().unwrap() = Some(sink);
-        *self.shared.arbiter.lock().unwrap() = Some(arbiter);
-        self.shared.clear_error(control::KEYING);
-        self.shared.log("info", format!("Keying output on {name}."));
-
-        // Re-attach the logger to the new arbiter if a logger port is selected.
-        self.refresh_logger();
+        });
     }
 
     fn open_paddle_port(&self, port: Option<String>) {

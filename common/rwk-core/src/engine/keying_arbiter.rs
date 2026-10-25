@@ -153,11 +153,19 @@ impl KeyingArbiter {
     /// Replaces the real output while a session runs, for a port or line change. The old adapter
     /// is dropped first (a serial port opens only once), then `build` opens the new one. The
     /// current key and PTT state is driven onto the new output straight away.
+    ///
+    /// Both the old port teardown and `build` run **outside** the arbiter lock: while the swap
+    /// is in flight, the arbiter points at an LED-only stand-in so the time-critical replay
+    /// thread and local logger thread never block on OS serial-port open/close syscalls.
     pub fn replace_adapter_with(&self, build: impl FnOnce() -> SerialKeyingAdapter) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::mem::replace(&mut inner.adapter, SerialKeyingAdapter::led_only());
+        let old = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut inner.adapter, SerialKeyingAdapter::led_only())
+        };
         drop(old);
-        inner.adapter = build();
+        let new_adapter = build();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.adapter = new_adapter;
         // Force the next apply to write the new output, even when the state has not changed.
         inner.last_key = None;
         inner.last_ptt = None;
@@ -305,6 +313,25 @@ mod tests {
 
         assert_eq!(arbiter.active_source(), KeySource::Local);
         local.set_key(false);
+        assert_eq!(arbiter.active_source(), KeySource::Remote);
+    }
+
+    #[test]
+    fn replace_adapter_with_does_not_hold_lock_across_build() {
+        let arbiter = KeyingArbiter::new(SerialKeyingAdapter::led_only());
+        let mut remote = arbiter.remote_output();
+        let local = arbiter.local_handle();
+
+        arbiter.replace_adapter_with(|| {
+            // Both remote and local handles must be able to acquire the lock while `build` runs,
+            // proving the time-critical replay thread is never blocked on OS port open/close.
+            remote.set_key(true);
+            local.set_ptt(true);
+            SerialKeyingAdapter::led_only()
+        });
+
+        assert_eq!(arbiter.active_source(), KeySource::Local);
+        local.set_ptt(false);
         assert_eq!(arbiter.active_source(), KeySource::Remote);
     }
 
