@@ -268,46 +268,6 @@ input[type="range"] {
 }
 
 /* Status strip */
-.splash {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  background: #000;
-}
-
-/* The hero spans 75% of the window width and keeps its aspect ratio, centred. */
-.splash-frame {
-  position: relative;
-  width: 75%;
-}
-
-.splash-hero {
-  display: block;
-  width: 100%;
-  height: auto;
-}
-
-.splash-title {
-  position: absolute;
-  top: 6%;
-  left: 4%;
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-}
-
-.splash-name {
-  font-size: 16px;
-  font-weight: 700;
-  color: #b6fcfe;
-}
-
-.splash-version {
-  font-size: 11px;
-  color: #fff;
-}
-
 .statusbar {
   display: flex;
   align-items: center;
@@ -471,4 +431,64 @@ table.rules code {
   border-radius: 6px;
   padding: 8px 10px;
   user-select: all;
+}
+
+/* About dialog: about.png artwork as background, centred white text. */
+.about-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.about-box {
+  position: relative;
+  width: 300px;
+  height: 504px;
+  background-size: cover;
+  background-position: center;
+  color: #fff;
+  text-align: center;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+}
+
+/* Name + version sit in the artwork's blank band at the top, clear of the artwork itself. */
+.about-head {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  top: 34px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.about-name {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.about-version {
+  font-size: 12px;
+}
+
+.about-lines {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 56px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.about-close {
+  position: absolute;
+  bottom: 14px;
+  left: 0;
+  right: 0;
+  font-size: 10px;
+  opacity: 0.7;
 }

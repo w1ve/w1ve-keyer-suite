@@ -20,6 +20,8 @@
       {
         "label": "main",
         "title": "W1VE Remote Keyer-Router — Any Rig, Any Internet, Anytime",
+        "backgroundColor": "#0f1115",
+        "visible": false,
         "width": 980,
         "height": 640,
         "minWidth": 900,

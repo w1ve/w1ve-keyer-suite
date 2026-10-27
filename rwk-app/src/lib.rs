@@ -28,6 +28,7 @@ use std::sync::Arc;
 use controller::{ClientController, ClientEvent};
 use device_watch::DeviceChangeWatcher;
 use station_controller::{StationController, StationEvent};
+use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Emitter, Manager, State};
 
 /// Extracts the native window handle as an `isize` for the serial-PnP device watcher.
@@ -85,6 +86,7 @@ pub fn run_client() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ui_ready,
             ping,
             request_state,
             set_speed,
@@ -123,6 +125,17 @@ pub fn run_client() {
 /// Backwards-compatible alias: the original single-binary entry point launched the Client.
 pub fn run() {
     run_client();
+}
+
+/// Reveals the main window.
+///
+/// The window is created hidden (`"visible": false` in tauri.conf.json) so the operator never
+/// sees a black webview while the front end boots; each UI calls this once it has rendered, and
+/// the front end also fires it on a timer as a safety net. Shared by both executables.
+#[tauri::command]
+fn ui_ready(window: tauri::WebviewWindow) {
+    let _ = window.show();
+    let _ = window.set_focus();
 }
 
 /// A trivial liveness command, used to confirm the UI↔Rust bridge is wired.
@@ -369,12 +382,39 @@ pub fn run_station() {
             });
             let watcher = DeviceChangeWatcher::start(raw_window, on_change);
             app.manage(StationState { controller, _watcher: watcher });
+
+            // File menu: About... (the UI shows the About dialog) and Exit (stops any active
+            // pairing first, then quits).
+            let about_item = MenuItemBuilder::with_id("about", "About...").build(app)?;
+            let exit_item = MenuItemBuilder::with_id("exit", "Exit").build(app)?;
+            let file_menu = SubmenuBuilder::new(app, "File")
+                .item(&about_item)
+                .separator()
+                .item(&exit_item)
+                .build()?;
+            let menu = MenuBuilder::new(app).item(&file_menu).build()?;
+            app.set_menu(menu)?;
+            app.on_menu_event(|app, event| match event.id().as_ref() {
+                "about" => {
+                    let _ = app.emit("rwk://menu", "about");
+                }
+                "exit" => {
+                    if let Some(state) = app.try_state::<StationState>() {
+                        state.controller.disconnect();
+                    }
+                    app.exit(0);
+                }
+                _ => {}
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ui_ready,
             station_ping,
             station_app_role,
             station_request_state,
+            station_show_splash,
+            station_hide_splash,
             station_serial_ports,
             station_select_keying_port,
             station_set_key_line,
@@ -410,6 +450,136 @@ fn station_app_role() -> String {
 #[tauri::command]
 fn station_request_state(state: State<'_, StationState>) {
     state.controller.request_state();
+}
+
+/// Shows the splash as a borderless popup window containing only the artwork.
+///
+/// The splash is deliberately its own window: an overlay inside the main webview filled the whole
+/// window with black around a small graphic. Here the window *is* the graphic — 300x168 (the size
+/// of `hero.png`), no decorations, no taskbar entry, not focusable — centred over the main window
+/// and kept above it. The UI calls this once its own DOM is fully loaded, then calls
+/// [`station_hide_splash`] five seconds later.
+#[tauri::command]
+async fn station_show_splash(app: tauri::AppHandle) -> Result<(), String> {
+    // MUST be async: on Windows, WebviewWindowBuilder deadlocks when it runs inside a synchronous
+    // command or event handler (tauri-apps/tauri#13092). The symptom is a window whose webview
+    // never initialises — it shows the bare window background and no document at all.
+    build_splash_window(&app)
+}
+
+/// Builds (or rebuilds) the splash popup. Must run on the main thread.
+fn build_splash_window(app: &tauri::AppHandle) -> Result<(), String> {
+    // A previous popup (or a reload of the main UI) must not stack up behind the new one.
+    if let Some(old) = app.get_webview_window("splash") {
+        let _ = old.destroy();
+    }
+
+    // Position is computed before the window is built: a freshly built window cannot be measured
+    // yet, and asking it for its size there is what left the popup parked at the default cascade
+    // position instead of centred.
+    const SPLASH_W: f64 = 300.0;
+    const SPLASH_H: f64 = 168.0;
+    let main = app.get_webview_window("main");
+    let (x, y) = main
+        .as_ref()
+        .and_then(|main| {
+            let pos = main.outer_position().ok()?;
+            let size = main.outer_size().ok()?;
+            let scale = main.scale_factor().unwrap_or(1.0);
+            let w = f64::from(size.width) / scale;
+            let h = f64::from(size.height) / scale;
+            Some((
+                f64::from(pos.x) / scale + (w - SPLASH_W) / 2.0,
+                f64::from(pos.y) / scale + (h - SPLASH_H) / 2.0,
+            ))
+        })
+        .unwrap_or((100.0, 100.0));
+
+    let splash = tauri::WebviewWindowBuilder::new(
+        app,
+        "splash",
+        // The splash reuses the built entry point; main.jsx tells the two windows apart by label
+        // ("splash") and renders the artwork alone in this one.
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+    .title("RWK Station")
+    .inner_size(SPLASH_W, SPLASH_H)
+    .position(x, y)
+    .decorations(false)
+    .resizable(false)
+    // Opaque window whose colour matches the artwork's own background: a transparent window here
+    // rendered nothing at all on Windows, leaving the popup see-through.
+    .transparent(false)
+    .background_color(tauri::window::Color(13, 23, 33, 255))
+    .shadow(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    // The File menu belongs to the main window; without this the popup would also carry a menu bar
+    // and be taller than the artwork.
+    let _ = splash.remove_menu();
+    Ok(())
+}
+
+/// Fades the splash popup out over ~200 ms, then closes it (called five seconds after it was
+/// shown).
+///
+/// The popup is a window showing a 300x168 panel, so closing it in one call makes the whole panel
+/// blink out of existence — the frame after it is simply gone. It is faded instead.
+#[tauri::command]
+async fn station_hide_splash(app: tauri::AppHandle) {
+    if let Some(splash) = app.get_webview_window("splash") {
+        fade_splash_out(&splash);
+        let _ = splash.close();
+    }
+}
+
+/// Steps the splash window's alpha down to zero, then returns so the caller can close it.
+///
+/// Windows composites a top-level window as one surface, so `WS_EX_LAYERED` +
+/// `SetLayeredWindowAttributes` fades the artwork *and* the window plate together. Fading inside
+/// the webview instead (CSS opacity on the artwork) could only dissolve the artwork into the
+/// popup's own background colour, and the plate would still disappear in a single frame.
+///
+/// Off Windows there is no equivalent one-call window alpha, so the popup just closes.
+#[allow(unused_variables)]
+fn fade_splash_out(window: &tauri::WebviewWindow) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW, GWL_EXSTYLE, LWA_ALPHA,
+            WS_EX_LAYERED,
+        };
+
+        const FADE_MS: u64 = 200;
+
+        let Ok(hwnd) = window.hwnd() else { return };
+        let hwnd = hwnd.0 as *mut core::ffi::c_void;
+        unsafe {
+            // The window was built opaque; LWA_ALPHA only applies once it is layered.
+            let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as i32);
+
+            // Alpha is driven by elapsed time, not by a step count: `sleep` rounds up to the
+            // system timer resolution (~15.6 ms), so sixteen nominal 12 ms steps would stretch
+            // the fade to ~250 ms. Here a late step just skips further down the ramp.
+            let start = std::time::Instant::now();
+            loop {
+                let elapsed = start.elapsed().as_millis() as u64;
+                let remaining = FADE_MS.saturating_sub(elapsed);
+                let alpha = (255 * remaining / FADE_MS) as u8;
+                // A failure means the popup is already gone (or refused the layered style): stop
+                // fading and let the caller close it.
+                if SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA) == 0 || remaining == 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        }
+    }
 }
 
 #[tauri::command]

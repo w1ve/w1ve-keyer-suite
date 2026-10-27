@@ -278,8 +278,8 @@ export default function StationTab({
           </div>
           <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0, marginTop: 8 }}>
             {settings.transport === "wan"
-              ? "Start and give the token to the Client. A keying port is optional — without one the KEY LED still follows the Client. Choose the keying port and PTT line before you pair."
-              : "Pick a keyer advertising on your LAN, then Connect. A keying port is optional and is chosen before you pair. No relay, no internet."}
+              ? "Start and give the token to the Client. Pair first, then choose the keying port and PTT line. A keying port is optional — without one the KEY LED still follows the Client."
+              : "Pick a keyer advertising on your LAN, then Connect. Choose the keying port after you pair. No relay, no internet."}
           </p>
         </div>
       </div>

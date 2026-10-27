@@ -8,6 +8,10 @@ import { listen } from "@tauri-apps/api/event";
 export const stationApi = {
   ping: () => invoke("station_ping"),
 
+  // Reveals the main window, which is created hidden so the first thing shown is the finished UI
+  // rather than a black webview.
+  uiReady: () => invoke("ui_ready"),
+
   // Pull the current settings + ports once the UI has subscribed (the backend's startup push
   // races the webview and would otherwise be missed).
   requestState: () => invoke("station_request_state"),
@@ -29,6 +33,11 @@ export const stationApi = {
   // Pairing — WAN (the Station waits for the client over the relay)
   listen: (relay, code) => invoke("station_listen", { relay, code }),
   disconnect: () => invoke("station_disconnect"),
+
+  // Splash: a native borderless popup window showing just the artwork, created and destroyed by
+  // the Rust side (the UI only decides when the main UI has loaded and when five seconds are up).
+  showSplash: () => invoke("station_show_splash"),
+  hideSplash: () => invoke("station_hide_splash"),
 
   // Pairing — transport + LAN (the Station browses advertised keyers and picks one)
   setTransport: (transport) => invoke("station_set_transport", { transport }),

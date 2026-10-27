@@ -4,9 +4,57 @@ import StationTab from "./StationTab.jsx";
 import RelayDialog, { DEFAULT_WAN_RELAY } from "./RelayDialog.jsx";
 import { LogEntries } from "./LogPanel.jsx";
 import ConnectionsTab from "./ConnectionsTab.jsx";
-import SplashScreen from "./SplashScreen.jsx";
+import AboutDialog from "./AboutDialog.jsx";
+import { listen } from "@tauri-apps/api/event";
 
+// The splash is a separate BORDERLESS POPUP window containing only the artwork — not an overlay
+// inside this window, and not a full-window black page. It is created natively (see
+// `station_show_splash` in src/lib.rs), sized to the artwork, centred over the main window and
+// hidden again after SPLASH_MS. This component only decides when, from the UI's own load state:
+//
+//   1. the document has finished loading (document.readyState === "complete"),
+//   2. the webfonts are ready,
+//   3. the first settings snapshot is applied (token, keying config, transport), and
+//   4. the serial-port inventory has arrived, so the port pickers are populated.
+//
+// The popup is shown the moment all four hold — i.e. when the main UI itself has rendered — and
+// there is no startup timer or safety net to race that: if the backend never answers, the popup
+// never appears rather than playing over a half-built window.
 const SPLASH_MS = 5000;
+
+/// True once the main UI is fully loaded: document ready, fonts settled, and the first settings
+/// and port snapshots applied. The splash waits on this rather than on elapsed time.
+function useUiLoaded(settingsLoaded, portsLoaded) {
+  const [documentLoaded, setDocumentLoaded] = useState(
+    () => typeof document !== "undefined" && document.readyState === "complete",
+  );
+  const [fontsLoaded, setFontsLoaded] = useState(false);
+
+  useEffect(() => {
+    if (documentLoaded) return undefined;
+    const onLoad = () => setDocumentLoaded(true);
+    window.addEventListener("load", onLoad, { once: true });
+    // The load event can fire between the initial state and this effect: re-check once.
+    if (document.readyState === "complete") setDocumentLoaded(true);
+    return () => window.removeEventListener("load", onLoad);
+  }, [documentLoaded]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const done = () => {
+      if (!cancelled) setFontsLoaded(true);
+    };
+    // `fonts.ready` resolves once layout-affecting fonts are loaded, and rejects never: the
+    // rejection handler is the same one-shot settle so a font failure cannot block the splash.
+    if (document.fonts?.ready) document.fonts.ready.then(done, done);
+    else done();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return documentLoaded && fontsLoaded && settingsLoaded && portsLoaded;
+}
 
 const DEFAULT_SETTINGS = {
   keyingPort: null,
@@ -38,17 +86,54 @@ export default function StationApp() {
   const [tab, setTab] = useState("main"); // "main" | "log"
   const [relayPrompt, setRelayPrompt] = useState(false);
   const unlisten = useRef(null);
-  const [splash, setSplash] = useState(true);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  // The two snapshots that make the main UI complete: settings (token, keying config, transport)
+  // and the serial-port inventory behind the port pickers.
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [portsLoaded, setPortsLoaded] = useState(false);
+  const uiLoaded = useUiLoaded(settingsLoaded, portsLoaded);
 
+  // Splash popup: the window is revealed and the popup shown the instant the main UI has finished
+  // rendering, then the popup is hidden five seconds later.
   useEffect(() => {
-    const t = setTimeout(() => setSplash(false), SPLASH_MS);
-    return () => clearTimeout(t);
+    if (!uiLoaded) return undefined;
+    let timer;
+    let cancelled = false;
+    stationApi
+      .uiReady()
+      .catch(() => {})
+      .then(() => stationApi.showSplash())
+      .then(() => {
+        // The timer starts once the popup is actually up, not when the UI finished rendering:
+        // anchoring it to `uiLoaded` would spend part of the five seconds on the IPC round trip
+        // and leave the splash visible for slightly less than five seconds.
+        if (cancelled) return;
+        timer = window.setTimeout(() => {
+          stationApi.hideSplash().catch(() => {});
+        }, SPLASH_MS);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [uiLoaded]);
+
+  // File > About... from the native menu.
+  useEffect(() => {
+    const un = listen("rwk://menu", (e) => {
+      if (e.payload === "about") setAboutOpen(true);
+    });
+    return () => {
+      un.then((fn) => fn());
+    };
   }, []);
 
   useEffect(() => {
     onRwkEvent((ev) => {
       switch (ev.kind) {
         case "settings":
+          setSettingsLoaded(true);
           setSettings({
             keyingPort: ev.keying_port ?? null,
             keyLine: ev.key_line,
@@ -62,6 +147,7 @@ export default function StationApp() {
           break;
         case "ports":
           setPorts(ev.available || []);
+          setPortsLoaded(true);
           break;
         case "error":
           if (ev.control === "relay") {
@@ -139,8 +225,6 @@ export default function StationApp() {
       : "Disconnected";
   const linkColor = running ? "var(--good)" : connecting ? "var(--warn)" : "var(--text-dim)";
 
-  if (splash) return <SplashScreen />;
-
   return (
     <div className="app station">
       <div className="statusbar">
@@ -199,6 +283,8 @@ export default function StationApp() {
         <span style={{ color: keyDown ? "var(--key-on)" : "var(--text-dim)" }}>Key: {keyDown ? "Down" : "Up"}</span>
         <span style={{ color: pttOn ? "var(--ptt-on)" : "var(--text-dim)" }}>PTT: {pttOn ? "On" : "Off"}</span>
       </div>
+
+      {aboutOpen && <AboutDialog onClose={() => setAboutOpen(false)} />}
 
       {relayPrompt && (
         <RelayDialog current={settings.relay} onConfirm={onRelayChosen} onCancel={() => setRelayPrompt(false)} />

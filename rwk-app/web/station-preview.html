@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RWK Station (preview)</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      // Temporary stub of the Tauri IPC bridge: makes main.jsx mount StationApp.
+      const replies = {
+        station_app_role: "station",
+        station_serial_ports: ["COM3", "COM4"],
+        station_regenerate_token: "185a37c0a02e",
+      };
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd) => (cmd in replies ? replies[cmd] : null),
+        transformCallback: () => 0,
+        unregisterCallback: () => {},
+        metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
+      };
+    </script>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

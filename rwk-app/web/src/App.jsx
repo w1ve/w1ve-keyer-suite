@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { api, onRwkEvent } from "./api.js";
 import KeyerTab from "./KeyerTab.jsx";
 import RouterTab from "./RouterTab.jsx";
@@ -27,6 +28,15 @@ const DEFAULT_SETTINGS = {
 // Direct / DERP at the top right), the Keyer and Ham Router tabs, and a log drawer. The bottom-left
 // shows whether FlexRadio discovery is enabled.
 export default function App() {
+  // The window is created hidden so the operator never sees a black webview while this UI builds;
+  // reveal it once the first render has painted.
+  useEffect(() => {
+    const id = requestAnimationFrame(() =>
+      requestAnimationFrame(() => invoke("ui_ready").catch(() => {})),
+    );
+    return () => cancelAnimationFrame(id);
+  }, []);
+
   const [tab, setTab] = useState("keyer");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [connection, setConnection] = useState({ state: "disconnected", path: "none" });
