@@ -325,15 +325,16 @@ Flow of the supervised WAN connect:
 
 Budget semantics to understand before changing it:
 
-- The 15 s window is opened **when a link is lost**, not when the operator pressed Connect.
-  A successful steady link never resets it because the budget is already `None`; a new Connect
-  starts a new window.
-- A *successful pairing* clears the budget. Therefore a peer that completes a handshake and then
-  dies instantly gets a fresh 15 s window each time — the pathological flapping case can keep
-  the UI in "Pairing…" indefinitely, one 15 s episode after another. `MAX_RECONNECT_ATTEMPTS`
-  does not bound this path because the counter is only incremented on connect failures. Fixing
-  this properly needs a stability threshold (for example: only clear the budget once the link
-  has stayed up for ≥ 5 s) or a single deadline fixed at Connect. See §5.11 item 3.
+- The `ReconnectWindow` is opened lazily on the first loop pass, so the **initial** pairing from
+  the operator's Connect is itself bounded by 15 s (rendezvous + handshake), and a fresh one is
+  opened after a previously successful link is lost.
+- A *successful pairing* clears the budget (`budget = None`). Therefore a peer that completes a
+  handshake and then dies instantly gets a fresh 15 s window each time — the pathological
+  flapping case can keep the UI in "Pairing…" indefinitely, one 15 s episode after another.
+  `MAX_RECONNECT_ATTEMPTS` does not bound this path because the counter is only incremented on
+  connect failures. Fixing this properly needs a stability threshold (for example: only clear
+  the budget once the link has stayed up for ≥ 5 s) or a single deadline fixed at Connect. See
+  §5.11 item 3.
 - The peer-loss path deliberately does **not** increment `attempts`; the 15 s window is the
   budget that matters there.
 
