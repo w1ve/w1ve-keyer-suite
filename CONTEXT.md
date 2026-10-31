@@ -76,6 +76,11 @@ Every app is a Tauri v2 shell over `rwk-core`. The Router Client and Station sha
 bundle and one Tauri config; `main.jsx` probes the `station_app_role` command to decide which UI
 to mount. Only the Router Station has the redesigned Station UI described below.
 
+The original repos (`E:\AI\RWK-Rust`, `E:\AI\W1VE-Keyer`, `E:\AI\W1VE-Remote-Keyer`) still
+exist and are untouched. The suite was assembled from them with full git history (`git subtree
+add` / `git merge -X subtree=`); the Router came from RWK-Rust's `rust/crates/*`. Do not edit
+the originals — work here.
+
 ---
 
 ## 3. Latest work in detail
@@ -254,6 +259,28 @@ script has not been run against a VPS.
 
 Unchanged. Useful for key generation and diagnostics (`rwk keygen`, `rwk connect`,
 `rwk selftest`).
+
+### Shared WinKeyer2 logger host (`rwk-core`)
+
+Logger input (N1MM+, DXLog and similar, speaking WinKeyer2) is implemented once in
+`common/rwk-core/src/engine/logger_host.rs` and used by the Router Station
+(`rwk-app/src/station_winkeyer.rs` re-exports it), the Router Client (`select_winkeyer_port`),
+the standalone Keyer, the Remote Keyer Station, and the Remote Keyer Client.
+
+- `LoggerHost::open(port, local_key, report)` keys text on a local output (Station, standalone
+  Keyer, Player).
+- `LoggerHost::open_text(port, sink, report)` sends text to a `TextSink` (both Clients), which
+  pushes it into the send buffer so it is keyed with sidetone, the key line and the tunnel.
+- `TextSink` covers speed, set_speed, host_mode, send_text and abort. The Clients lock the speed
+  slider while host mode is open, because the logger owns the speed then.
+- Behaviour follows the C# emulator's `KeyerCore`, which N1MM accepts: Admin Open replies with
+  version byte 23; sub-commands 0x10 and up consume one data byte; text is batched until the
+  logger is quiet for 5 ms, then echoed with idle status 0xC0 and queued for CW; Request Status
+  is answered at once (0xC5 while text waits to flush, 0xC0 otherwise, never held behind CW); CW
+  plays on its own thread; Clear Buffer and Host Close drop the batch and queue and abort CW in
+  progress; a port read failure reports `HostReport::ReadFailed` (and logs); the 1200 baud
+  WinKeyer2 link uses a 5 ms read timeout.
+- The temporary N1MM trace logging has been removed from every project.
 
 ---
 
