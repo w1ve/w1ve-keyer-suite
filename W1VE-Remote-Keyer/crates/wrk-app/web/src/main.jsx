@@ -1,12 +1,62 @@
 import React, { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
+import { invoke } from "@tauri-apps/api/core";
 import { detectRole } from "./api.js";
 import ClientApp from "./ClientApp.jsx";
 import ServerApp from "./ServerApp.jsx";
+import { APP_NAME_CLIENT, APP_NAME_SERVER, APP_VERSION } from "./app-info.js";
 import "./styles.css";
 
+// The splash popup loads this same entry point and shows the artwork alone. The window is
+// identified by its Tauri label — "splash" — set by the window builder in src/lib.rs (a
+// `?splash` query is accepted as a browser-preview fallback).
+const SPLASH_ONLY =
+  window.__TAURI_INTERNALS__?.metadata?.currentWindow?.label === "splash" ||
+  new URLSearchParams(window.location.search).has("splash");
+
+function SplashArtwork() {
+  const [name, setName] = useState("W1VE Remote Keyer");
+  useEffect(() => {
+    let cancelled = false;
+    detectRole().then((role) => {
+      if (!cancelled) setName(role === "server" ? APP_NAME_SERVER : APP_NAME_CLIENT);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "#0d1721" }}>
+      <img
+        src="/splash-hero.png"
+        alt=""
+        style={{ display: "block", width: "100vw", height: "100vh" }}
+      />
+      <div
+        style={{
+          position: "absolute",
+          left: 8,
+          top: 7,
+          padding: "3px 6px",
+          borderRadius: 4,
+          background: "rgba(5, 12, 19, 0.82)",
+          color: "#fff",
+          font: "600 10px Segoe UI, sans-serif",
+          lineHeight: 1.35,
+        }}
+      >
+        <div>{name}</div>
+        <div style={{ color: "#9ecfff", fontSize: 9 }}>Version {APP_VERSION}</div>
+      </div>
+    </div>
+  );
+}
+
 // One web bundle serves both executables. The Server binary exposes `server_app_role`; the
-// Client does not. We probe it once and mount the matching UI.
+// Client does not. We probe it once and mount the matching UI. The window is created hidden
+// (see `ui_ready` in src/lib.rs); whichever UI mounts reveals it once loaded, and this timer is
+// the safety net that still reveals it if that call never comes.
 function Root() {
   const [role, setRole] = useState(null);
 
@@ -20,28 +70,18 @@ function Root() {
     };
   }, []);
 
+  useEffect(() => {
+    const t = window.setTimeout(() => invoke("ui_ready").catch(() => {}), 3000);
+    return () => window.clearTimeout(t);
+  }, []);
+
   if (role === null) {
-    return (
-      <div
-        style={{
-          height: "100%",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          color: "var(--text-dim)",
-          fontFamily: "Segoe UI, system-ui, sans-serif",
-        }}
-      >
-        Starting…
-      </div>
-    );
+    return <div style={{ height: "100%" }} />;
   }
 
   return role === "server" ? <ServerApp /> : <ClientApp />;
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(
-  <React.StrictMode>
-    <Root />
-  </React.StrictMode>,
+  <React.StrictMode>{SPLASH_ONLY ? <SplashArtwork /> : <Root />}</React.StrictMode>,
 );

@@ -6,6 +6,11 @@ import { listen } from "@tauri-apps/api/event";
 export const api = {
   ping: () => invoke("ping"),
 
+  // Shared shell commands for the hidden-until-ready main window and native splash popup.
+  uiReady: () => invoke("ui_ready"),
+  showSplash: () => invoke("show_splash"),
+  hideSplash: () => invoke("hide_splash"),
+
   // Pull the current settings + ports + audio devices (called once the UI has subscribed,
   // since the backend's startup push races the webview and would otherwise be missed).
   requestState: () => invoke("request_state"),

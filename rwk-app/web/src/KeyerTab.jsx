@@ -280,8 +280,8 @@ export default function KeyerTab({ settings, setSettings, connection, ports, aud
       </div>
 
       {/* ─── Pairing (full width) ──────────────────────── */}
-      <div className="panel">
-        <h3>Pair with Station</h3>
+      <div className="panel pairing-panel">
+        <h3>Pair with Player</h3>
         <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
           <div>
             <label style={{ display: "block", fontSize: 12, color: "var(--text-dim)", marginBottom: 4 }}>
@@ -382,8 +382,8 @@ export default function KeyerTab({ settings, setSettings, connection, ports, aud
         {settings.transport === "lan" && (
           <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0, marginTop: 8 }}>
             {advertising
-              ? `Advertising as ${lanName(settings)} — pick this keyer on the Station.`
-              : "Enter your callsign (and an optional ID), then Advertise so the Station can find and pick this keyer. No relay, no internet."}
+              ? `Advertising as ${lanName(settings)} — pick this keyer on the Player.`
+              : "Enter your callsign (and an optional ID), then Advertise so the Player can find and pick this keyer. No relay, no internet."}
           </p>
         )}
       </div>

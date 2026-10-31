@@ -129,10 +129,10 @@ public class Fade {
 }
 "@
 
-Get-Process w1ve-rkr-station -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process w1ve-krp -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 800
 
-$exe = 'E:\AI\w1ve-keyer-suite\target\release\w1ve-rkr-station.exe'
+$exe = 'E:\AI\w1ve-keyer-suite\target\release\w1ve-krp.exe'
 $t0 = Get-Date
 $p = Start-Process -FilePath $exe -PassThru
 $pid32 = [uint32]$p.Id

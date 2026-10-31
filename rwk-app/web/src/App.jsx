@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { api, onRwkEvent } from "./api.js";
 import KeyerTab from "./KeyerTab.jsx";
 import RouterTab from "./RouterTab.jsx";
 import RelayDialog, { DEFAULT_WAN_RELAY } from "./RelayDialog.jsx";
 import { LogEntries } from "./LogPanel.jsx";
+import AboutDialog from "./AboutDialog.jsx";
+import { APP_NAME_CLIENT } from "./app-info.js";
+
+const SPLASH_MS = 5000;
 
 const DEFAULT_SETTINGS = {
   wpm: 20,
@@ -28,15 +32,6 @@ const DEFAULT_SETTINGS = {
 // Direct / DERP at the top right), the Keyer and Ham Router tabs, and a log drawer. The bottom-left
 // shows whether FlexRadio discovery is enabled.
 export default function App() {
-  // The window is created hidden so the operator never sees a black webview while this UI builds;
-  // reveal it once the first render has painted.
-  useEffect(() => {
-    const id = requestAnimationFrame(() =>
-      requestAnimationFrame(() => invoke("ui_ready").catch(() => {})),
-    );
-    return () => cancelAnimationFrame(id);
-  }, []);
-
   const [tab, setTab] = useState("keyer");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [connection, setConnection] = useState({ state: "disconnected", path: "none" });
@@ -52,6 +47,9 @@ export default function App() {
   const [log, setLog] = useState([]);
   const [logOpen, setLogOpen] = useState(false);
   const [relayPrompt, setRelayPrompt] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [portsLoaded, setPortsLoaded] = useState(false);
   const pendingToken = useRef("");
   const unlisten = useRef(null);
 
@@ -59,6 +57,7 @@ export default function App() {
     onRwkEvent((ev) => {
       switch (ev.kind) {
         case "settings":
+          setSettingsLoaded(true);
           setSettings({
             wpm: ev.wpm,
             speedLocked: ev.speed_locked ?? false,
@@ -79,6 +78,7 @@ export default function App() {
           break;
         case "ports":
           setPorts(ev.available || []);
+          setPortsLoaded(true);
           break;
         case "audioDevices":
           // Each entry: { name, isDefault }.
@@ -139,6 +139,37 @@ export default function App() {
     };
   }, []);
 
+  // Reveal the finished Client UI, show the same native splash as the Station for five seconds,
+  // then fade it out. The timer starts only after the popup has been created.
+  const uiLoaded = settingsLoaded && portsLoaded;
+  useEffect(() => {
+    if (!uiLoaded) return undefined;
+    let timer;
+    let cancelled = false;
+    api.uiReady()
+      .catch(() => {})
+      .then(() => api.showSplash())
+      .then(() => {
+        if (cancelled) return;
+        timer = window.setTimeout(() => api.hideSplash().catch(() => {}), SPLASH_MS);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [uiLoaded]);
+
+  // File > About... from the native menu.
+  useEffect(() => {
+    const un = listen("rwk://menu", (e) => {
+      if (e.payload === "about") setAboutOpen(true);
+    });
+    return () => {
+      un.then((fn) => fn());
+    };
+  }, []);
+
   // Pair through the relay in settings (the built-in one until the operator changes it).
   function onPair(token) {
     pendingToken.current = token;
@@ -167,7 +198,7 @@ export default function App() {
   return (
     <div className="app">
       <div className="statusbar" style={{ borderTop: "none", borderBottom: "1px solid var(--border)" }}>
-        <strong style={{ color: "var(--accent)" }}>W1VE Remote Keyer-Router</strong>
+        <strong style={{ color: "var(--accent)" }}>W1VE Remote Keyer Router</strong>
         <span className="spring" />
         {paired && <span>RTT {rtt ?? "—"} ms</span>}
         {paired && <span style={{ margin: "0 8px", color: "var(--text-dim)" }}>|</span>}
@@ -231,6 +262,8 @@ export default function App() {
         <span style={{ color: sending ? "var(--accent)" : "var(--text-dim)" }}>{sending ? "Sending" : "Idle"}</span>
         <span style={{ color: keyDown ? "var(--key-on)" : "var(--text-dim)" }}>Key: {keyDown ? "Down" : "Up"}</span>
       </div>
+
+      {aboutOpen && <AboutDialog name={APP_NAME_CLIENT} onClose={() => setAboutOpen(false)} />}
 
       {relayPrompt && (
         <RelayDialog

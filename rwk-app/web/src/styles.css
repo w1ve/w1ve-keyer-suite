@@ -492,3 +492,8 @@ table.rules code {
   font-size: 10px;
   opacity: 0.7;
 }
+
+/* Pair first, then operate: establish the Player link before using keyer/router controls. */
+.keyer-body > .pairing-panel {
+  order: -1;
+}

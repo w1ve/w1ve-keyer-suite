@@ -1,8 +1,15 @@
 import { Fragment, useEffect, useState } from "react";
-import { clientApi as api, onEvent } from "./api.js";
+import { listen } from "@tauri-apps/api/event";
+import { clientApi as api, shellApi, onEvent } from "./api.js";
 import TransportSlider from "./TransportSlider.jsx";
 import RadarSweep from "./RadarSweep.jsx";
 import { LogEntries } from "./LogPanel.jsx";
+import ConnectionsTab from "./ConnectionsTab.jsx";
+import AboutDialog from "./AboutDialog.jsx";
+import { APP_NAME_CLIENT } from "./app-info.js";
+
+// How long the splash popup stays up once the main UI has loaded.
+const SPLASH_MS = 5000;
 
 // Is this platform event-driven for device changes? On Windows the backend pushes updated
 // device/port lists on WM_DEVICECHANGE, so no manual refresh is needed. Elsewhere we expose a
@@ -74,11 +81,16 @@ export default function ClientApp() {
   const [macros, setMacros] = useState(loadMacros);
   const [editing, setEditing] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
+  const [tab, setTab] = useState("main"); // "main" | "connections"
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [portsLoaded, setPortsLoaded] = useState(false);
 
   useEffect(() => {
     const unlisten = onEvent((ev) => {
       switch (ev.kind) {
         case "settings":
+          setSettingsLoaded(true);
           setSettings({
             wpm: ev.wpm,
             speedLocked: ev.speed_locked ?? false,
@@ -113,6 +125,7 @@ export default function ClientApp() {
           break;
         case "ports":
           setPorts(ev.available || []);
+          setPortsLoaded(true);
           break;
         case "audioDevices":
           // Each entry: { name, isDefault }.
@@ -131,6 +144,40 @@ export default function ClientApp() {
     // Pull current state once subscribed (startup push races the webview and is otherwise lost).
     unlisten.then(() => api.requestState().catch(() => {}));
     return () => unlisten.then((f) => f());
+  }, []);
+
+  // Splash popup: reveal the window and show the popup once the main UI has loaded (first
+  // settings + ports snapshots applied), then hide it five seconds later.
+  const uiLoaded = settingsLoaded && portsLoaded;
+  useEffect(() => {
+    if (!uiLoaded) return undefined;
+    let timer;
+    let cancelled = false;
+    shellApi
+      .uiReady()
+      .catch(() => {})
+      .then(() => shellApi.showSplash())
+      .then(() => {
+        if (cancelled) return;
+        timer = window.setTimeout(() => {
+          shellApi.hideSplash().catch(() => {});
+        }, SPLASH_MS);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [uiLoaded]);
+
+  // File > About... from the native menu.
+  useEffect(() => {
+    const un = listen("rwk://menu", (e) => {
+      if (e.payload === "about") setAboutOpen(true);
+    });
+    return () => {
+      un.then((fn) => fn());
+    };
   }, []);
 
   // Global ESC: abort sending from anywhere in the window (e.g. while a macro plays and the
@@ -196,6 +243,22 @@ export default function ClientApp() {
         <span>{pathText}</span>
       </div>
 
+      <div className="tabbar">
+        <button type="button" className={`tab${tab === "main" ? " active" : ""}`} onClick={() => setTab("main")}>
+          Main
+        </button>
+        <button
+          type="button"
+          className={`tab${tab === "connections" ? " active" : ""}`}
+          onClick={() => setTab("connections")}
+        >
+          Connections
+        </button>
+      </div>
+
+      {tab === "connections" ? (
+        <ConnectionsTab />
+      ) : (
       <div className="tabbody keyer-body">
         <div className="keyer-top">
           {/* ─── Keyer ─────────────────────────────────────── */}
@@ -384,8 +447,7 @@ export default function ClientApp() {
           </div>
         </div>
 
-        {/* ─── Pairing (full width) ──────────────────────── */}
-        <div className="panel">
+        <div className="panel pairing-panel">
           <h3>Pair with Player</h3>
           <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
             <div>
@@ -504,6 +566,7 @@ export default function ClientApp() {
           />
         )}
       </div>
+      )}
 
       {/* The log opens above the status bar and only then adds height. */}
       {logOpen && (
@@ -531,6 +594,8 @@ export default function ClientApp() {
           Key: {keyDown ? "Down" : "Up"}
         </span>
       </div>
+
+      {aboutOpen && <AboutDialog name={APP_NAME_CLIENT} onClose={() => setAboutOpen(false)} />}
     </div>
   );
 }

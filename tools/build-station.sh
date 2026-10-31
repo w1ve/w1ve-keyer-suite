@@ -21,4 +21,4 @@ SDK='C:\Program Files (x86)\Windows Kits\10'
 export INCLUDE="${MSVC}\\include;${SDK}\\Include\\10.0.19041.0\\ucrt;${SDK}\\Include\\10.0.19041.0\\um;${SDK}\\Include\\10.0.19041.0\\shared"
 export LIB="${MSVC}\\lib\\x64;${SDK}\\Lib\\10.0.19041.0\\ucrt\\x64;${SDK}\\Lib\\10.0.19041.0\\um\\x64"
 
-exec cargo build -p rwk-app --release --bin w1ve-rkr-station --features custom-protocol "$@"
+exec cargo build -p rwk-app --release --bin w1ve-krp --features custom-protocol "$@"

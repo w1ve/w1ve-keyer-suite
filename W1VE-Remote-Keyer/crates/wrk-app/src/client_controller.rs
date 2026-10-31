@@ -29,6 +29,9 @@ use rwk_core::engine::keying::{KeyerElement, KeyerElementTiming};
 use rwk_core::engine::logger_host::{HostReport, HostReporter, LoggerHost, TextSink};
 use rwk_core::engine::lan_discovery::{Beacon, LanAdvertiser};
 use rwk_core::engine::network::EdgeTransport;
+use rwk_core::engine::reconnect::{
+    self, connect_with_relay_retry, watch_edge_liveness, Liveness, ReconnectBudget,
+};
 use rwk_core::engine::paddle::PaddleKeyer;
 use rwk_core::engine::paddle_input::PaddleInputPort;
 use rwk_core::engine::serial::{
@@ -47,24 +50,10 @@ use crate::pairing::{self, Transport};
 /// The inner UDP port the keying edge rides over the tunnel, matching the Server.
 const EDGE_PORT: u16 = 5555;
 
-/// How often the Client beacons a liveness heartbeat to the Player. It must stay well inside the
-/// Player's 750 ms F1 window, or a key held longer than that with no edges is forced up.
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-/// The RTT readout refreshes once a second: every this many heartbeat ticks.
-const RTT_EVERY_TICKS: u32 = 4;
-
-/// How long the Client waits without ANY inbound traffic from the Player (heartbeats or any
-/// datagram) before declaring the peer lost and reconnecting. Five seconds rides out a brief
-/// relay/roaming hiccup while still catching a Player that was closed.
-const PEER_TIMEOUT: std::time::Duration = rwk_core::engine::reconnect::PEER_SILENCE_TIMEOUT;
-
-/// Consecutive failed reconnect attempts after which the Client gives up and stays
-/// disconnected (the operator must reconnect manually).
+/// Consecutive failed *connect* attempts after which the Client gives up and stays disconnected
+/// (the operator must reconnect manually). The 15 s [`reconnect::RECONNECT_WINDOW`] budget bounds
+/// the overall churn; this caps repeated hard failures inside it.
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
-
-/// Budget for re-establishing a lost link (shared policy): after this long the Keyer gives up
-/// and reports disconnected.
-const RECONNECT_BUDGET: std::time::Duration = rwk_core::engine::reconnect::RECONNECT_WINDOW;
 
 /// Control identifiers for inline error messages in the UI.
 mod control {
@@ -821,19 +810,17 @@ impl ClientController {
             // stops heartbeating (closed, or the link dropped), reconnect automatically with the
             // same token, up to MAX_RECONNECT_ATTEMPTS consecutive failures before giving up.
             let mut attempts: u32 = 0;
-            // Opened when a link is lost; the Keyer retries within it, then reports disconnected.
-            let mut budget: Option<rwk_core::engine::reconnect::ReconnectWindow> = None;
+            // The shared reconnect budget: a 15 s window that only resets after a link has stayed
+            // up for the stability threshold, so a pair-then-die flap cannot reconnect forever.
+            let mut budget = ReconnectBudget::new();
             loop {
-                let window = *budget.get_or_insert_with(|| {
-                    rwk_core::engine::reconnect::ReconnectWindow::open(std::time::Instant::now())
-                });
-                let remaining = window.remaining(std::time::Instant::now());
+                let remaining = budget.remaining(std::time::Instant::now());
                 if remaining.is_zero() {
                     fail(
                         &shared,
                         format!(
                             "Could not reach the Player within {}s; disconnected. Reconnect to try again.",
-                            RECONNECT_BUDGET.as_secs()
+                            reconnect::RECONNECT_WINDOW.as_secs()
                         ),
                     );
                     return;
@@ -845,23 +832,32 @@ impl ClientController {
                         Err(e) => return fail(&shared, e),
                     };
 
-                // Each attempt is capped by the budget left, so pairing cannot hang past it.
-                let attempt = tokio::time::timeout(remaining, tunnel::connect(&config)).await;
+                // Each attempt is capped by the budget left, so pairing cannot hang past it. The
+                // shared helper retries the relay rendezvous once (750 ms) inside that budget.
+                let attempt =
+                    tokio::time::timeout(remaining, connect_with_relay_retry(&config)).await;
                 match attempt {
                     Err(_) => shared.log("warn", "link failed: reconnect budget elapsed"),
                     Ok(Ok(connected)) => {
                         if let Some(edge) = bring_up_keying(&shared, connected).await {
-                            // Connected: a successful pairing clears the failure budget.
+                            // A link came up; it must prove it is stable before the budget resets.
                             attempts = 0;
-                            budget = None;
-                            let outcome = watch_edge_liveness(edge, Arc::clone(&shared)).await;
+                            let connected_at = std::time::Instant::now();
+                            let rtt_shared = Arc::clone(&shared);
+                            let outcome = watch_edge_liveness(edge, move |ms| {
+                                rtt_shared.emit(ClientEvent::Rtt { ms });
+                            })
+                            .await;
+                            // Only a link that stayed up past the stability threshold earns a
+                            // fresh budget; a flap keeps consuming the current window.
+                            budget.record_link_ended(connected_at, std::time::Instant::now());
                             // Tear the dead session down before retrying.
                             teardown_session(&shared).await;
                             if outcome == Liveness::Closed {
                                 // A deliberate local teardown (unpair) ends the supervisor.
                                 return;
                             }
-                            // Link lost: a fresh reconnect window opens on the next pass.
+                            // Link lost: retry within whatever budget remains.
                             shared.log("warn", "Player stopped responding; reconnecting…");
                             shared.emit(ClientEvent::Connection {
                                 state: "connecting".into(),
@@ -978,7 +974,11 @@ async fn lan_advertise_and_await(shared: Arc<Shared>, callsign: String, keyer_id
         //    responding (closed, or the link dropped), tear the dead session down and loop to
         //    re-advertise, so the radio site can re-establish without the operator re-arming.
         if let Some(edge) = bring_up_keying(&shared, connected).await {
-            let _ = watch_edge_liveness(edge, Arc::clone(&shared)).await;
+            let rtt_shared = Arc::clone(&shared);
+            let _ = watch_edge_liveness(edge, move |ms| {
+                rtt_shared.emit(ClientEvent::Rtt { ms });
+            })
+            .await;
             teardown_session(&shared).await;
             shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
             shared.log("info", "Player stopped responding; re-advertising on the LAN…");
@@ -995,69 +995,6 @@ async fn teardown_session(shared: &Arc<Shared>) {
     shared.edge.detach();
     if let Some(mut session) = shared.session.lock().await.take() {
         session.shutdown().await;
-    }
-}
-
-/// Why an edge-liveness watch ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Liveness {
-    /// No inbound traffic from the Player within [`PEER_TIMEOUT`]; the peer is presumed gone.
-    PeerLost,
-    /// The edge receive stream ended (the tunnel/netstack closed) — a clean teardown.
-    Closed,
-}
-
-/// The edge's round-trip time in whole milliseconds, or [`None`] before the first pong.
-fn rtt_millis(edge: &EdgeTransport) -> Option<u32> {
-    edge.rtt().map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
-}
-
-/// Watches the live edge for Player liveness while beaconing our own heartbeat.
-///
-/// Runs two things concurrently against the current `edge`:
-/// * a 1 Hz heartbeat sender, so the Player can tell this keyer is up even when idle;
-/// * an inbound watch: every datagram (a Player heartbeat, or any edge frame) refreshes a
-///   deadline; if [`PEER_TIMEOUT`] passes with silence, the peer is declared [`Liveness::PeerLost`].
-///
-/// Returns when the peer is lost or the stream closes. Keying out is unaffected — this only
-/// observes; the caller decides whether to reconnect.
-async fn watch_edge_liveness(edge: Arc<EdgeTransport>, shared: Arc<Shared>) -> Liveness {
-    let recv_edge = Arc::clone(&edge);
-    let receiver = async move {
-        loop {
-            // A received datagram (heartbeat or frame) proves the peer is alive this instant.
-            match tokio::time::timeout(PEER_TIMEOUT, recv_edge.recv_edge()).await {
-                // Any inbound datagram (Some) or a dropped-but-received one (None) = alive.
-                Ok(Ok(_)) => continue,
-                // The stream ended (netstack stopped): a clean close.
-                Ok(Err(_)) => return Liveness::Closed,
-                // No datagram at all within the window: the Player is presumed gone.
-                Err(_) => return Liveness::PeerLost,
-            }
-        }
-    };
-
-    // Each tick: a liveness heartbeat, a ping that the Player answers so we can measure the round
-    // trip, and the RTT the UI shows.
-    let hb_edge = Arc::clone(&edge);
-    let heartbeat = async move {
-        let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
-        let mut beats: u32 = 0;
-        loop {
-            tick.tick().await;
-            let _ = hb_edge.send_heartbeat().await;
-            let _ = hb_edge.send_ping().await;
-            beats = beats.wrapping_add(1);
-            if beats % RTT_EVERY_TICKS == 0 {
-                shared.emit(ClientEvent::Rtt { ms: rtt_millis(&hb_edge) });
-            }
-        }
-    };
-
-    // The heartbeat future never completes; the receiver decides the outcome.
-    tokio::select! {
-        outcome = receiver => outcome,
-        _ = heartbeat => Liveness::Closed,
     }
 }
 

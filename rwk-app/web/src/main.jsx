@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App.jsx";
 import StationApp from "./StationApp.jsx";
+import { APP_NAME_CLIENT, APP_NAME_STATION, APP_VERSION } from "./app-info.js";
 import "./styles.css";
 
 // The splash popup loads this same entry point and shows the artwork alone, so it uses the asset
@@ -14,6 +15,21 @@ const SPLASH_ONLY =
   new URLSearchParams(window.location.search).has("splash");
 
 function SplashArtwork() {
+  const [name, setName] = useState("W1VE Remote Keyer Router");
+  useEffect(() => {
+    let cancelled = false;
+    invoke("station_app_role")
+      .then((role) => {
+        if (!cancelled) setName(role === "station" ? APP_NAME_STATION : APP_NAME_CLIENT);
+      })
+      .catch(() => {
+        if (!cancelled) setName(APP_NAME_CLIENT);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <div style={{ position: "fixed", inset: 0, background: "#0d1721" }}>
       <img
@@ -21,6 +37,22 @@ function SplashArtwork() {
         alt=""
         style={{ display: "block", width: "100vw", height: "100vh" }}
       />
+      <div
+        style={{
+          position: "absolute",
+          left: 8,
+          top: 7,
+          padding: "3px 6px",
+          borderRadius: 4,
+          background: "rgba(5, 12, 19, 0.82)",
+          color: "#fff",
+          font: "600 10px Segoe UI, sans-serif",
+          lineHeight: 1.35,
+        }}
+      >
+        <div>{name}</div>
+        <div style={{ color: "#9ecfff", fontSize: 9 }}>Version {APP_VERSION}</div>
+      </div>
     </div>
   );
 }

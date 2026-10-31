@@ -4,6 +4,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export const api = {
+  // Reveals the main window, which is created hidden so the first thing shown is the finished UI
+  // rather than a black webview.
+  uiReady: () => invoke("ui_ready"),
+
+  // Splash: a native borderless popup window showing just the artwork, created and destroyed by
+  // the Rust side (the UI only decides when the main UI has loaded and when five seconds are up).
+  showSplash: () => invoke("show_splash"),
+  hideSplash: () => invoke("hide_splash"),
+
   // Pull the current settings + port list (called once the UI has subscribed, since the
   // backend's startup push races the webview and would otherwise be missed).
   requestState: () => invoke("request_state"),

@@ -15,7 +15,7 @@ use rwk_core::engine::bus::{CoreEvent, EventBus};
 use rwk_core::engine::edge_station::{pump_edges, tunnel_replayer};
 use rwk_core::engine::keying_arbiter::{KeyingArbiter, LineObserver, LineUpdate};
 use rwk_core::engine::network::EdgeTransport;
-use rwk_core::engine::reconnect::PEER_SILENCE_TIMEOUT;
+use rwk_core::engine::reconnect::{connect_with_relay_retry, PEER_SILENCE_TIMEOUT};
 use rwk_core::engine::replay::{spawn_driver, EdgeJitterProfile, SerialKeyingAdapter};
 use rwk_core::engine::serial::{
     enumerate_ports, natural_port_key, KeyingOutputConfig, PttTiming, SerialKeyingOutput,
@@ -575,7 +575,10 @@ impl ServerController {
                     Err(e) => return fail(&shared, e),
                 };
 
-            let connected = match tunnel::connect(&config).await {
+            // Retry the relay rendezvous once (750 ms) via the shared helper, so a transient
+            // relay race just after a Client restart does not fail the listen immediately — the
+            // same resilience the Client's connect path has.
+            let connected = match connect_with_relay_retry(&config).await {
                 Ok(c) => c,
                 Err(e) => return fail(&shared, format!("link failed: {e}")),
             };

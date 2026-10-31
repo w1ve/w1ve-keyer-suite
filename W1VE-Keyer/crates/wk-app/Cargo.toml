@@ -38,6 +38,11 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_LibraryLoader",
 ] }
 
+# Linux splash fade: Tauri already uses GTK 3 on Linux; this direct edge only brings the
+# WidgetExt opacity method into scope and does not add another GUI toolkit.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
 [features]
 # Enabled by Tauri's build tooling for production bundles so the webview serves the bundled
 # web/dist assets instead of the dev URL. Mirrors the sibling apps.

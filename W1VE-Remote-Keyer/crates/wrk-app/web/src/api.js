@@ -52,6 +52,15 @@ export const serverApi = {
   connectLan: (key, endpoint) => invoke("s_connect_lan", { key, endpoint }),
 };
 
+// Shared window/splash bridge: both the Client and the Server binaries register these commands.
+export const shellApi = {
+  // Reveals the main window, which is created hidden so the first thing shown is the finished UI.
+  uiReady: () => invoke("ui_ready"),
+  // Splash: a native borderless popup window showing just the artwork, created/destroyed by Rust.
+  showSplash: () => invoke("show_splash"),
+  hideSplash: () => invoke("hide_splash"),
+};
+
 // Both roles emit on the same `rwk://event` channel.
 export function onEvent(handler) {
   return listen("rwk://event", (e) => handler(e.payload));

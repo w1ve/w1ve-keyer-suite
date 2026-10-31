@@ -1,5 +1,11 @@
 import { Fragment, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api, onEvent } from "./api.js";
+import AboutDialog from "./AboutDialog.jsx";
+import ConnectionsTab from "./ConnectionsTab.jsx";
+
+// How long the splash popup stays up once the main UI has loaded.
+const SPLASH_MS = 5000;
 
 const MODES = [
   ["iambicB", "Iambic B"],
@@ -39,6 +45,7 @@ const IS_WINDOWS = /windows/i.test(navigator.userAgent);
 // serial ports and keyer macros/type-ahead below, and a KEY/PTT/SEND status strip.
 export default function App() {
   const [settings, setSettings] = useState(null);
+  const [tab, setTab] = useState("main");
   const [ports, setPorts] = useState([]);
   const [audioDevices, setAudioDevices] = useState([]);
   const [errors, setErrors] = useState({}); // control -> short red message
@@ -50,6 +57,10 @@ export default function App() {
   const [macros, setMacros] = useState(loadMacros);
   const [editing, setEditing] = useState(false);
   const [typeAhead, setTypeAhead] = useState("");
+  const [aboutOpen, setAboutOpen] = useState(false);
+  // The two snapshots that make the main UI complete: the first settings snapshot and the
+  // serial-port inventory behind the port pickers.
+  const [portsLoaded, setPortsLoaded] = useState(false);
   const unlisten = useRef(null);
 
   useEffect(() => {
@@ -60,6 +71,7 @@ export default function App() {
           break;
         case "ports":
           setPorts(ev.available || []);
+          setPortsLoaded(true);
           break;
         case "audioDevices":
           // Each entry: { name, isDefault }.
@@ -89,6 +101,41 @@ export default function App() {
     });
     return () => {
       if (unlisten.current) unlisten.current();
+    };
+  }, []);
+
+  // Splash popup: the window is revealed and the popup shown the instant the main UI has
+  // finished loading (first settings + ports snapshots applied), then hidden five seconds later.
+  // The 5 s timer starts after showSplash() resolves so the IPC round trip is not counted.
+  const uiLoaded = settings != null && portsLoaded;
+  useEffect(() => {
+    if (!uiLoaded) return undefined;
+    let timer;
+    let cancelled = false;
+    api
+      .uiReady()
+      .catch(() => {})
+      .then(() => api.showSplash())
+      .then(() => {
+        if (cancelled) return;
+        timer = window.setTimeout(() => {
+          api.hideSplash().catch(() => {});
+        }, SPLASH_MS);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [uiLoaded]);
+
+  // File > About... from the native menu.
+  useEffect(() => {
+    const un = listen("wk://menu", (e) => {
+      if (e.payload === "about") setAboutOpen(true);
+    });
+    return () => {
+      un.then((fn) => fn());
     };
   }, []);
 
@@ -153,6 +200,20 @@ export default function App() {
 
   return (
     <div className="app">
+      <div className="tabbar">
+        <button type="button" className={`tab${tab === "main" ? " active" : ""}`} onClick={() => setTab("main")}>
+          Main
+        </button>
+        <button
+          type="button"
+          className={`tab${tab === "connections" ? " active" : ""}`}
+          onClick={() => setTab("connections")}
+        >
+          Connections
+        </button>
+      </div>
+
+      {tab === "main" ? (
       <div className="body">
         <div className="col2">
           {/* ─── Keyer ─────────────────────────────────── */}
@@ -373,6 +434,9 @@ export default function App() {
           <LogView lines={log} />
         </div>
       </div>
+      ) : (
+        <ConnectionsTab />
+      )}
 
       {/* ─── Status strip ──────────────────────────────── */}
       <div className="statusbar">
@@ -392,6 +456,8 @@ export default function App() {
           onCancel={() => setEditing(false)}
         />
       )}
+
+      {aboutOpen && <AboutDialog onClose={() => setAboutOpen(false)} />}
     </div>
   );
 }

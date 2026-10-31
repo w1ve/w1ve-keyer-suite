@@ -12,9 +12,9 @@ repository.workspace = true
 name = "w1ve-remote-keyer"
 path = "src/main_client.rs"
 
-# The Server (remote radio site) binary: receives keyed edges and keys the radio.
+# The Player (remote radio site) binary: receives keyed edges and keys the radio.
 [[bin]]
-name = "w1ve-remote-keyer-station"
+name = "w1ve-remote-keyer-player"
 path = "src/main_server.rs"
 
 [build-dependencies]
@@ -41,6 +41,11 @@ windows-sys = { version = "0.60", features = [
     "Win32_UI_Shell",
     "Win32_System_LibraryLoader",
 ] }
+
+# Linux splash fade: Tauri already uses GTK 3 on Linux; this direct edge only brings the
+# WidgetExt opacity method into scope and does not add another GUI toolkit.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
 
 [features]
 # Enabled by Tauri's build tooling (and our standalone build) so the webview serves the

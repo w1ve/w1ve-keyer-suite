@@ -49,8 +49,8 @@ engine, so they look and behave consistently and a fix to the engine benefits al
 | App | Binaries | What it does |
 |-----|----------|--------------|
 | **W1VE Keyer** | `w1ve-keyer` | A standalone software WinKeyer. Paddle + logger (WinKeyer2) in, serial key-line out, local sidetone. No networking — a direct replacement for a hardware WinKeyer on the desk. |
-| **W1VE Remote Keyer** | `w1ve-remote-keyer`, `w1ve-remote-keyer-station` | A focused Client/Station pair that keys a radio at a remote site over an encrypted link. The operating position sends hand-sent CW; the radio-site station replays it on the key line with fail-safe protection. |
-| **W1VE Remote Keyer-Router** | `w1ve-rkr`, `w1ve-rkr-station` | The Remote Keyer plus a "Ham Router": TCP/UDP port forwarding, SSB PTT control, and FlexRadio discovery relay — CAT control, audio, and rig discovery tunneled alongside the CW. |
+| **W1VE Remote Keyer** | `w1ve-remote-keyer`, `w1ve-remote-keyer-player` | A focused Operator/Player pair that keys a radio at a remote site over an encrypted link. The operating position sends hand-sent CW; the radio-site Player replays it on the key line with fail-safe protection. |
+| **W1VE Remote Keyer Router** | `w1ve-krr`, `w1ve-krp` | The Remote Keyer plus a "Ham Router": TCP/UDP port forwarding, SSB PTT control, and FlexRadio discovery relay — CAT control, audio, and rig discovery tunneled alongside the CW. |
 | **Relay** (server) | `rwk-relay` | An optional, key-addressed packet relay for NAT traversal when the two ends of a networked link have no direct path. A Linux server/container, not a desktop app. |
 
 Both networked apps offer a **WAN** mode (rendezvous over a relay with a shared pairing code)
@@ -94,7 +94,7 @@ w1ve-keyer-suite/
   Cargo.toml          root workspace: rwk-core, rwk, rwk-relay, rwk-app
   common/rwk-core/    the shared engine: keyer timing, serial keying, sidetone,
                       paddle decode, WinKeyer2 host, WireGuard tunnel, relay, netstack
-  rwk-app/            W1VE Remote Keyer-Router (Client + Station + Ham Router)
+  rwk-app/            W1VE Remote Keyer Router (Client + Station + Ham Router)
   rwk-relay/          the relay server + dashboard
   linux/rwk-relay/    relay Dockerfile + compose (Linux server image)
   windows/rwk-relay/  relay deploy scripts (run from Windows)

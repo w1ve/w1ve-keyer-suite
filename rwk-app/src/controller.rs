@@ -25,6 +25,9 @@ use rwk_core::engine::flex_discovery::DiscoveryEmitter;
 use rwk_core::engine::keying::{KeyerElement, KeyerElementTiming};
 use rwk_core::engine::logger_host::{HostReport, HostReporter, LoggerHost, TextSink};
 use rwk_core::engine::network::EdgeTransport;
+use rwk_core::engine::reconnect::{
+    self, connect_with_relay_retry, watch_edge_liveness, Liveness, ReconnectBudget,
+};
 use rwk_core::engine::paddle::PaddleKeyer;
 use rwk_core::engine::paddle_input::PaddleInputPort;
 use rwk_core::engine::serial::{
@@ -40,6 +43,10 @@ use rwk_core::timing::{Clock, HybridWaiter, MonotonicClock};
 
 /// The inner UDP port the keying edge rides over the tunnel, both ends agreeing.
 const EDGE_PORT: u16 = 5555;
+
+/// Consecutive failed *connect* attempts after which the Client gives up and stays disconnected
+/// (the operator reconnects manually). The shared 15 s reconnect window bounds the overall churn.
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 
 /// Control identifiers for inline per-control error messages in the UI.
 mod control {
@@ -452,6 +459,10 @@ struct Shared {
     control_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<ControlMessage>>>,
     /// The task that keeps the control channel dialled while paired; aborted on unpair.
     control_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The WAN reconnect supervisor task: pairs, keys, watches the Station's liveness and
+    /// reconnects within the shared 15 s window. Present only while a WAN connect is active;
+    /// aborted on unpair. The LAN responder does not use this (it runs under `advertise`).
+    supervisor: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The live session, so the Client can restart its own forwards on a rule change. Shared
     /// (rather than held only on the controller) so command handlers reach it.
     session: tokio::sync::Mutex<Option<Session>>,
@@ -626,6 +637,7 @@ impl ClientController {
             advertise: tokio::sync::Mutex::new(None),
             control_tx: Mutex::new(None),
             control_task: Mutex::new(None),
+            supervisor: tokio::sync::Mutex::new(None),
             session: tokio::sync::Mutex::new(None),
             flex_emitter: Mutex::new(None),
             config: Mutex::new(config),
@@ -1297,41 +1309,106 @@ impl ClientController {
             }
         };
         let code = code.to_string();
+        // Cancel any prior pairing / supervisor so a re-Connect never leaves two loops running.
+        self.disconnect();
         let shared = Arc::clone(&self.shared);
 
         shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
 
-        self.runtime.spawn(async move {
-            // Clone the PERSISTED config so the WireGuard identity is stable across runs,
-            // then layer the relay and pairing code on top. The peer key is discovered by
-            // rendezvous, so no key paste is needed. The forward rules travel to the Station
-            // over the control channel, so they are not needed in the connect config.
-            let mut config = shared.config.lock().unwrap().clone();
-            config.role = Role::Client;
-            config.relay = Some(rwk_core::config::RelayConfig { address: relay_addr });
-            config.pairing_code = Some(code.clone());
+        let handle = self.runtime.spawn(async move {
             // Remember the relay + code for next launch.
             shared.persist_pairing(relay_addr, &code);
-
-            // The first rendezvous can race the relay or the peer's arrival; retry once before
-            // reporting the relay as unreachable.
-            let mut attempt = tunnel::connect(&config).await;
-            if attempt.is_err() {
-                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-                attempt = tunnel::connect(&config).await;
-            }
-            let connected = match attempt {
-                Ok(c) => c,
-                Err(e) => {
-                    // The relay did not answer: ask the operator for a relay address.
+            // Supervised WAN connect, identical in shape to the Remote Keyer Client: pair, key,
+            // watch the Station's liveness, and reconnect automatically within the shared 15 s
+            // budget. The budget only resets after a link has stayed up for the stability
+            // threshold, so a pair-then-die flap cannot reconnect forever.
+            let mut attempts: u32 = 0;
+            let mut budget = ReconnectBudget::new();
+            loop {
+                let remaining = budget.remaining(std::time::Instant::now());
+                if remaining.is_zero() {
                     shared.emit(ClientEvent::Error {
                         control: "relay".into(),
                         message: "Relay not reachable".into(),
                     });
-                    return fail(&shared, format!("link failed: {e}"));
+                    fail(
+                        &shared,
+                        format!(
+                            "Could not reach the Station within {}s; disconnected. Reconnect to try again.",
+                            reconnect::RECONNECT_WINDOW.as_secs()
+                        ),
+                    );
+                    return;
                 }
-            };
-            bring_up_client(&shared, connected).await;
+
+                // Clone the PERSISTED config so the WireGuard identity is stable across runs,
+                // then layer the relay and pairing code on top. The peer key is discovered by
+                // rendezvous, so no key paste is needed. The forward rules travel to the Station
+                // over the control channel, so they are not needed in the connect config.
+                let config = {
+                    let mut config = shared.config.lock().unwrap().clone();
+                    config.role = Role::Client;
+                    config.relay = Some(rwk_core::config::RelayConfig { address: relay_addr });
+                    config.pairing_code = Some(code.clone());
+                    config
+                };
+
+                // Each attempt is capped by the budget left, so pairing cannot hang past it; the
+                // shared helper retries the relay rendezvous once (750 ms) inside that budget.
+                let attempt =
+                    tokio::time::timeout(remaining, connect_with_relay_retry(&config)).await;
+                match attempt {
+                    Err(_) => shared.log("warn", "link failed: reconnect budget elapsed"),
+                    Ok(Ok(connected)) => {
+                        if let Some(edge) = bring_up_client(&shared, connected).await {
+                            attempts = 0;
+                            let connected_at = std::time::Instant::now();
+                            let rtt_shared = Arc::clone(&shared);
+                            let outcome = watch_edge_liveness(edge, move |ms| {
+                                rtt_shared.emit(ClientEvent::Rtt { ms });
+                            })
+                            .await;
+                            budget.record_link_ended(connected_at, std::time::Instant::now());
+                            teardown_session(&shared).await;
+                            if outcome == Liveness::Closed {
+                                // A deliberate local teardown (unpair) ends the supervisor.
+                                return;
+                            }
+                            shared.log("warn", "The Station stopped responding; reconnecting…");
+                            shared.emit(ClientEvent::Connection {
+                                state: "connecting".into(),
+                                path: "none".into(),
+                            });
+                            continue;
+                        }
+                    }
+                    Ok(Err(e)) => shared.log("warn", format!("link failed: {e}")),
+                }
+
+                attempts += 1;
+                if attempts >= MAX_RECONNECT_ATTEMPTS {
+                    shared.emit(ClientEvent::Error {
+                        control: "relay".into(),
+                        message: "Relay not reachable".into(),
+                    });
+                    fail(
+                        &shared,
+                        format!(
+                            "Could not reach the Station after {MAX_RECONNECT_ATTEMPTS} attempts; \
+                             giving up. Reconnect to try again."
+                        ),
+                    );
+                    return;
+                }
+                shared.log(
+                    "info",
+                    format!("Reconnect attempt {attempts}/{MAX_RECONNECT_ATTEMPTS}…"),
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+        self.runtime.block_on(async {
+            *self.shared.supervisor.lock().await = Some(handle);
         });
     }
 
@@ -1342,6 +1419,9 @@ impl ClientController {
         self.shared.edge.detach();
         let shared = Arc::clone(&self.shared);
         self.runtime.block_on(async move {
+            if let Some(task) = shared.supervisor.lock().await.take() {
+                task.abort();
+            }
             if let Some(task) = shared.advertise.lock().await.take() {
                 task.abort();
             }
@@ -1361,17 +1441,11 @@ impl ClientController {
     }
 }
 
-/// How long the Client waits without any inbound datagram from the Station before it declares the
-/// pairing lost. The Station answers every 250 ms, so five seconds is ample.
-const PEER_TIMEOUT: std::time::Duration = rwk_core::engine::reconnect::PEER_SILENCE_TIMEOUT;
-
-/// Whether the Station has been silent for at least [`PEER_TIMEOUT`] as of `now`.
-fn peer_silent(last_heard: std::time::Instant, now: std::time::Instant) -> bool {
-    now.saturating_duration_since(last_heard) >= PEER_TIMEOUT
-}
-
-/// The Station stopped answering: tear the pairing down as Unpair does, then report disconnected.
-async fn drop_lost_peer(shared: &Arc<Shared>) {
+/// Tears the current pairing's edge, control channel and session down **without** emitting
+/// "disconnected" or touching the LAN advertiser, so the WAN supervisor can reconnect cleanly.
+/// The time-critical keyer threads key into `shared.edge`, which is detached here; with no
+/// transport the frames are dropped until the next `bring_up_client` reinstalls one.
+async fn teardown_session(shared: &Arc<Shared>) {
     *shared.transport.lock().unwrap() = None;
     shared.edge.detach();
     if let Some(task) = shared.control_task.lock().unwrap().take() {
@@ -1380,88 +1454,37 @@ async fn drop_lost_peer(shared: &Arc<Shared>) {
     *shared.control_tx.lock().unwrap() = None;
     // Report the teardown before awaiting the session, so the UI cannot stay on a live pairing.
     shared.emit(ClientEvent::Rtt { ms: None });
-    shared.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
-    shared.log("warn", "The Station stopped responding; unpaired.");
+    *shared.control_tx.lock().unwrap() = None;
     if let Some(mut session) = shared.session.lock().await.take() {
         session.shutdown().await;
     }
 }
 
-/// Liveness heartbeat and round-trip probe for a paired link. Each tick it sends a heartbeat
-/// (so the Station's watchdogs see the Client alive) and a ping the Station answers; every
-/// fourth tick it reports the RTT to the UI. It runs only while `transport` is still the live
-/// one, so it stops by itself once the pairing ends.
-fn spawn_rtt_heartbeat(shared: Arc<Shared>, transport: Arc<EdgeTransport>) {
-    // The Client only sends, so nothing else reads the link. Drain inbound datagrams here so the
-    // Station's pong to each ping is processed (that is what sets the round trip).
-    {
-        let shared = Arc::clone(&shared);
-        let transport = Arc::clone(&transport);
-        tokio::spawn(async move {
-            // Any inbound datagram (the Station heartbeat or a pong) proves the Station is there.
-            let mut last_heard = std::time::Instant::now();
-            loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(1), transport.recv_edge()).await {
-                    Ok(Ok(_)) => last_heard = std::time::Instant::now(),
-                    Ok(Err(_)) => return,
-                    Err(_) => {}
-                }
-                let live = shared
-                    .transport
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|t| Arc::ptr_eq(t, &transport));
-                if !live {
-                    return;
-                }
-                if peer_silent(last_heard, std::time::Instant::now()) {
-                    drop_lost_peer(&shared).await;
-                    return;
-                }
-            }
-        });
-    }
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
-        let mut beats: u32 = 0;
-        loop {
-            tick.tick().await;
-            let live = shared
-                .transport
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|t| Arc::ptr_eq(t, &transport));
-            if !live {
-                return;
-            }
-            let _ = transport.send_heartbeat().await;
-            let _ = transport.send_ping().await;
-            beats = beats.wrapping_add(1);
-            if beats % 4 == 0 {
-                let ms = transport.rtt().map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
-                shared.emit(ClientEvent::Rtt { ms });
-            }
-        }
-    });
-}
-
 /// Shared post-connect wiring for the Client (operating position), used by both the WAN
 /// `connect` and the LAN advertise paths: start the session, open the keying edge, open the
-/// control channel and push the forward rules, and report connected.
-async fn bring_up_client(shared: &Arc<Shared>, connected: tunnel::Connected) {
+/// control channel and push the forward rules, and report connected. Returns the live
+/// [`EdgeTransport`] so the caller can watch it for peer liveness, or [`None`] if bring-up failed.
+async fn bring_up_client(
+    shared: &Arc<Shared>,
+    connected: tunnel::Connected,
+) -> Option<Arc<EdgeTransport>> {
     let path = format!("{:?}", connected.path).to_lowercase();
     let config = shared.config.lock().unwrap().clone();
     let session = match Session::start(connected, &config) {
         Ok(s) => s,
-        Err(e) => return fail(shared, format!("session failed: {e}")),
+        Err(e) => {
+            fail(shared, format!("session failed: {e}"));
+            return None;
+        }
     };
     let net = session.handle();
 
     let conn = match net.open_udp(EDGE_PORT).await {
         Ok(c) => c,
-        Err(e) => return fail(shared, format!("edge open failed: {e}")),
+        Err(e) => {
+            fail(shared, format!("edge open failed: {e}"));
+            return None;
+        }
     };
     let transport = Arc::new(EdgeTransport::over_tunnel(conn));
     let peer = std::net::SocketAddr::new(
@@ -1487,7 +1510,6 @@ async fn bring_up_client(shared: &Arc<Shared>, connected: tunnel::Connected) {
     // The Station builds a fresh replayer per session, so it accepts the restart.
     shared.edge.begin(*shared.epoch.lock().unwrap(), MonotonicClock.now(), Arc::clone(&transport));
     *shared.transport.lock().unwrap() = Some(Arc::clone(&transport));
-    spawn_rtt_heartbeat(Arc::clone(shared), Arc::clone(&transport));
 
     if let Some(mut old) = shared.session.lock().await.replace(session) {
         old.shutdown().await;
@@ -1499,6 +1521,8 @@ async fn bring_up_client(shared: &Arc<Shared>, connected: tunnel::Connected) {
     // replayer down and back up per pairing), so a stable epoch is both correct and necessary.
     shared.emit(ClientEvent::Connection { state: "connected".into(), path: path.clone() });
     shared.log("info", format!("Paired over the {path} path."));
+    // Hand the live transport back so the supervisor (WAN) or the LAN loop can watch liveness.
+    Some(Arc::clone(&transport))
 }
 
 /// The operating-position LAN flow: a **persistent responder**. The operator arms it once
@@ -1549,7 +1573,21 @@ async fn lan_advertise_and_await(shared: Arc<Shared>) {
         };
         beacon_task.abort();
         shared.emit(ClientEvent::Advertising { active: false });
-        bring_up_client(&shared, connected).await;
+
+        // Bring the link up, then watch the Station's liveness. When it stops responding (closed
+        // or dropped), tear the dead session down and loop to re-advertise, so the Station can
+        // re-establish without the operator re-arming. The LAN responder is deliberately
+        // unbounded (a rebooting Station should always find the beacon waiting).
+        if let Some(edge) = bring_up_client(&shared, connected).await {
+            let rtt_shared = Arc::clone(&shared);
+            let _ = watch_edge_liveness(edge, move |ms| {
+                rtt_shared.emit(ClientEvent::Rtt { ms });
+            })
+            .await;
+            teardown_session(&shared).await;
+            shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
+            shared.log("info", "The Station stopped responding; re-advertising on the LAN…");
+        }
     }
 }
 
@@ -2062,10 +2100,13 @@ mod tests {
 
     #[test]
     fn peer_is_lost_only_after_the_full_timeout() {
+        // The Client's peer-loss detection uses the shared reconnect policy; assert the boundary
+        // against it so this app stays pinned to the same 1.5 s timeout as the Station.
+        use rwk_core::engine::reconnect::{peer_silent, PEER_SILENCE_TIMEOUT};
         let heard = Instant::now();
         assert!(!peer_silent(heard, heard));
-        assert!(!peer_silent(heard, heard + PEER_TIMEOUT - Duration::from_millis(1)));
-        assert!(peer_silent(heard, heard + PEER_TIMEOUT));
+        assert!(!peer_silent(heard, heard + PEER_SILENCE_TIMEOUT - Duration::from_millis(1)));
+        assert!(peer_silent(heard, heard + PEER_SILENCE_TIMEOUT));
         assert!(peer_silent(heard, heard + Duration::from_secs(30)));
     }
 

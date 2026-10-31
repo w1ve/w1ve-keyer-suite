@@ -1,11 +1,11 @@
-//! The W1VE Remote Keyer-Router desktop applications (Tauri v2).
+//! The W1VE Remote Keyer Router desktop applications (Tauri v2).
 //!
 //! This crate is the operator-facing shell over the native [`rwk_core`] engine. It ships as
 //! **two separate executables** that share this one library:
 //!
-//! * `w1ve-rkr` — the **Client** (operating position): the paddle/keyer UI, driven by
+//! * `w1ve-krr` — the **Client** (operating position): the paddle/keyer UI, driven by
 //!   [`ClientController`]. Entry point [`run_client`].
-//! * `w1ve-rkr-station` — the **Station** (remote radio site): the replay/keying UI, driven
+//! * `w1ve-krp` — the **Player** (remote radio site): the replay/keying UI, driven
 //!   by [`StationController`]. Entry point [`run_station`].
 //!
 //! They are distinct binaries, not one app in two modes, because the two sides run on
@@ -46,8 +46,28 @@ fn window_handle_isize(window: &tauri::WebviewWindow) -> Option<isize> {
     }
 }
 
+/// The main window is configured visible so WebKitGTK starts navigation. During setup Linux keeps
+/// it mapped at zero opacity; other platforms hide it before the event loop presents it.
+/// [`ui_ready`] reveals the finished UI.
+#[allow(unused_variables)]
+fn prepare_hidden_main_window(window: &tauri::WebviewWindow) {
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::WidgetExt;
+        if let Ok(native) = window.gtk_window() {
+            // The config creates the window visible so WebKitGTK starts navigation; setup runs
+            // before the event loop maps it, so zero opacity prevents any startup flash.
+            native.set_opacity(0.0);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window.hide();
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Client application (`w1ve-rkr`)
+//  Client application (`w1ve-krr`)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// The Tauri-managed state for the Client app: the live Client controller plus the serial
@@ -73,8 +93,10 @@ pub fn run_client() {
             // Install the serial PnP watcher. On Windows it subclasses this window for
             // WM_DEVICECHANGE; elsewhere it polls. Either way it fires the controller's port
             // reconciliation, which pushes a fresh Ports event and drops vanished selections.
-            let raw_window =
-                app.get_webview_window("main").and_then(|w| window_handle_isize(&w));
+            let raw_window = app.get_webview_window("main").and_then(|w| {
+                prepare_hidden_main_window(&w);
+                window_handle_isize(&w)
+            });
             let app_handle = app.handle().clone();
             let on_change: device_watch::OnChange = Arc::new(move || {
                 if let Some(state) = app_handle.try_state::<ClientState>() {
@@ -83,10 +105,38 @@ pub fn run_client() {
             });
             let watcher = DeviceChangeWatcher::start(raw_window, on_change);
             app.manage(ClientState { controller, _watcher: watcher });
+
+            // File menu: About... opens the role-specific dialog; Exit tears down a live pairing
+            // before quitting.
+            let about_item = MenuItemBuilder::with_id("about", "About...").build(app)?;
+            let exit_item = MenuItemBuilder::with_id("exit", "Exit").build(app)?;
+            let file_menu = SubmenuBuilder::new(app, "File")
+                .item(&about_item)
+                .separator()
+                .item(&exit_item)
+                .build()?;
+            let menu = MenuBuilder::new(app).item(&file_menu).build()?;
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_menu(menu)?;
+            }
+            app.on_menu_event(|app, event| match event.id().as_ref() {
+                "about" => {
+                    let _ = app.emit("rwk://menu", "about");
+                }
+                "exit" => {
+                    if let Some(state) = app.try_state::<ClientState>() {
+                        state.controller.disconnect();
+                    }
+                    app.exit(0);
+                }
+                _ => {}
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             ui_ready,
+            show_splash,
+            hide_splash,
             ping,
             request_state,
             set_speed,
@@ -129,19 +179,33 @@ pub fn run() {
 
 /// Reveals the main window.
 ///
-/// The window is created hidden (`"visible": false` in tauri.conf.json) so the operator never
-/// sees a black webview while the front end boots; each UI calls this once it has rendered, and
-/// the front end also fires it on a timer as a safety net. Shared by both executables.
+/// The configured-visible window is hidden during setup (or mapped at zero opacity on Linux), so
+/// the operator never sees an unfinished webview. Each UI calls this once rendered; the frontend
+/// also fires it on a timer as a safety net. Shared by both executables.
 #[tauri::command]
 fn ui_ready(window: tauri::WebviewWindow) {
-    let _ = window.show();
-    let _ = window.set_focus();
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::{GtkWindowExt, WidgetExt};
+        let dispatch_window = window.clone();
+        let _ = window.run_on_main_thread(move || {
+            if let Ok(native) = dispatch_window.gtk_window() {
+                native.set_opacity(1.0);
+                native.present();
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 /// A trivial liveness command, used to confirm the UI↔Rust bridge is wired.
 #[tauri::command]
 fn ping() -> String {
-    format!("w1ve-rkr {} ready", env!("CARGO_PKG_VERSION"))
+    format!("w1ve-krr {} ready", env!("CARGO_PKG_VERSION"))
 }
 
 /// Re-emits settings, forward rules, flex state, ports, and audio devices. The UI calls this
@@ -334,7 +398,7 @@ fn set_flex_discovery(state: State<'_, ClientState>, enabled: bool) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Station application (`w1ve-rkr-station`)
+//  Player application (`w1ve-krp`)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// The Tauri-managed state for the Station app: the live Station controller plus the serial
@@ -360,8 +424,9 @@ pub fn run_station() {
             // end probes the `station_app_role` command, which exists only in this binary, and
             // mounts the Station UI when it succeeds (and the Client UI when it does not).
             let raw_window = if let Some(window) = app.get_webview_window("main") {
+                prepare_hidden_main_window(&window);
                 let _ = window.set_title(
-                    "W1VE Remote Keyer-Router Station — Any Rig, Any Internet, Anytime",
+                    "W1VE Remote Keyer Router Player",
                 );
                 // A compact site window: about half of a 1024x768 screen. The shared config's
                 // 980x640 window (minimum 900x560) is too wide for a Station, so override it here.
@@ -393,7 +458,9 @@ pub fn run_station() {
                 .item(&exit_item)
                 .build()?;
             let menu = MenuBuilder::new(app).item(&file_menu).build()?;
-            app.set_menu(menu)?;
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_menu(menu)?;
+            }
             app.on_menu_event(|app, event| match event.id().as_ref() {
                 "about" => {
                     let _ = app.emit("rwk://menu", "about");
@@ -430,13 +497,13 @@ pub fn run_station() {
             station_disconnect,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running the RWK Station application");
+        .expect("error while running the W1VE Remote Keyer Router Player application");
 }
 
 /// Station liveness command.
 #[tauri::command]
 fn station_ping() -> String {
-    format!("w1ve-rkr-station {} ready", env!("CARGO_PKG_VERSION"))
+    format!("w1ve-krp {} ready", env!("CARGO_PKG_VERSION"))
 }
 
 /// Which role this executable is. The shared web bundle calls this once at startup and mounts
@@ -452,6 +519,26 @@ fn station_request_state(state: State<'_, StationState>) {
     state.controller.request_state();
 }
 
+/// Shows the Client splash as the same borderless artwork popup used by the Station.
+#[tauri::command]
+async fn show_splash(app: tauri::AppHandle) -> Result<(), String> {
+    build_splash_window(&app)?;
+    // WebKitGTK maps a new top-level webview asynchronously. Hold the IPC response briefly so
+    // the frontend's five-second timer begins after the Linux splash is actually visible.
+    #[cfg(target_os = "linux")]
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    Ok(())
+}
+
+/// Hides the Client splash with the same platform fade used by the Station.
+#[tauri::command]
+async fn hide_splash(app: tauri::AppHandle) {
+    if let Some(splash) = app.get_webview_window("splash") {
+        fade_splash_out(&splash).await;
+        let _ = splash.close();
+    }
+}
+
 /// Shows the splash as a borderless popup window containing only the artwork.
 ///
 /// The splash is deliberately its own window: an overlay inside the main webview filled the whole
@@ -464,7 +551,12 @@ async fn station_show_splash(app: tauri::AppHandle) -> Result<(), String> {
     // MUST be async: on Windows, WebviewWindowBuilder deadlocks when it runs inside a synchronous
     // command or event handler (tauri-apps/tauri#13092). The symptom is a window whose webview
     // never initialises — it shows the bare window background and no document at all.
-    build_splash_window(&app)
+    build_splash_window(&app)?;
+    // WebKitGTK maps a new top-level webview asynchronously. Hold the IPC response briefly so
+    // the frontend's five-second timer begins after the Linux splash is actually visible.
+    #[cfg(target_os = "linux")]
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    Ok(())
 }
 
 /// Builds (or rebuilds) the splash popup. Must run on the main thread.
@@ -502,11 +594,15 @@ fn build_splash_window(app: &tauri::AppHandle) -> Result<(), String> {
         // ("splash") and renders the artwork alone in this one.
         tauri::WebviewUrl::App("index.html".into()),
     )
-    .title("RWK Station")
+    .title("W1VE Remote Keyer Router")
     .inner_size(SPLASH_W, SPLASH_H)
+    .min_inner_size(SPLASH_W, SPLASH_H)
+    .max_inner_size(SPLASH_W, SPLASH_H)
     .position(x, y)
     .decorations(false)
-    .resizable(false)
+    // GTK chooses a 200 px minimum on the first configure when a window starts non-resizable.
+    // Build resizable while hidden, map at 300x168, then lock it after the first configure.
+    .resizable(true)
     // Opaque window whose colour matches the artwork's own background: a transparent window here
     // rendered nothing at all on Windows, leaving the popup see-through.
     .transparent(false)
@@ -515,12 +611,59 @@ fn build_splash_window(app: &tauri::AppHandle) -> Result<(), String> {
     .always_on_top(true)
     .skip_taskbar(true)
     .focused(false)
+    // Build hidden so GTK never maps the inherited application-menu allocation. Remove the menu
+    // and apply the exact artwork size below before the popup becomes visible.
+    .visible(false)
     .build()
     .map_err(|e| e.to_string())?;
 
-    // The File menu belongs to the main window; without this the popup would also carry a menu bar
-    // and be taller than the artwork.
+    // The File menu belongs to the main window. GTK may keep the menu row's allocation after
+    // removal, so reset the popup to the artwork's exact logical size afterwards.
     let _ = splash.remove_menu();
+    let _ = splash.set_size(tauri::LogicalSize::new(SPLASH_W, SPLASH_H));
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::{GtkWindowExt, WidgetExt};
+        let dispatch_window = splash.clone();
+        let _ = splash.run_on_main_thread(move || {
+            if let Ok(native) = dispatch_window.gtk_window() {
+                native.resize(SPLASH_W as i32, SPLASH_H as i32);
+                // Tauri's show path below maps and initializes the WebKit child. The delayed
+                // hints correct GTK's initial 200 px floor without bypassing that lifecycle.
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(100),
+                    move || {
+                        let geometry = gtk::gdk::Geometry::new(
+                            SPLASH_W as i32,
+                            SPLASH_H as i32,
+                            SPLASH_W as i32,
+                            SPLASH_H as i32,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0.0,
+                            0.0,
+                            gtk::gdk::Gravity::Center,
+                        );
+                        native.set_geometry_hints(
+                            None::<&gtk::Window>,
+                            Some(&geometry),
+                            gtk::gdk::WindowHints::MIN_SIZE | gtk::gdk::WindowHints::MAX_SIZE,
+                        );
+                        native.resize(SPLASH_W as i32, SPLASH_H as i32);
+                    },
+                );
+            }
+        });
+        // Map through Tauri so the WebKit child receives its initial navigation.
+        let _ = splash.show();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = splash.set_resizable(false);
+        let _ = splash.show();
+    }
     Ok(())
 }
 
@@ -532,21 +675,18 @@ fn build_splash_window(app: &tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn station_hide_splash(app: tauri::AppHandle) {
     if let Some(splash) = app.get_webview_window("splash") {
-        fade_splash_out(&splash);
+        fade_splash_out(&splash).await;
         let _ = splash.close();
     }
 }
 
 /// Steps the splash window's alpha down to zero, then returns so the caller can close it.
 ///
-/// Windows composites a top-level window as one surface, so `WS_EX_LAYERED` +
-/// `SetLayeredWindowAttributes` fades the artwork *and* the window plate together. Fading inside
-/// the webview instead (CSS opacity on the artwork) could only dissolve the artwork into the
-/// popup's own background colour, and the plate would still disappear in a single frame.
-///
-/// Off Windows there is no equivalent one-call window alpha, so the popup just closes.
+/// Windows uses layered-window alpha; Linux uses GTK widget opacity. Both fade the complete
+/// top-level window surface, including the artwork and its opaque plate. Other platforms close
+/// directly until they gain an equivalent native implementation.
 #[allow(unused_variables)]
-fn fade_splash_out(window: &tauri::WebviewWindow) {
+async fn fade_splash_out(window: &tauri::WebviewWindow) {
     #[cfg(windows)]
     {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -578,6 +718,29 @@ fn fade_splash_out(window: &tauri::WebviewWindow) {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(8));
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::WidgetExt;
+
+        const FADE_MS: u64 = 200;
+        let start = std::time::Instant::now();
+        loop {
+            let elapsed = start.elapsed().as_millis() as u64;
+            let remaining = FADE_MS.saturating_sub(elapsed);
+            let opacity = remaining as f64 / FADE_MS as f64;
+            let dispatch_window = window.clone();
+            let _ = window.run_on_main_thread(move || {
+                if let Ok(native) = dispatch_window.gtk_window() {
+                    native.set_opacity(opacity);
+                }
+            });
+            if remaining == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
         }
     }
 }

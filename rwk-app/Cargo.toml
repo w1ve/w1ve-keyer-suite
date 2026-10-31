@@ -6,17 +6,17 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-default-run = "w1ve-rkr"
+default-run = "w1ve-krr"
 
 # The Client (operating-position) binary.
 [[bin]]
-name = "w1ve-rkr"
+name = "w1ve-krr"
 path = "src/main.rs"
 
-# The Station (remote radio site) binary. A separate executable sharing this crate's library
+# The Player (remote radio site) binary. A separate executable sharing this crate's library
 # and web bundle, but running the Station controller, command set, and window.
 [[bin]]
-name = "w1ve-rkr-station"
+name = "w1ve-krp"
 path = "src/main_station.rs"
 
 [build-dependencies]
@@ -44,6 +44,11 @@ windows-sys = { version = "0.60", features = [
     "Win32_UI_Shell",
     "Win32_System_LibraryLoader",
 ] }
+
+# Linux splash fade: Tauri already uses GTK 3 on Linux; this direct edge only brings the
+# WidgetExt opacity method into scope and does not add another GUI toolkit.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
 
 [features]
 # Enabled by Tauri's build tooling for production bundles; harmless in dev.

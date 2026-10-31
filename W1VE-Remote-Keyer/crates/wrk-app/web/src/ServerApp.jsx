@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
-import { serverApi as api, onEvent } from "./api.js";
+import { listen } from "@tauri-apps/api/event";
+import { serverApi as api, shellApi, onEvent } from "./api.js";
 import TransportSlider from "./TransportSlider.jsx";
 import LogPanel from "./LogPanel.jsx";
+import ConnectionsTab from "./ConnectionsTab.jsx";
+import AboutDialog from "./AboutDialog.jsx";
+import { APP_NAME_SERVER } from "./app-info.js";
+
+// How long the splash popup stays up once the main UI has loaded.
+const SPLASH_MS = 5000;
 
 // The Remote Keyer Server: keying-output configuration, WAN/LAN choice, the pairing token to
 // hand the Client, KEY/PTT indicators, and a fail-safe banner. Same look-and-feel as the
@@ -27,11 +34,17 @@ export default function ServerApp() {
   const [errors, setErrors] = useState({}); // control -> short red message
   const [lanPeers, setLanPeers] = useState([]);
   const [pickedKey, setPickedKey] = useState("");
+  const [tab, setTab] = useState("main"); // "main" | "connections"
+  const [aboutOpen, setAboutOpen] = useState(false);
+  // The two snapshots that make the main UI complete: first settings snapshot and ports.
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [portsLoaded, setPortsLoaded] = useState(false);
 
   useEffect(() => {
     const unlisten = onEvent((ev) => {
       switch (ev.kind) {
         case "settings":
+          setSettingsLoaded(true);
           setSettings({
             keyingPort: ev.keying_port,
             loggerPort: ev.logger_port,
@@ -64,6 +77,7 @@ export default function ServerApp() {
           break;
         case "ports":
           setPorts(ev.available || []);
+          setPortsLoaded(true);
           break;
         case "error":
           setErrors((e) => ({ ...e, [ev.control]: ev.message || undefined }));
@@ -78,6 +92,40 @@ export default function ServerApp() {
     // Pull current state once subscribed (startup push races the webview and is otherwise lost).
     unlisten.then(() => api.requestState().catch(() => {}));
     return () => unlisten.then((f) => f());
+  }, []);
+
+  // Splash popup: reveal the window and show the popup once the main UI has loaded (first
+  // settings + ports snapshots applied), then hide it five seconds later.
+  const uiLoaded = settingsLoaded && portsLoaded;
+  useEffect(() => {
+    if (!uiLoaded) return undefined;
+    let timer;
+    let cancelled = false;
+    shellApi
+      .uiReady()
+      .catch(() => {})
+      .then(() => shellApi.showSplash())
+      .then(() => {
+        if (cancelled) return;
+        timer = window.setTimeout(() => {
+          shellApi.hideSplash().catch(() => {});
+        }, SPLASH_MS);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [uiLoaded]);
+
+  // File > About... from the native menu.
+  useEffect(() => {
+    const un = listen("rwk://menu", (e) => {
+      if (e.payload === "about") setAboutOpen(true);
+    });
+    return () => {
+      un.then((fn) => fn());
+    };
   }, []);
 
   // Keep the picked keyer valid as the live list changes.
@@ -98,7 +146,7 @@ export default function ServerApp() {
   return (
     <div className="app">
       <div className="statusbar" style={{ borderTop: "none", borderBottom: "1px solid var(--border)" }}>
-        <strong style={{ color: "var(--accent)" }}>W1VE Remote Keyer — Player</strong>
+        <strong style={{ color: "var(--accent)" }}>W1VE Remote Keyer Player</strong>
         <span className="spring" />
         {running && <span>RTT {rtt ?? "—"} ms</span>}
         {running && <span style={{ margin: "0 8px", color: "var(--text-dim)" }}>|</span>}
@@ -106,6 +154,22 @@ export default function ServerApp() {
         <span>{pathText}</span>
       </div>
 
+      <div className="tabbar">
+        <button type="button" className={`tab${tab === "main" ? " active" : ""}`} onClick={() => setTab("main")}>
+          Main
+        </button>
+        <button
+          type="button"
+          className={`tab${tab === "connections" ? " active" : ""}`}
+          onClick={() => setTab("connections")}
+        >
+          Connections
+        </button>
+      </div>
+
+      {tab === "connections" ? (
+        <ConnectionsTab />
+      ) : (
       <div className="tabbody">
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <div className="panel-row" style={{ gridTemplateColumns: "1fr 1fr" }}>
@@ -324,6 +388,7 @@ export default function ServerApp() {
           <LogPanel log={log} />
         </div>
       </div>
+      )}
 
       <div className="statusbar">
         <span className="spring" />
@@ -334,6 +399,8 @@ export default function ServerApp() {
           PTT: {pttOn ? "On" : "Off"}
         </span>
       </div>
+
+      {aboutOpen && <AboutDialog name={APP_NAME_SERVER} onClose={() => setAboutOpen(false)} />}
     </div>
   );
 }

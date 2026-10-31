@@ -1,19 +1,18 @@
-import { APP_NAME, APP_VERSION } from "./app-info.js";
+import { APP_VERSION } from "./app-info.js";
 
-// Help > About dialog: the about artwork as the background, with the product name and version in
-// the blank band at the top of the artwork and the license lines in the band below it. Clicking
-// anywhere on the dialog closes it.
-export default function AboutDialog({ onClose }) {
+// File > About dialog: the about artwork as the background, with the role-specific product name
+// and common version in the blank band at the top. Clicking anywhere closes it.
+export default function AboutDialog({ name, onClose }) {
   return (
     <div className="about-backdrop" onClick={onClose}>
       <div
         className="about-box"
         role="dialog"
-        aria-label={`About ${APP_NAME}`}
+        aria-label={`About ${name}`}
         style={{ backgroundImage: "url(/about.png)" }}
       >
         <div className="about-head">
-          <div className="about-name">W1VE Remote Keyer/Router - Station</div>
+          <div className="about-name">{name}</div>
           <div className="about-version">Version {APP_VERSION}</div>
         </div>
         <div className="about-lines">

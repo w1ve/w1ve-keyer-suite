@@ -33,6 +33,7 @@ use rwk_core::engine::flex_discovery::DiscoveryListener;
 use rwk_core::engine::keying_arbiter::{KeyingArbiter, LineObserver, LineUpdate};
 use rwk_core::engine::network::EdgeTransport;
 use rwk_core::engine::replay::{spawn_driver, EdgeJitterProfile, SerialKeyingAdapter};
+use rwk_core::engine::reconnect::connect_with_relay_retry;
 use rwk_core::engine::serial::{enumerate_ports, KeyingOutputConfig, PttTiming, SerialKeyingOutput};
 use rwk_core::engine::session::Session;
 use rwk_core::engine::tunnel;
@@ -633,7 +634,10 @@ impl StationController {
             config.relay = Some(rwk_core::config::RelayConfig { address: relay_addr });
             config.pairing_code = Some(code);
 
-            let connected = match tunnel::connect(&config).await {
+            // The first rendezvous can race the relay or the Client's arrival just after a
+            // restart; the shared helper retries once (750 ms) before giving up — the same
+            // resilience the Client's connect path has.
+            let connected = match connect_with_relay_retry(&config).await {
                 Ok(c) => c,
                 Err(e) => {
                     // The relay did not answer: ask the operator for a relay address.

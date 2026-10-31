@@ -21,7 +21,8 @@ use std::path::PathBuf;
 
 use rwk_core::config::Role;
 
-/// The vendor/product folder name under the per-user config root.
+/// The legacy config directory is intentionally retained so existing installations keep their
+/// pairing and hardware settings after the visible product rename.
 const APP_DIR_WINDOWS: &str = "W1VE Remote Keyer-Router";
 const APP_DIR_UNIX: &str = "w1ve-remote-keyer-router";
 

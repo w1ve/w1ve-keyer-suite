@@ -5,6 +5,7 @@ import RelayDialog, { DEFAULT_WAN_RELAY } from "./RelayDialog.jsx";
 import { LogEntries } from "./LogPanel.jsx";
 import ConnectionsTab from "./ConnectionsTab.jsx";
 import AboutDialog from "./AboutDialog.jsx";
+import { APP_NAME_STATION } from "./app-info.js";
 import { listen } from "@tauri-apps/api/event";
 
 // The splash is a separate BORDERLESS POPUP window containing only the artwork — not an overlay
@@ -228,7 +229,7 @@ export default function StationApp() {
   return (
     <div className="app station">
       <div className="statusbar">
-        <strong style={{ color: "var(--accent)" }}>RWK Station</strong>
+        <strong style={{ color: "var(--accent)" }}>W1VE Remote Keyer Router Player</strong>
         <span className="spring" />
         {running && <span>RTT {rtt ?? "—"} ms</span>}
         <span className="led" style={{ color: linkColor }}>
@@ -284,7 +285,7 @@ export default function StationApp() {
         <span style={{ color: pttOn ? "var(--ptt-on)" : "var(--text-dim)" }}>PTT: {pttOn ? "On" : "Off"}</span>
       </div>
 
-      {aboutOpen && <AboutDialog onClose={() => setAboutOpen(false)} />}
+      {aboutOpen && <AboutDialog name={APP_NAME_STATION} onClose={() => setAboutOpen(false)} />}
 
       {relayPrompt && (
         <RelayDialog current={settings.relay} onConfirm={onRelayChosen} onCancel={() => setRelayPrompt(false)} />
