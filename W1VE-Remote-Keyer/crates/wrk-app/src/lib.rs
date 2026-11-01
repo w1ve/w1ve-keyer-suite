@@ -9,8 +9,9 @@
 //! * `w1ve-remote-keyer-player` — the Player at the remote radio site: receives keyed edges and
 //!   keys the radio. Entry point [`run_server`].
 //!
-//! Both offer a **WAN/LAN** transport slider and a **pairing token** (see [`pairing`]). The
-//! engine, the look-and-feel, and the pairing model match the Keyer-Router app.
+//! Both retain the **WAN** shared-token relay path. On **LAN**, the desktop Player advertises
+//! its persisted callsign/label and waits as the tunnel responder; the operating Keyer browses
+//! desktop and W1VE ESP32 Players, then initiates the selected session.
 
 mod app_paths;
 mod client_controller;
@@ -376,9 +377,8 @@ pub fn run_client() {
             c_set_paddle_reverse,
             c_set_transport,
             c_set_relay,
-            c_set_callsign,
-            c_set_keyer_id,
-            c_lan_advertise,
+            c_lan_browse,
+            c_connect_lan,
             c_set_tone_frequency,
             c_set_tone_volume,
             c_select_audio_device,
@@ -432,16 +432,15 @@ fn c_set_relay(state: State<'_, ClientState>, relay: String) {
     state.controller.set_relay(&relay);
 }
 #[tauri::command]
-fn c_set_callsign(state: State<'_, ClientState>, callsign: String) {
-    state.controller.set_callsign(&callsign);
+fn c_lan_browse(state: State<'_, ClientState>) {
+    state.controller.lan_browse();
 }
 #[tauri::command]
-fn c_set_keyer_id(state: State<'_, ClientState>, keyer_id: String) {
-    state.controller.set_keyer_id(&keyer_id);
-}
-#[tauri::command]
-fn c_lan_advertise(state: State<'_, ClientState>, on: bool) {
-    state.controller.lan_advertise(on);
+fn c_connect_lan(
+    state: State<'_, ClientState>,
+    selection: client_controller::LanPlayerSelection,
+) {
+    state.controller.connect_lan(selection);
 }
 #[tauri::command]
 fn c_set_tone_frequency(state: State<'_, ClientState>, hz: i32) {
@@ -553,10 +552,11 @@ pub fn run_server() {
             s_set_ptt_hang,
             s_set_transport,
             s_set_relay,
+            s_set_callsign,
+            s_set_keyer_id,
             s_regenerate_token,
             s_listen,
-            s_lan_browse,
-            s_connect_lan,
+            s_lan_advertise,
             s_disconnect,
         ])
         .run(tauri::generate_context!())
@@ -606,6 +606,14 @@ fn s_set_relay(state: State<'_, ServerState>, relay: String) {
     state.controller.set_relay(&relay);
 }
 #[tauri::command]
+fn s_set_callsign(state: State<'_, ServerState>, callsign: String) {
+    state.controller.set_callsign(&callsign);
+}
+#[tauri::command]
+fn s_set_keyer_id(state: State<'_, ServerState>, keyer_id: String) {
+    state.controller.set_keyer_id(&keyer_id);
+}
+#[tauri::command]
 fn s_regenerate_token(state: State<'_, ServerState>) {
     state.controller.regenerate_token();
 }
@@ -614,12 +622,8 @@ fn s_listen(state: State<'_, ServerState>) {
     state.controller.listen();
 }
 #[tauri::command]
-fn s_lan_browse(state: State<'_, ServerState>) {
-    state.controller.lan_browse();
-}
-#[tauri::command]
-fn s_connect_lan(state: State<'_, ServerState>, key: String, endpoint: String) {
-    state.controller.connect_lan(&key, &endpoint);
+fn s_lan_advertise(state: State<'_, ServerState>, on: bool) {
+    state.controller.lan_advertise(on);
 }
 #[tauri::command]
 fn s_disconnect(state: State<'_, ServerState>) {

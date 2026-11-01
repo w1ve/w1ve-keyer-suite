@@ -1,30 +1,16 @@
-//! The pairing model: how the Server and Client find each other, over WAN or LAN.
+//! The pairing model: how the Server and Client find each other over WAN or LAN.
 //!
-//! The UI offers a **WAN/LAN** slider and a **pairing token** the Server generates and the
-//! Client enters — the same model as the C# "WinKey Remote" pair in the screenshot, but on the
-//! native `rwk-core` engine.
+//! * **WAN** uses the public relay and a short pairing token. Both desktop endpoints present the
+//!   same token, learn each other's WireGuard public key and observed address, then establish a
+//!   direct tunnel when possible.
+//! * **LAN** is relay-free. The desktop radio-site Player advertises its CW-capable v2 LAN
+//!   identity and waits as the WireGuard responder. The operating-position Client browses it,
+//!   validates the discovered record, and initiates the tunnel. W1VE ESP32 Players advertise
+//!   separately; the Client browses and explicitly selects one before opening its trusted-LAN
+//!   session. LAN selection uses no ESP PIN or persistent ESP secret.
 //!
-//! Both transports use the engine's zero-setup rendezvous
-//! ([`rwk_core::engine::tunnel::connect_paired`]): both ends present the same pairing code to a
-//! relay, which introduces them (public keys + observed addresses), and the WireGuard tunnel
-//! comes up **directly** (hole-punched) whenever the two can reach each other, falling back to
-//! carrying traffic over the relay only when they cannot. The WAN/LAN choice selects *which
-//! relay* does the introduction:
-//!
-//! * **WAN** — the public W1VE relay on the internet. Zero network setup: no port forwarding,
-//!   no static IP. Traffic goes peer-to-peer when NATs allow, else via the relay.
-//! * **LAN** — a relay reachable on the local network (often the Server itself running the
-//!   relay). Two hosts on the same LAN hole-punch trivially, so after the brief rendezvous all
-//!   keyed traffic stays on the LAN with no internet dependency.
-//!
-//! Why a relay even on the LAN: the engine's WireGuard peers are *static-keyed*, so each end
-//! must learn the other's public key before the handshake. The relay rendezvous is what
-//! exchanges those keys from a short human code, which is exactly what lets the operator pair
-//! with a token instead of copying 32-byte keys by hand. A later increment can add a
-//! key-learning LAN responder to drop the relay entirely on the LAN.
-//!
-//! [`build_config`] turns the UI's choice + token + relay into the
-//! [`rwk_core::config::Config`] the engine consumes, so both controllers share one path.
+//! [`build_config`] applies only to the WAN token path. LAN pairing is owned by the controllers
+//! and their discovery listeners.
 
 use rwk_core::config::{Config, RelayConfig, Role};
 
@@ -33,12 +19,12 @@ use rwk_core::config::{Config, RelayConfig, Role};
 pub enum Transport {
     /// Over the internet via the public W1VE relay.
     Wan,
-    /// On the local network via a LAN-reachable relay (zero internet dependency once paired).
+    /// Desktop and W1VE ESP32 Player pairing on the local network.
     Lan,
 }
 
 impl Transport {
-    /// Parses the UI slider value ("wan"/"lan"); anything unrecognised defaults to WAN.
+    /// Parses the UI slider value ("wan" or "lan"); anything unrecognised defaults to WAN.
     #[must_use]
     pub fn parse(s: &str) -> Self {
         if s.eq_ignore_ascii_case("lan") {
@@ -80,8 +66,8 @@ pub fn build_config(
     token: &str,
     relay: &str,
 ) -> Result<Config, String> {
-    if transport == Transport::Lan {
-        return Err("LAN pairing does not use build_config; use the LAN discovery path".into());
+    if transport != Transport::Wan {
+        return Err("only WAN pairing uses build_config; use the selected LAN transport".into());
     }
     let relay = relay.trim();
     let relay = if relay.is_empty() { DEFAULT_WAN_RELAY } else { relay };

@@ -144,9 +144,8 @@ pub fn run_client() {
             set_mode,
             set_paddle_reverse,
             set_transport,
-            set_callsign,
-            set_keyer_id,
-            lan_advertise,
+            lan_browse_players,
+            lan_connect_player,
             set_tone_frequency,
             set_tone_volume,
             select_audio_device,
@@ -208,8 +207,8 @@ fn ping() -> String {
     format!("w1ve-krr {} ready", env!("CARGO_PKG_VERSION"))
 }
 
-/// Re-emits settings, forward rules, flex state, ports, and audio devices. The UI calls this
-/// right after subscribing to the event stream to beat the startup race.
+/// Re-emits settings, tagged LAN Players, Router availability, forward rules, Flex state, ports,
+/// and audio devices. The UI calls this right after subscribing to beat the startup race.
 #[tauri::command]
 fn request_state(state: State<'_, ClientState>) {
     state.controller.request_state();
@@ -242,19 +241,16 @@ fn set_transport(state: State<'_, ClientState>, transport: String) {
     state.controller.set_transport(&transport);
 }
 
+/// Starts fresh tagged desktop and W1VE ESP32 Player discovery on the operating Keyer.
 #[tauri::command]
-fn set_callsign(state: State<'_, ClientState>, callsign: String) {
-    state.controller.set_callsign(&callsign);
+fn lan_browse_players(state: State<'_, ClientState>) {
+    state.controller.lan_browse_players();
 }
 
+/// Connects only to a current browser entry; the backend validates the tagged type/id boundary.
 #[tauri::command]
-fn set_keyer_id(state: State<'_, ClientState>, keyer_id: String) {
-    state.controller.set_keyer_id(&keyer_id);
-}
-
-#[tauri::command]
-fn lan_advertise(state: State<'_, ClientState>, on: bool) {
-    state.controller.lan_advertise(on);
+fn lan_connect_player(state: State<'_, ClientState>, player_type: String, id: String) {
+    state.controller.connect_lan_player(&player_type, &id);
 }
 
 // ─── Client: sidetone ─────────────────────────────────────────────────────────
@@ -491,8 +487,9 @@ pub fn run_station() {
             station_set_ptt_hang,
             station_regenerate_token,
             station_set_transport,
-            station_lan_browse,
-            station_connect_lan,
+            station_set_callsign,
+            station_set_keyer_id,
+            station_lan_advertise,
             station_listen,
             station_disconnect,
         ])
@@ -513,7 +510,7 @@ fn station_app_role() -> String {
     "station".to_string()
 }
 
-/// Re-emits the Station settings + ports once the UI has subscribed (beats the startup race).
+/// Re-emits Station settings, LAN advertising state, and ports once the UI has subscribed.
 #[tauri::command]
 fn station_request_state(state: State<'_, StationState>) {
     state.controller.request_state();
@@ -791,13 +788,19 @@ fn station_set_transport(state: State<'_, StationState>, transport: String) {
 }
 
 #[tauri::command]
-fn station_lan_browse(state: State<'_, StationState>) {
-    state.controller.lan_browse();
+fn station_set_callsign(state: State<'_, StationState>, callsign: String) {
+    state.controller.set_callsign(&callsign);
 }
 
 #[tauri::command]
-fn station_connect_lan(state: State<'_, StationState>, key: String, endpoint: String) {
-    state.controller.connect_lan(&key, &endpoint);
+fn station_set_keyer_id(state: State<'_, StationState>, keyer_id: String) {
+    state.controller.set_keyer_id(&keyer_id);
+}
+
+/// Starts or stops the desktop Player's RWKP v2 LAN advertisement/responder loop.
+#[tauri::command]
+fn station_lan_advertise(state: State<'_, StationState>, on: bool) {
+    state.controller.lan_advertise(on);
 }
 
 /// Begins pairing: the Station waits for the Client to connect over the shared relay + code,

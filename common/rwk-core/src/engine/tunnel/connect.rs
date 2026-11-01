@@ -258,13 +258,13 @@ async fn try_relay(
 // ─── LAN direct path (relay-free) ──────────────────────────────────────────────
 //
 // On a LAN the two ends find each other by UDP broadcast (see
-// [`crate::engine::lan_discovery`]) instead of a relay. The radio site *browses* the
-// advertised keyers and *picks* one, so — unlike WAN, where the Client initiates — on the LAN
-// the **picker initiates** and the **advertiser responds**. boringtun needs each end to know
-// the other's static key before the handshake: the picker learns the advertiser's key from the
-// beacon, and a one-shot plaintext HELLO (the picker's key, sent to the advertiser's WireGuard
-// port) tells the advertiser the picker's key. After that the normal WireGuard handshake runs
-// with no relay and no NAT hole-punch.
+// [`crate::engine::lan_discovery`]) instead of a relay. The radio-site Player advertises its
+// availability, and the operating Keyer browses then explicitly selects it. On the LAN the
+// **selecting Keyer initiates** and the **advertising Player responds**. boringtun needs each end
+// to know the other's static key before the handshake: the Keyer learns the Player's key from the
+// beacon, and a one-shot plaintext HELLO (the Keyer's key, sent to the Player's WireGuard port)
+// tells the Player the Keyer's key. After that the normal WireGuard handshake runs with no relay
+// and no NAT hole-punch.
 
 /// How long the advertiser waits for a picker's HELLO before giving up a listen cycle.
 const LAN_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -545,9 +545,9 @@ mod tests {
 
     #[tokio::test]
     async fn lan_picker_and_advertiser_establish_a_direct_link() {
-        // The advertiser (operating position) binds its WG socket and waits; the picker (radio
-        // site) sends a HELLO to that port and initiates. Both end up with an established
-        // direct tunnel over loopback — the relay-free LAN path.
+        // The advertiser (radio-site Player) binds its WG socket and waits; the selecting Keyer
+        // sends a HELLO to that port and initiates. Both end up with an established direct
+        // tunnel over loopback — the relay-free LAN path.
         let advertiser_id = IdentityConfig::generate().unwrap().to_identity().unwrap();
         let picker_id = IdentityConfig::generate().unwrap().to_identity().unwrap();
 

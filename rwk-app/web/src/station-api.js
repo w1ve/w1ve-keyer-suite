@@ -39,10 +39,11 @@ export const stationApi = {
   showSplash: () => invoke("station_show_splash"),
   hideSplash: () => invoke("station_hide_splash"),
 
-  // Pairing — transport + LAN (the Station browses advertised keyers and picks one)
+  // Pairing — LAN: this desktop Player owns its identity and advertises for a Keyer to select.
   setTransport: (transport) => invoke("station_set_transport", { transport }),
-  lanBrowse: () => invoke("station_lan_browse"),
-  connectLan: (key, endpoint) => invoke("station_connect_lan", { key, endpoint }),
+  setCallsign: (callsign) => invoke("station_set_callsign", { callsign }),
+  setKeyerId: (keyerId) => invoke("station_set_keyer_id", { keyerId }),
+  lanAdvertise: (on) => invoke("station_lan_advertise", { on }),
 };
 
 // Subscribes to the controller event stream. `handler` receives each StationEvent (a JS

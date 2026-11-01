@@ -1,5 +1,5 @@
-// The WAN/LAN segmented slider shared by both roles. WAN = the W1VE relay over the internet;
-// LAN = a relay on the local network (zero internet dependency once paired).
+// Transport selector shared by both roles. WAN uses the W1VE relay. On LAN, the desktop Player
+// advertises itself while the operating Keyer browses desktop and W1VE ESP32 Players locally.
 export default function TransportSlider({ value, onChange, disabled }) {
   return (
     <div className="segmented" style={disabled ? { opacity: 0.5, pointerEvents: "none" } : null}>

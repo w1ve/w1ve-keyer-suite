@@ -6,9 +6,9 @@
 //! the sidetone engine, the serial paddle input — and differs from the Keyer-Router Client
 //! only in that there is no Ham Router: no forward rules, no control channel, no Flex.
 //!
-//! The WAN/LAN choice and the pairing token flow through [`crate::pairing::build_config`], so
-//! the controller does not care which relay introduced the peer; it just connects, opens the
-//! keying edge over the resulting tunnel, and keys.
+//! WAN pairing uses [`crate::pairing::build_config`] and the shared relay token. LAN pairing is
+//! relay-free: the Client browses advertising desktop and W1VE ESP32 Players, validates a
+//! selected discovery record, and initiates the matching session.
 //!
 //! Type-ahead and macros are keyed by a single **send-worker** thread draining a shared
 //! [`SendBuffer`] as a continuous CW element stream (one character at a time, managing the
@@ -17,17 +17,22 @@
 //! and the UI KEY indicator all stay in lock-step.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
 use rwk_core::config::{Config, Role};
 use rwk_core::engine::audio::SidetoneEngine;
 use rwk_core::engine::debounce::ContactDebouncer;
-use rwk_core::engine::edge_session::EdgeSession;
+use rwk_core::engine::edge_session::{EdgeDrain, EdgeSession};
+use rwk_core::engine::esp_player::{
+    EspPlayerAdvertisement, EspPlayerBrowser, EspPlayerInbound, EspPlayerSession,
+    ESP_PLAYER_MISSED_PING_LIMIT, ESP_PLAYER_PING_INTERVAL,
+};
 use rwk_core::engine::keying::{KeyerElement, KeyerElementTiming};
 use rwk_core::engine::logger_host::{HostReport, HostReporter, LoggerHost, TextSink};
-use rwk_core::engine::lan_discovery::{Beacon, LanAdvertiser};
+use rwk_core::engine::lan_discovery::LanBrowser;
 use rwk_core::engine::network::EdgeTransport;
 use rwk_core::engine::reconnect::{
     self, connect_with_relay_retry, watch_edge_liveness, Liveness, ReconnectBudget,
@@ -55,6 +60,11 @@ const EDGE_PORT: u16 = 5555;
 /// the overall churn; this caps repeated hard failures inside it.
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 
+/// Controlled cadence for the bounded ESP32 Player unicast-discovery pass.
+const ESP_DISCOVERY_QUERY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+/// Keeps the UI list fresh and lets both core browsers prune expired advertisements promptly.
+const LAN_PLAYER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Control identifiers for inline error messages in the UI.
 mod control {
     pub const LOGGER: &str = "logger";
@@ -79,8 +89,8 @@ pub enum ClientEvent {
         audio_device: Option<String>,
         transport: String,
         relay: String,
-        callsign: String,
-        keyer_id: String,
+        /// The remembered WAN pairing token (empty until one has been used).
+        token: String,
         paddle_port: Option<String>,
         logger_port: Option<String>,
         /// N1MM has the WinKeyer logger open and owns the speed; the Client's slider is locked.
@@ -89,8 +99,8 @@ pub enum ClientEvent {
     /// The round-trip time to the Player in whole milliseconds, once a second while paired (`None`
     /// until the first pong arrives).
     Rtt { ms: Option<u32> },
-    /// Whether the LAN discovery beacon is currently being advertised.
-    Advertising { active: bool },
+    /// Desktop and W1VE ESP32 Players currently available on the LAN.
+    LanPlayers { players: Vec<LanPlayerView> },
     /// The type-ahead / macro send buffer is actively keying.
     Sending { active: bool },
     /// The current serial-port inventory.
@@ -107,6 +117,140 @@ pub enum ClientEvent {
 pub struct AudioDeviceView {
     pub name: String,
     pub is_default: bool,
+}
+
+/// A discovered LAN Player exposed to the web UI. The `kind` tag keeps desktop tunnel and
+/// W1VE ESP32 Player selections distinct even when their display names are identical.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LanPlayerView {
+    Desktop { id: String, name: String, endpoint: String },
+    Esp { id: String, name: String, endpoint: String, busy: bool },
+}
+
+/// A tagged Player selection returned by the web UI. The controller parses and matches every
+/// identifier and endpoint against its current discovery catalogue before opening a session.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LanPlayerSelection {
+    Desktop { id: String, endpoint: String },
+    Esp { id: String, endpoint: String },
+}
+
+#[derive(Clone)]
+struct DesktopPlayer {
+    public_key: [u8; 32],
+    name: String,
+    endpoint: SocketAddr,
+}
+
+#[derive(Default)]
+struct LanPlayerCatalog {
+    /// Zero means there is no live browse task. A task may update only its own generation.
+    generation: u64,
+    desktop: Vec<DesktopPlayer>,
+    esp: Vec<EspPlayerAdvertisement>,
+}
+
+enum ValidatedLanSelection {
+    Desktop { public_key: [u8; 32], endpoint: SocketAddr },
+    Esp(EspPlayerAdvertisement),
+}
+
+/// Identifies one user-visible connection operation. A newer operation invalidates every older
+/// asynchronous setup flow before it is allowed to install connection resources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperationId(u64);
+
+#[derive(Default)]
+struct OperationGate {
+    generation: u64,
+}
+
+impl OperationGate {
+    fn replace(&mut self) -> OperationId {
+        self.generation = self.generation.wrapping_add(1);
+        OperationId(self.generation)
+    }
+
+    fn permits(&self, operation: OperationId) -> bool {
+        self.generation == operation.0
+    }
+}
+
+/// One-way stop token shared by the ESP edge callback and its connection owner. A replacement
+/// permanently revokes the old token before it detaches that operation's edge drain.
+#[derive(Clone)]
+struct EspSenderStop {
+    active: Arc<AtomicBool>,
+}
+
+impl EspSenderStop {
+    fn new() -> Self {
+        Self { active: Arc::new(AtomicBool::new(true)) }
+    }
+
+    fn stop(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+/// The ESP session and the callback capability that belongs only to its installation operation.
+struct ActiveEspSession {
+    operation: OperationId,
+    session: Arc<EspPlayerSession>,
+    sender_stop: EspSenderStop,
+}
+
+/// All resources tied to a Client pairing live behind one short-held installation gate. No
+/// asynchronous setup code holds this lock while awaiting network I/O; it only acquires it to
+/// verify its generation and atomically publish or retire resources and connection events.
+struct ClientConnection {
+    gate: OperationGate,
+    transport: Option<Arc<EdgeTransport>>,
+    session: Option<Session>,
+    esp_session: Option<ActiveEspSession>,
+    supervisor: Option<(OperationId, tokio::task::JoinHandle<()>)>,
+}
+
+impl ClientConnection {
+    fn permits(&self, operation: OperationId) -> bool {
+        self.gate.permits(operation)
+    }
+
+    fn permits_resource_install(&self, operation: OperationId) -> bool {
+        self.permits(operation)
+            && self.transport.is_none()
+            && self.session.is_none()
+            && self.esp_session.is_none()
+    }
+}
+
+impl Default for ClientConnection {
+    fn default() -> Self {
+        Self {
+            gate: OperationGate::default(),
+            transport: None,
+            session: None,
+            esp_session: None,
+            supervisor: None,
+        }
+    }
+}
+
+/// Resources detached from the installation gate for asynchronous cleanup. They are never
+/// returned to the shared state, so an older operation can only tear down what it created.
+struct RetiredClientConnection {
+    transport: Option<Arc<EdgeTransport>>,
+    session: Option<Session>,
+    esp_session: Option<ActiveEspSession>,
+    /// The exact old edge task detached while the operation gate was held.
+    edge_drain: EdgeDrain,
+    supervisor: Option<(OperationId, tokio::task::JoinHandle<()>)>,
 }
 
 /// A sink the host (Tauri) registers for [`ClientEvent`]s.
@@ -126,8 +270,8 @@ struct Settings {
     paddle_port: Option<String>,
     transport: Transport,
     relay: String,
-    callsign: String,
-    keyer_id: String,
+    /// The last WAN pairing token entered, remembered so the operator need not retype it.
+    token: String,
 }
 
 impl Default for Settings {
@@ -144,8 +288,29 @@ impl Default for Settings {
             paddle_port: None,
             transport: Transport::Wan,
             relay: pairing::DEFAULT_WAN_RELAY.to_string(),
-            callsign: String::new(),
-            keyer_id: String::new(),
+            token: String::new(),
+        }
+    }
+}
+
+impl Settings {
+    /// Restores every persisted UI setting, keeping the default for anything never saved.
+    fn from_config(config: &Config) -> Self {
+        let defaults = Self::default();
+        let k = &config.keyer;
+        Self {
+            wpm: k.wpm.unwrap_or(defaults.wpm).clamp(5, 60),
+            weight: k.weight.unwrap_or(defaults.weight).clamp(25, 75),
+            mode: k.mode.as_deref().map(parse_mode).unwrap_or(defaults.mode),
+            paddle_reverse: k.paddle_reverse.unwrap_or(defaults.paddle_reverse),
+            tone_hz: k.tone_hz.unwrap_or(defaults.tone_hz),
+            tone_volume: k.tone_volume.unwrap_or(defaults.tone_volume).min(100),
+            audio_device: k.audio_device.clone(),
+            logger_port: k.logger_port.clone(),
+            paddle_port: k.paddle_port.clone(),
+            transport: config.transport.as_deref().map(Transport::parse).unwrap_or(defaults.transport),
+            relay: config.relay.as_ref().map(|r| r.address.to_string()).unwrap_or(defaults.relay),
+            token: config.pairing_code.clone().unwrap_or_default(),
         }
     }
 }
@@ -310,21 +475,23 @@ struct Shared {
     /// True while the logger (N1MM) has host mode open. It owns the keying speed then, so the
     /// Client's own speed changes are ignored.
     speed_from_logger: AtomicBool,
-    transport: Mutex<Option<Arc<EdgeTransport>>>,
+    /// Serializes operation replacement with resource installation. The generation stored here
+    /// is the authority for WAN, desktop-LAN, and ESP pairing work.
+    connection: Mutex<ClientConnection>,
     epoch: Mutex<u16>,
     /// The shared session edge path (`rwk-core`): one sender for every edge source and one
-    /// ordered tunnel FIFO. Restarted once per pairing in `bring_up_keying`.
+    /// ordered outbound carrier. Restarted for each tunnel or W1VE ESP32 Player pairing.
     edge: EdgeSession,
     paddle: Mutex<Option<PaddlePollerHandle>>,
     /// The type-ahead / macro send buffer, drained by the single send-worker thread.
     send: SendBuffer,
-    session: tokio::sync::Mutex<Option<Session>>,
-    /// The running LAN advertiser task (operating-position side), present while advertising.
-    advertise: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// The running WAN connect supervisor (pair → key → watch liveness → reconnect), present
-    /// between a `connect` and the next `disconnect`/`connect`. Aborted so a new attempt or an
-    /// unpair never leaves a second supervisor looping.
-    supervisor: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The live desktop/W1VE ESP32 Player browse task. It is aborted before a selection connects.
+    browse: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Monotonic generation assigned to each browse task, preventing a cancelled task from
+    /// repopulating the selection catalogue.
+    browse_generation: AtomicU64,
+    /// Discovery-validated candidates used as the only source for LAN selection endpoints.
+    lan_players: Mutex<LanPlayerCatalog>,
     config: Mutex<Config>,
     config_path: Option<std::path::PathBuf>,
     sink: EventSink,
@@ -362,8 +529,7 @@ impl Shared {
             audio_device: s.audio_device.clone(),
             transport: s.transport.as_str().into(),
             relay: s.relay.clone(),
-            callsign: s.callsign.clone(),
-            keyer_id: s.keyer_id.clone(),
+            token: s.token.clone(),
             paddle_port: s.paddle_port.clone(),
             logger_port: s.logger_port.clone(),
             speed_locked: self.speed_from_logger.load(Ordering::SeqCst),
@@ -382,8 +548,20 @@ impl Shared {
             if let Ok(addr) = s.relay.parse() {
                 config.relay = Some(rwk_core::config::RelayConfig { address: addr });
             }
-            config.callsign = s.callsign.clone();
-            config.keyer_id = s.keyer_id.clone();
+            config.transport = Some(s.transport.as_str().to_string());
+            config.pairing_code = (!s.token.is_empty()).then(|| s.token.clone());
+            config.keyer = rwk_core::config::KeyerSettings {
+                wpm: Some(s.wpm),
+                weight: Some(s.weight),
+                mode: Some(mode_name(s.mode).to_string()),
+                paddle_reverse: Some(s.paddle_reverse),
+                tone_hz: Some(s.tone_hz),
+                tone_volume: Some(s.tone_volume),
+                audio_device: s.audio_device.clone(),
+                paddle_port: s.paddle_port.clone(),
+                logger_port: s.logger_port.clone(),
+                keying_port: None,
+            };
         }
         let config = self.config.lock().unwrap();
         if let Err(e) = config.save(path) {
@@ -409,26 +587,22 @@ impl ClientController {
     /// Starts against an explicit config path (`None` disables persistence, for tests).
     pub fn start_with_config(sink: EventSink, config_path: Option<std::path::PathBuf>) -> Self {
         let config = load_or_create(&config_path, Role::Client);
-        // Seed the UI settings from the persisted config (callsign/keyer_id/relay survive).
-        let mut settings = Settings::default();
-        settings.callsign = config.callsign.clone();
-        settings.keyer_id = config.keyer_id.clone();
-        if let Some(r) = &config.relay {
-            settings.relay = r.address.to_string();
-        }
+        // The Client restores every keyer, sidetone, port, transport, relay and token setting;
+        // Player display identity belongs to the advertising Server configuration.
+        let settings = Settings::from_config(&config);
         let shared = Arc::new(Shared {
             settings: Mutex::new(settings.clone()),
             sidetone: Mutex::new(None),
             logger: Mutex::new(None),
             speed_from_logger: AtomicBool::new(false),
-            transport: Mutex::new(None),
+            connection: Mutex::new(ClientConnection::default()),
             epoch: Mutex::new(1),
             edge: EdgeSession::new(MonotonicClock.frequency(), MonotonicClock.now()),
             paddle: Mutex::new(None),
             send: SendBuffer::default(),
-            session: tokio::sync::Mutex::new(None),
-            advertise: tokio::sync::Mutex::new(None),
-            supervisor: tokio::sync::Mutex::new(None),
+            browse: Mutex::new(None),
+            browse_generation: AtomicU64::new(0),
+            lan_players: Mutex::new(LanPlayerCatalog::default()),
             config: Mutex::new(config),
             config_path,
             sink,
@@ -452,6 +626,7 @@ impl ClientController {
         let controller = Self { shared, runtime, _clock: Arc::new(MonotonicClock) };
         // Open whatever persisted ports are present right now.
         controller.open_paddle_port(settings.paddle_port.clone());
+        controller.open_logger_port(settings.logger_port.clone());
         controller.shared.emit_settings();
         controller
     }
@@ -474,22 +649,38 @@ impl ClientController {
             return;
         }
         self.shared.settings.lock().unwrap().wpm = wpm;
+        self.shared.persist();
     }
 
     pub fn set_weight(&self, weight: u32) {
         self.shared.settings.lock().unwrap().weight = weight;
+        self.shared.persist();
     }
 
     pub fn set_mode(&self, mode: &str) {
         self.shared.settings.lock().unwrap().mode = parse_mode(mode);
+        self.shared.persist();
     }
 
     pub fn set_paddle_reverse(&self, reverse: bool) {
         self.shared.settings.lock().unwrap().paddle_reverse = reverse;
+        self.shared.persist();
     }
 
     pub fn set_transport(&self, transport: &str) {
-        self.shared.settings.lock().unwrap().transport = Transport::parse(transport);
+        let transport = Transport::parse(transport);
+        let leaving_lan = {
+            let mut settings = self.shared.settings.lock().unwrap();
+            let leaving_lan = settings.transport == Transport::Lan && transport != Transport::Lan;
+            settings.transport = transport;
+            leaving_lan
+        };
+        self.shared.persist();
+        if leaving_lan {
+            self.disconnect();
+        } else if transport != Transport::Lan {
+            self.stop_browsing();
+        }
         self.shared.emit_settings();
     }
 
@@ -499,69 +690,102 @@ impl ClientController {
         self.shared.emit_settings();
     }
 
-    /// Sets the operator callsign used as the LAN beacon name.
-    pub fn set_callsign(&self, callsign: &str) {
-        self.shared.settings.lock().unwrap().callsign = callsign.to_string();
-        self.shared.persist();
-        self.shared.emit_settings();
-    }
+    // ─── LAN browse and selection (operating-position side) ───────────────────
 
-    /// Sets the position label (e.g. `20m`) appended to the callsign in the LAN beacon.
-    pub fn set_keyer_id(&self, keyer_id: &str) {
-        self.shared.settings.lock().unwrap().keyer_id = keyer_id.to_string();
-        self.shared.persist();
-        self.shared.emit_settings();
-    }
-
-    // ─── LAN advertise (operating-position side) ───────────────────────────────
-
-    /// Starts (or restarts) broadcasting this keyer's LAN beacon so radio-site apps can find
-    /// it, and waits for one to pick us — then brings the keying edge up as the responder.
-    /// Stops any WAN pairing first. Advertising stops automatically once paired.
-    pub fn lan_advertise(&self, on: bool) {
-        if !on {
-            self.stop_advertising();
-            self.disconnect();
-            return;
-        }
-        // Only one pairing attempt at a time.
-        self.disconnect();
-        let (callsign, keyer_id) = {
-            let s = self.shared.settings.lock().unwrap();
-            (s.callsign.clone(), s.keyer_id.clone())
-        };
-        let shared = Arc::clone(&self.shared);
-        shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
-        shared.emit(ClientEvent::Advertising { active: true });
-        shared.log("info", "Advertising on the LAN; waiting for a radio site to connect…");
-
-        let handle = self.runtime.spawn(async move {
-            lan_advertise_and_await(shared, callsign, keyer_id).await;
-        });
-        self.runtime.block_on(async {
-            *self.shared.advertise.lock().await = Some(handle);
-        });
-    }
-
-    fn stop_advertising(&self) {
-        let shared = Arc::clone(&self.shared);
-        self.runtime.block_on(async move {
-            if let Some(task) = shared.advertise.lock().await.take() {
-                task.abort();
+    /// Starts a fresh LAN browse for advertising desktop and W1VE ESP32 Players. The ESP32
+    /// browser begins one bounded unicast query pass in addition to accepting advertisements.
+    pub fn lan_browse(&self) {
+        // A browse is a new pairing operation, so it cannot coexist with a live WAN/LAN session.
+        let operation = self.replace_operation();
+        let identity = match self.shared.config.lock().unwrap().identity.to_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                log_client_if_current(&self.shared, operation, "warn", format!("identity error: {error}"));
+                return;
             }
+        };
+        let self_key = identity.public_bytes();
+        let keyer_id = keyer_id_from_public_key(self_key);
+        let Some(generation) = activate_lan_browse(&self.shared, operation) else {
+            return;
+        };
+
+        let shared = Arc::clone(&self.shared);
+        let handle = self.runtime.spawn(async move {
+            browse_lan_players(shared, generation, self_key, keyer_id).await;
         });
-        self.shared.emit(ClientEvent::Advertising { active: false });
+        install_browse_task(&self.shared, operation, generation, handle);
+    }
+
+    /// Validates a tagged UI selection against a current discovery record, then begins exactly
+    /// the selected desktop tunnel or W1VE ESP32 Player session as the operating Keyer.
+    pub fn connect_lan(&self, selection: LanPlayerSelection) {
+        let selected = {
+            let players = self.shared.lan_players.lock().unwrap();
+            validate_lan_selection(&players, &selection)
+        };
+        let selected = match selected {
+            Ok(selected) => selected,
+            Err(message) => {
+                self.shared.log("warn", message);
+                return;
+            }
+        };
+
+        // Clear the browse task only after the selected record has been matched. No ESP session
+        // is constructed from a UI-supplied id/address; `selected` contains browser-owned data.
+        let operation = self.replace_operation();
+        let shared = Arc::clone(&self.shared);
+        match selected {
+            ValidatedLanSelection::Desktop { public_key, endpoint } => {
+                if !announce_client_connecting(
+                    &shared,
+                    operation,
+                    "Connecting to the selected desktop Player…",
+                ) {
+                    return;
+                }
+                let task_shared = Arc::clone(&shared);
+                let handle = self.runtime.spawn(async move {
+                    connect_desktop_player(&task_shared, operation, public_key, endpoint).await;
+                });
+                install_client_supervisor(&shared, operation, handle);
+            }
+            ValidatedLanSelection::Esp(player) => {
+                if !announce_client_connecting(
+                    &shared,
+                    operation,
+                    "Pairing with the selected W1VE ESP32 Player…",
+                ) {
+                    return;
+                }
+                let task_shared = Arc::clone(&shared);
+                let handle = self.runtime.spawn(async move {
+                    connect_esp_player(&task_shared, operation, player).await;
+                });
+                install_client_supervisor(&shared, operation, handle);
+            }
+        }
+    }
+
+    fn stop_browsing(&self) {
+        // Use the same gate as operation replacement so a browse spawned immediately before
+        // Stop cannot register its handle or repopulate the catalogue afterwards.
+        let _connection = self.shared.connection.lock().unwrap();
+        stop_browsing_locked(&self.shared);
     }
 
     // ─── Sidetone ──────────────────────────────────────────────────────────────
 
     pub fn set_tone_frequency(&self, hz: i32) {
         self.shared.settings.lock().unwrap().tone_hz = hz;
+        self.shared.persist();
         self.restart_sidetone();
     }
 
     pub fn set_tone_volume(&self, percent: u32) {
         self.shared.settings.lock().unwrap().tone_volume = percent.min(100);
+        self.shared.persist();
         self.restart_sidetone();
     }
 
@@ -647,6 +871,7 @@ impl ClientController {
             }
         }
         self.shared.settings.lock().unwrap().logger_port = port.clone();
+        self.shared.persist();
         self.open_logger_port(port);
         self.shared.emit_settings();
     }
@@ -664,6 +889,7 @@ impl ClientController {
             }
         }
         self.shared.settings.lock().unwrap().paddle_port = port.clone();
+        self.shared.persist();
         self.open_paddle_port(port);
         self.shared.emit_settings();
     }
@@ -792,253 +1018,933 @@ impl ClientController {
 
     // ─── Pairing ──────────────────────────────────────────────────────────────
 
-    /// Pairs with the Server using the current transport (WAN/LAN) + token, then brings the
+    /// Pairs with the Server over WAN using the current relay and shared token, then brings the
     /// keying edge up over the resulting tunnel.
     pub fn connect(&self, token: &str) {
         let (transport, relay) = {
             let s = self.shared.settings.lock().unwrap();
             (s.transport, s.relay.clone())
         };
-        let token = token.to_string();
-        // Cancel any prior pairing / supervisor so a re-Connect never leaves two loops running.
-        self.disconnect();
+        let token = token.trim().to_string();
+        // Remember the token so the next launch pre-fills it.
+        self.shared.settings.lock().unwrap().token = token.clone();
+        self.shared.persist();
+        // Replacement invalidates older tasks before they can install a tunnel, edge sender, or
+        // session. It also tears down resources already installed by the prior operation.
+        let operation = self.replace_operation();
         let shared = Arc::clone(&self.shared);
-        shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
+        if !announce_client_connecting(&shared, operation, "Connecting to the Player…") {
+            return;
+        }
 
+        let task_shared = Arc::clone(&shared);
         let handle = self.runtime.spawn(async move {
-            // Supervised WAN connect: pair, key, and watch the Player's liveness. If the Player
-            // stops heartbeating (closed, or the link dropped), reconnect automatically with the
-            // same token, up to MAX_RECONNECT_ATTEMPTS consecutive failures before giving up.
-            let mut attempts: u32 = 0;
-            // The shared reconnect budget: a 15 s window that only resets after a link has stayed
-            // up for the stability threshold, so a pair-then-die flap cannot reconnect forever.
-            let mut budget = ReconnectBudget::new();
-            loop {
-                let remaining = budget.remaining(std::time::Instant::now());
-                if remaining.is_zero() {
-                    fail(
-                        &shared,
-                        format!(
-                            "Could not reach the Player within {}s; disconnected. Reconnect to try again.",
-                            reconnect::RECONNECT_WINDOW.as_secs()
-                        ),
-                    );
-                    return;
-                }
-                let base = shared.config.lock().unwrap().clone();
-                let config =
-                    match pairing::build_config(&base, Role::Client, transport, &token, &relay) {
-                        Ok(c) => c,
-                        Err(e) => return fail(&shared, e),
-                    };
-
-                // Each attempt is capped by the budget left, so pairing cannot hang past it. The
-                // shared helper retries the relay rendezvous once (750 ms) inside that budget.
-                let attempt =
-                    tokio::time::timeout(remaining, connect_with_relay_retry(&config)).await;
-                match attempt {
-                    Err(_) => shared.log("warn", "link failed: reconnect budget elapsed"),
-                    Ok(Ok(connected)) => {
-                        if let Some(edge) = bring_up_keying(&shared, connected).await {
-                            // A link came up; it must prove it is stable before the budget resets.
-                            attempts = 0;
-                            let connected_at = std::time::Instant::now();
-                            let rtt_shared = Arc::clone(&shared);
-                            let outcome = watch_edge_liveness(edge, move |ms| {
-                                rtt_shared.emit(ClientEvent::Rtt { ms });
-                            })
-                            .await;
-                            // Only a link that stayed up past the stability threshold earns a
-                            // fresh budget; a flap keeps consuming the current window.
-                            budget.record_link_ended(connected_at, std::time::Instant::now());
-                            // Tear the dead session down before retrying.
-                            teardown_session(&shared).await;
-                            if outcome == Liveness::Closed {
-                                // A deliberate local teardown (unpair) ends the supervisor.
-                                return;
-                            }
-                            // Link lost: retry within whatever budget remains.
-                            shared.log("warn", "Player stopped responding; reconnecting…");
-                            shared.emit(ClientEvent::Connection {
-                                state: "connecting".into(),
-                                path: "none".into(),
-                            });
-                            continue;
-                        }
-                        // bring_up failed after a link came up; count it as an attempt.
-                    }
-                    Ok(Err(e)) => shared.log("warn", format!("link failed: {e}")),
-                }
-
-                attempts += 1;
-                if attempts >= MAX_RECONNECT_ATTEMPTS {
-                    fail(
-                        &shared,
-                        format!(
-                            "Could not reach the Player after {MAX_RECONNECT_ATTEMPTS} attempts; \
-                             giving up. Reconnect to try again."
-                        ),
-                    );
-                    return;
-                }
-                shared.log(
-                    "info",
-                    format!("Reconnect attempt {attempts}/{MAX_RECONNECT_ATTEMPTS}…"),
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
+            connect_wan(task_shared, operation, transport, relay, token).await;
         });
-        self.runtime.block_on(async {
-            *self.shared.supervisor.lock().await = Some(handle);
-        });
+        install_client_supervisor(&shared, operation, handle);
     }
 
     pub fn disconnect(&self) {
-        *self.shared.transport.lock().unwrap() = None;
-        // Ends the pairing's ordered tunnel FIFO; the next pairing starts a fresh one.
-        self.shared.edge.detach();
-        let shared = Arc::clone(&self.shared);
-        // Report the teardown before blocking on the session, so the UI cannot stay on a live
-        // pairing behind a stuck shutdown.
-        self.shared.emit(ClientEvent::Advertising { active: false });
-        self.shared
-            .emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
-        self.shared.log("info", "Unpaired.");
-        self.runtime.block_on(async move {
-            if let Some(task) = shared.supervisor.lock().await.take() {
-                task.abort();
-            }
-            if let Some(task) = shared.advertise.lock().await.take() {
-                task.abort();
-            }
-            if let Some(mut session) = shared.session.lock().await.take() {
-                session.shutdown().await;
-            }
-        });
+        let _ = self.replace_operation();
+    }
+
+    /// Invalidates every existing asynchronous connection flow before cleanup starts. The new
+    /// identifier is handed only to the replacement flow, so stale work cannot publish after a
+    /// Stop or a subsequent Connect/LAN selection.
+    fn replace_operation(&self) -> OperationId {
+        let (operation, retired) = replace_client_operation(&self.shared);
+        self.runtime.block_on(shutdown_retired_client_connection(retired));
+        operation
     }
 }
 
-/// The operating-position LAN flow: a **persistent responder**. The operator arms it once
-/// (Advertise); it then keeps answering radio sites until unpaired. Each cycle binds a fresh
-/// WireGuard socket, broadcasts the beacon with that port, waits for a picker to initiate, and
-/// brings the keying edge up. When that session is superseded by the next picker (or the link
-/// is retried), the loop re-binds and re-advertises — so the keyer reconnects without the
-/// operator touching Advertise again. The radio site resolves the keyer's *current* port from
-/// the live beacon at connect time, so the re-bound port is never stale.
-///
-/// Runs as one task; aborting it (unpair) stops the beacon and the wait. The beacon stops only
-/// while a handshake is being completed, then resumes for the next picker.
-async fn lan_advertise_and_await(shared: Arc<Shared>, callsign: String, keyer_id: String) {
-    let identity = match shared.config.lock().unwrap().identity.to_identity() {
-        Ok(id) => id,
-        Err(e) => return fail(&shared, format!("identity error: {e}")),
+/// Replaces the current connection operation while holding the same gate used for installation.
+/// The returned resources have already been made unreachable from shared state; they must be
+/// shut down outside the lock so their old async work cannot affect a replacement operation.
+fn replace_client_operation(shared: &Arc<Shared>) -> (OperationId, RetiredClientConnection) {
+    let mut connection = shared.connection.lock().unwrap();
+    let operation = connection.gate.replace();
+    // Revoke the ESP callback before it loses its queue. The callback also checks this token, so
+    // a buffered frame cannot begin a new ESP send after this retirement becomes visible.
+    if let Some(esp) = connection.esp_session.as_ref() {
+        esp.sender_stop.stop();
+    }
+    stop_browsing_locked(shared);
+    // Ends the pairing's ordered edge FIFO before any old session is shut down. `edge_drain`
+    // belongs only to this retired queue, so a later operation cannot be awaited by mistake.
+    let edge_drain = shared.edge.detach_with_drain();
+    let retired = RetiredClientConnection {
+        transport: connection.transport.take(),
+        session: connection.session.take(),
+        esp_session: connection.esp_session.take(),
+        edge_drain,
+        supervisor: connection.supervisor.take(),
     };
+    // Report teardown before awaiting a session shutdown, so the UI cannot stay live behind a
+    // stuck network close. This is inside the installation gate, so a stale connect cannot emit
+    // a later connected state after this Stop is visible.
+    shared.emit(ClientEvent::Rtt { ms: None });
+    shared.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
+    shared.log("info", "Unpaired.");
+    (operation, retired)
+}
 
+async fn shutdown_retired_client_connection(retired: RetiredClientConnection) {
+    let RetiredClientConnection { transport, session, esp_session, edge_drain, supervisor } = retired;
+    if let Some((_operation, task)) = supervisor {
+        task.abort();
+    }
+    if let Some(esp) = esp_session {
+        // The stop token was revoked before detaching. Awaiting this specific cancelled drain
+        // makes the ESP terminal unpair the first carrier action after all old frame callbacks.
+        edge_drain.wait().await;
+        let _ = esp.session.send_unpair().await;
+    }
+    if let Some(mut session) = session {
+        session.shutdown().await;
+    }
+    // Dropping the tunnel transport releases its UDP path after the global edge FIFO has been
+    // detached. It is deliberately retained until here so teardown ownership is explicit.
+    drop(transport);
+}
+
+/// Stops the LAN browse task and invalidates its catalogue generation. The caller must hold the
+/// Client connection gate whenever this races a new operation or a browse-handle installation.
+fn stop_browsing_locked(shared: &Arc<Shared>) {
+    if let Some(task) = shared.browse.lock().unwrap().take() {
+        task.abort();
+    }
+    shared.browse_generation.fetch_add(1, Ordering::SeqCst);
+    let mut players = shared.lan_players.lock().unwrap();
+    players.generation = 0;
+    players.desktop.clear();
+    players.esp.clear();
+    shared.emit(ClientEvent::LanPlayers { players: Vec::new() });
+}
+
+/// Opens a fresh browse generation only if its parent operation is still current. Holding the
+/// connection gate through catalogue publication closes the Stop/spawn window.
+fn activate_lan_browse(shared: &Arc<Shared>, operation: OperationId) -> Option<u64> {
+    let connection = shared.connection.lock().unwrap();
+    if !connection.permits(operation) {
+        return None;
+    }
+    let generation = shared.browse_generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    let mut players = shared.lan_players.lock().unwrap();
+    players.generation = generation;
+    players.desktop.clear();
+    players.esp.clear();
+    shared.emit(ClientEvent::LanPlayers { players: Vec::new() });
+    Some(generation)
+}
+
+/// Stores a browse handle only if both its pairing operation and discovery generation remain
+/// current. A stale spawned task is aborted instead of becoming an unreachable background task.
+fn install_browse_task(
+    shared: &Arc<Shared>,
+    operation: OperationId,
+    generation: u64,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let connection = shared.connection.lock().unwrap();
+    let mut browse = shared.browse.lock().unwrap();
+    if connection.permits(operation)
+        && shared.browse_generation.load(Ordering::SeqCst) == generation
+    {
+        if let Some(previous) = browse.replace(handle) {
+            previous.abort();
+        }
+    } else {
+        handle.abort();
+    }
+}
+
+/// Stores the WAN/LAN supervisor only while its operation is current. This closes the race where
+/// Stop runs after `spawn` but before the task handle reaches shared state.
+fn install_client_supervisor(
+    shared: &Arc<Shared>,
+    operation: OperationId,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut connection = shared.connection.lock().unwrap();
+    if connection.permits(operation) {
+        if let Some((_previous_operation, previous)) = connection.supervisor.replace((operation, handle)) {
+            previous.abort();
+        }
+    } else {
+        handle.abort();
+    }
+}
+
+fn client_operation_is_current(shared: &Arc<Shared>, operation: OperationId) -> bool {
+    shared.connection.lock().unwrap().permits(operation)
+}
+
+/// Pure ownership check used by the ESP frame sender. Both the operation generation and the
+/// one-way sender token must still authorize a callback before it starts carrier I/O.
+fn esp_sender_is_permitted(
+    connection: &ClientConnection,
+    operation: OperationId,
+    sender_stop: &EspSenderStop,
+) -> bool {
+    connection.permits(operation) && sender_stop.is_active()
+}
+
+fn esp_sender_is_current(
+    shared: &Arc<Shared>,
+    operation: OperationId,
+    sender_stop: &EspSenderStop,
+) -> bool {
+    let connection = shared.connection.lock().unwrap();
+    esp_sender_is_permitted(&connection, operation, sender_stop)
+}
+
+/// Emits a connecting state while holding the operation gate, so it cannot appear after a
+/// competing Stop or replacement has reported disconnected.
+fn announce_client_connecting(shared: &Arc<Shared>, operation: OperationId, message: &str) -> bool {
+    let connection = shared.connection.lock().unwrap();
+    if !connection.permits(operation) {
+        return false;
+    }
+    shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
+    shared.log("info", message);
+    true
+}
+
+fn log_client_if_current(
+    shared: &Arc<Shared>,
+    operation: OperationId,
+    level: &str,
+    message: impl Into<String>,
+) -> bool {
+    let connection = shared.connection.lock().unwrap();
+    if !connection.permits(operation) {
+        return false;
+    }
+    shared.log(level, message);
+    true
+}
+
+fn fail_client_operation(shared: &Arc<Shared>, operation: OperationId, message: impl Into<String>) {
+    let connection = shared.connection.lock().unwrap();
+    if !connection.permits(operation) {
+        return;
+    }
+    shared.log("warn", message);
+    shared.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
+}
+
+fn emit_client_rtt_if_current(shared: &Arc<Shared>, operation: OperationId, ms: Option<u32>) -> bool {
+    let connection = shared.connection.lock().unwrap();
+    if !connection.permits(operation) {
+        return false;
+    }
+    shared.emit(ClientEvent::Rtt { ms });
+    true
+}
+
+/// Browses both Player families in one cancellable task. The ESP32 query pass is deliberately
+/// finite and paced; receiving an advertisement never creates a session by itself.
+async fn browse_lan_players(
+    shared: Arc<Shared>,
+    generation: u64,
+    self_key: [u8; 32],
+    keyer_id: [u8; 6],
+) {
+    let mut desktop = match LanBrowser::bind(self_key) {
+        Ok(browser) => browser,
+        Err(error) => {
+            shared.log("warn", format!("Desktop Player browse failed: {error}"));
+            clear_lan_players(&shared, generation);
+            return;
+        }
+    };
+    // The desktop browser is already bound to the local LAN address selected for this Keyer.
+    // Reuse that address for ESP type-10 traffic instead of independently guessing from an
+    // Internet-route probe, which can select a VPN or virtual adapter on a multi-homed host.
+    let esp_bind_address = match desktop.local_addr() {
+        Ok(SocketAddr::V4(address)) if !address.ip().is_unspecified() => Some(*address.ip()),
+        Ok(_) | Err(_) => None,
+    };
+    let mut esp = match esp_bind_address {
+        Some(address) => EspPlayerBrowser::bind_on(keyer_id, address).await,
+        None => EspPlayerBrowser::bind(keyer_id).await,
+    }
+    .map(Some)
+    .unwrap_or_else(|error| {
+        shared.log("warn", format!("W1VE ESP32 Player browse unavailable: {error}"));
+        None
+    });
+    let mut query_active = false;
+    if let Some(browser) = esp.as_mut() {
+        browser.request_discovery();
+        query_active = true;
+    }
+
+    shared.log("info", "Browsing the LAN for desktop and W1VE ESP32 Players…");
+    if !publish_lan_players(&shared, generation, &mut desktop, esp.as_mut()) {
+        return;
+    }
+
+    enum BrowseEvent {
+        DesktopUpdated,
+        DesktopStopped(String),
+        EspUpdated,
+        EspStopped(String),
+        Deadline,
+    }
+
+    let mut next_query = tokio::time::Instant::now();
+    let mut next_refresh = tokio::time::Instant::now() + LAN_PLAYER_REFRESH_INTERVAL;
     loop {
-        // 1. Bind a fresh WireGuard socket for this cycle so the beacon advertises a live port.
-        let (socket, wg_port) = match tunnel::lan_bind().await {
-            Ok(pair) => pair,
-            Err(e) => return fail(&shared, format!("LAN bind failed: {e}")),
-        };
-
-        // 2. Broadcast the beacon until a picker connects.
-        let beacon = Beacon {
-            callsign: callsign.clone(),
-            keyer_id: keyer_id.clone(),
-            public_key: identity.public_bytes(),
-            wg_port,
-        };
-        let advertiser = match LanAdvertiser::new(beacon) {
-            Ok(a) => a,
-            Err(e) => return fail(&shared, format!("LAN advertise failed: {e}")),
-        };
-        let beacon_task = tokio::spawn(advertiser.run());
-        shared.emit(ClientEvent::Advertising { active: true });
-
-        // 3. Wait for a radio site to pick us and complete the handshake (we are the responder).
-        let connected = match tunnel::lan_await_initiator(socket, &identity).await {
-            Ok(c) => c,
-            Err(e) => {
-                beacon_task.abort();
-                // A timeout or socket error on this cycle: log and re-arm rather than giving
-                // up, so a transient hiccup does not silently stop the keyer responding.
-                shared.log("warn", format!("LAN listen cycle ended: {e}; re-advertising."));
-                continue;
+        // Send at most one unicast query per controlled interval. The core browser itself caps
+        // this pass to its local subnet, and `request_discovery` was called exactly once above.
+        let now = tokio::time::Instant::now();
+        if query_active && now >= next_query {
+            let result = match esp.as_mut() {
+                Some(browser) => browser.send_next_discovery_query().await,
+                None => Ok(false),
+            };
+            match result {
+                Ok(has_more) => query_active = has_more,
+                Err(error) => {
+                    shared.log("warn", format!("W1VE ESP32 Player discovery query stopped: {error}"));
+                    query_active = false;
+                }
             }
-        };
-        // Handshaking: stop this cycle's beacon so we are not picked twice mid-handshake.
-        beacon_task.abort();
-        shared.emit(ClientEvent::Advertising { active: false });
+            next_query = tokio::time::Instant::now() + ESP_DISCOVERY_QUERY_INTERVAL;
+        }
+        if tokio::time::Instant::now() >= next_refresh {
+            if !publish_lan_players(&shared, generation, &mut desktop, esp.as_mut()) {
+                return;
+            }
+            next_refresh = tokio::time::Instant::now() + LAN_PLAYER_REFRESH_INTERVAL;
+        }
 
-        // 4. Bring the keying edge up, then watch the Player's liveness. When the Player stops
-        //    responding (closed, or the link dropped), tear the dead session down and loop to
-        //    re-advertise, so the radio site can re-establish without the operator re-arming.
-        if let Some(edge) = bring_up_keying(&shared, connected).await {
-            let rtt_shared = Arc::clone(&shared);
-            let _ = watch_edge_liveness(edge, move |ms| {
-                rtt_shared.emit(ClientEvent::Rtt { ms });
-            })
-            .await;
-            teardown_session(&shared).await;
-            shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
-            shared.log("info", "Player stopped responding; re-advertising on the LAN…");
+        let next_deadline = if query_active { next_query.min(next_refresh) } else { next_refresh };
+        let wait = next_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = tokio::select! {
+            result = desktop.recv_once() => match result {
+                Ok(_) => BrowseEvent::DesktopUpdated,
+                Err(error) => BrowseEvent::DesktopStopped(error.to_string()),
+            },
+            result = async {
+                match esp.as_mut() {
+                    Some(browser) => browser.recv_once().await,
+                    None => std::future::pending::<rwk_core::Result<bool>>().await,
+                }
+            } => match result {
+                Ok(_) => BrowseEvent::EspUpdated,
+                Err(error) => BrowseEvent::EspStopped(error.to_string()),
+            },
+            _ = tokio::time::sleep(wait) => BrowseEvent::Deadline,
+        };
+        match event {
+            BrowseEvent::DesktopUpdated | BrowseEvent::EspUpdated => {
+                if !publish_lan_players(&shared, generation, &mut desktop, esp.as_mut()) {
+                    return;
+                }
+            }
+            BrowseEvent::DesktopStopped(error) => {
+                shared.log("warn", format!("Desktop Player browse stopped: {error}"));
+                clear_lan_players(&shared, generation);
+                return;
+            }
+            BrowseEvent::EspStopped(error) => {
+                shared.log("warn", format!("W1VE ESP32 Player browse stopped: {error}"));
+                esp = None;
+                query_active = false;
+                if !publish_lan_players(&shared, generation, &mut desktop, None) {
+                    return;
+                }
+            }
+            BrowseEvent::Deadline => {}
         }
     }
 }
 
-/// Tears the current pairing's edge + session down without emitting "disconnected" or touching
-/// the LAN advertiser, so the WAN supervisor can reconnect cleanly. The time-critical keyer
-/// threads key into `shared.edge`, which is detached here; with no transport the frames are
-/// simply dropped until the next `bring_up_keying` reinstalls one.
-async fn teardown_session(shared: &Arc<Shared>) {
-    *shared.transport.lock().unwrap() = None;
-    shared.edge.detach();
-    if let Some(mut session) = shared.session.lock().await.take() {
+/// Publishes browser-owned records and replaces the selection catalogue only when this is the
+/// current browse generation. Holding the catalogue lock through the event emission makes a
+/// stop's empty snapshot win over any racing cancelled task.
+fn publish_lan_players(
+    shared: &Arc<Shared>,
+    generation: u64,
+    desktop: &mut LanBrowser,
+    esp: Option<&mut EspPlayerBrowser>,
+) -> bool {
+    let desktop_players: Vec<DesktopPlayer> = desktop
+        .peers()
+        .into_iter()
+        .map(|player| DesktopPlayer {
+            public_key: player.public_key,
+            name: player.display_name(),
+            endpoint: player.endpoint,
+        })
+        .collect();
+    let esp_players = match esp {
+        Some(browser) => browser.players(),
+        None => Vec::new(),
+    };
+    let mut views: Vec<LanPlayerView> = desktop_players
+        .iter()
+        .map(|player| LanPlayerView::Desktop {
+            id: rwk_core::config::base64_encode(&player.public_key),
+            name: player.name.clone(),
+            endpoint: player.endpoint.to_string(),
+        })
+        .collect();
+    views.extend(esp_players.iter().map(|player| LanPlayerView::Esp {
+        id: player.id_hex(),
+        name: player.name.clone(),
+        endpoint: player.endpoint.to_string(),
+        busy: player.busy(),
+    }));
+
+    let mut catalogue = shared.lan_players.lock().unwrap();
+    if catalogue.generation != generation {
+        return false;
+    }
+    catalogue.desktop = desktop_players;
+    catalogue.esp = esp_players;
+    shared.emit(ClientEvent::LanPlayers { players: views });
+    true
+}
+
+fn clear_lan_players(shared: &Arc<Shared>, generation: u64) {
+    let mut catalogue = shared.lan_players.lock().unwrap();
+    if catalogue.generation != generation {
+        return;
+    }
+    catalogue.desktop.clear();
+    catalogue.esp.clear();
+    shared.emit(ClientEvent::LanPlayers { players: Vec::new() });
+}
+
+/// Runs the WAN reconnect supervisor for one operation. The relay address and shared token are
+/// deliberately retained exactly as supplied by `connect`; generation checks only decide whether
+/// this operation may still publish a resulting session.
+async fn connect_wan(
+    shared: Arc<Shared>,
+    operation: OperationId,
+    transport: Transport,
+    relay: String,
+    token: String,
+) {
+    // Supervised WAN connect: pair, key, and watch the Player's liveness. If the Player stops
+    // heartbeating (closed, or the link dropped), reconnect automatically with the same token,
+    // up to MAX_RECONNECT_ATTEMPTS consecutive failures before giving up.
+    let mut attempts: u32 = 0;
+    // The shared reconnect budget: a 15 s window that only resets after a link has stayed up for
+    // the stability threshold, so a pair-then-die flap cannot reconnect forever.
+    let mut budget = ReconnectBudget::new();
+    loop {
+        if !client_operation_is_current(&shared, operation) {
+            return;
+        }
+        let remaining = budget.remaining(std::time::Instant::now());
+        if remaining.is_zero() {
+            fail_client_operation(
+                &shared,
+                operation,
+                format!(
+                    "Could not reach the Player within {}s; disconnected. Reconnect to try again.",
+                    reconnect::RECONNECT_WINDOW.as_secs()
+                ),
+            );
+            return;
+        }
+        let base = shared.config.lock().unwrap().clone();
+        let config = match pairing::build_config(&base, Role::Client, transport, &token, &relay) {
+            Ok(config) => config,
+            Err(error) => {
+                fail_client_operation(&shared, operation, error);
+                return;
+            }
+        };
+        if !client_operation_is_current(&shared, operation) {
+            return;
+        }
+
+        // Each attempt is capped by the budget left, so pairing cannot hang past it. The shared
+        // helper retries the relay rendezvous once (750 ms) inside that budget.
+        let attempt = tokio::time::timeout(remaining, connect_with_relay_retry(&config)).await;
+        if !client_operation_is_current(&shared, operation) {
+            // A completed `Connected` is dropped here before a Session has been started.
+            return;
+        }
+        match attempt {
+            Err(_) => {
+                if !log_client_if_current(&shared, operation, "warn", "link failed: reconnect budget elapsed") {
+                    return;
+                }
+            }
+            Ok(Ok(connected)) => {
+                if let Some(edge) = bring_up_keying(&shared, operation, connected).await {
+                    if !client_operation_is_current(&shared, operation) {
+                        return;
+                    }
+                    // A link came up; it must prove it is stable before the budget resets.
+                    attempts = 0;
+                    let connected_at = std::time::Instant::now();
+                    let rtt_shared = Arc::clone(&shared);
+                    let outcome = watch_edge_liveness(edge, move |ms| {
+                        let _ = emit_client_rtt_if_current(&rtt_shared, operation, ms);
+                    })
+                    .await;
+                    if !client_operation_is_current(&shared, operation) {
+                        return;
+                    }
+                    // Only a link that stayed up past the stability threshold earns a fresh
+                    // budget; a flap keeps consuming the current window.
+                    budget.record_link_ended(connected_at, std::time::Instant::now());
+                    // Tear the dead session down before retrying. This only takes resources that
+                    // still belong to this operation.
+                    if !teardown_session(&shared, operation).await {
+                        return;
+                    }
+                    if outcome == Liveness::Closed {
+                        // A deliberate local teardown (unpair) ends the supervisor.
+                        return;
+                    }
+                    // Link lost: retry within whatever budget remains.
+                    if !log_client_if_current(
+                        &shared,
+                        operation,
+                        "warn",
+                        "Player stopped responding; reconnecting…",
+                    ) || !announce_client_connecting(&shared, operation, "Reconnecting to the Player…")
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if !client_operation_is_current(&shared, operation) {
+                    return;
+                }
+                // bring_up failed after a link came up; count it as an attempt.
+            }
+            Ok(Err(error)) => {
+                if !log_client_if_current(&shared, operation, "warn", format!("link failed: {error}")) {
+                    return;
+                }
+            }
+        }
+
+        attempts += 1;
+        if attempts >= MAX_RECONNECT_ATTEMPTS {
+            fail_client_operation(
+                &shared,
+                operation,
+                format!(
+                    "Could not reach the Player after {MAX_RECONNECT_ATTEMPTS} attempts; \
+                     giving up. Reconnect to try again."
+                ),
+            );
+            return;
+        }
+        if !log_client_if_current(
+            &shared,
+            operation,
+            "info",
+            format!("Reconnect attempt {attempts}/{MAX_RECONNECT_ATTEMPTS}…"),
+        ) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Resolves the selected desktop Player's current advertised endpoint, then connects as the
+/// WireGuard initiator. The browser-provided endpoint remains an identity-validated fallback if
+/// the Player re-advertisement is missed during the short resolution window.
+async fn connect_desktop_player(
+    shared: &Arc<Shared>,
+    operation: OperationId,
+    public_key: [u8; 32],
+    endpoint_hint: SocketAddr,
+) {
+    if !client_operation_is_current(shared, operation) {
+        return;
+    }
+    let config = shared.config.lock().unwrap().clone();
+    let identity = match config.identity.to_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            fail_client_operation(shared, operation, format!("identity error: {error}"));
+            return;
+        }
+    };
+    let resolved = LanBrowser::resolve(
+        identity.public_bytes(),
+        public_key,
+        std::time::Duration::from_secs(4),
+    )
+    .await;
+    if !client_operation_is_current(shared, operation) {
+        return;
+    }
+    let endpoint = match resolved {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            if !log_client_if_current(
+                shared,
+                operation,
+                "warn",
+                format!(
+                    "Desktop Player did not refresh during selection: {error}; using its last advertised address."
+                ),
+            ) {
+                return;
+            }
+            endpoint_hint
+        }
+    };
+    let connected = tunnel::lan_connect_to(&identity, public_key, endpoint).await;
+    if !client_operation_is_current(shared, operation) {
+        // The tunnel has not become a Session yet, so dropping `Connected` tears down its
+        // uninstalled setup state.
+        return;
+    }
+    let connected = match connected {
+        Ok(connected) => connected,
+        Err(error) => {
+            fail_client_operation(shared, operation, format!("LAN link failed: {error}"));
+            return;
+        }
+    };
+    if let Some(edge) = bring_up_keying(shared, operation, connected).await {
+        if !client_operation_is_current(shared, operation) {
+            return;
+        }
+        let rtt_shared = Arc::clone(shared);
+        let _ = watch_edge_liveness(edge, move |ms| {
+            let _ = emit_client_rtt_if_current(&rtt_shared, operation, ms);
+        })
+        .await;
+        if !teardown_session(shared, operation).await {
+            return;
+        }
+        let connection = shared.connection.lock().unwrap();
+        if !connection.permits(operation) {
+            return;
+        }
+        shared.emit(ClientEvent::Rtt { ms: None });
+        shared.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
+        shared.log("warn", "Desktop Player stopped responding; disconnected.");
+    }
+}
+
+/// Pairs only with a discovery-validated W1VE ESP32 Player record. The compact Keyer id is
+/// always derived from this Client's persisted WireGuard public key, never UI input.
+async fn connect_esp_player(
+    shared: &Arc<Shared>,
+    operation: OperationId,
+    player: EspPlayerAdvertisement,
+) {
+    if !client_operation_is_current(shared, operation) {
+        return;
+    }
+    let identity = match shared.config.lock().unwrap().identity.to_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            fail_client_operation(shared, operation, format!("identity error: {error}"));
+            return;
+        }
+    };
+    let keyer_id = keyer_id_from_public_key(identity.public_bytes());
+    let session = EspPlayerSession::pair(player, keyer_id).await;
+    if !client_operation_is_current(shared, operation) {
+        // Pairing succeeded after Stop/replacement. It was never published, so explicitly
+        // release the Player's temporary pairing state instead of relying on task abort alone.
+        if let Ok(session) = session {
+            let _ = session.send_unpair().await;
+        }
+        return;
+    }
+    let session = match session {
+        Ok(session) => Arc::new(session),
+        Err(error) => {
+            fail_client_operation(
+                shared,
+                operation,
+                format!("W1VE ESP32 Player pairing failed: {error}"),
+            );
+            return;
+        }
+    };
+    run_esp_player_session(shared, operation, session).await;
+}
+
+/// Installs the ESP edge sender and session only while this operation still owns the single
+/// connection gate. The callback captures this operation and a one-way stop token, so it cannot
+/// send an old queued frame after the session has been retired.
+fn install_esp_session(
+    shared: &Arc<Shared>,
+    operation: OperationId,
+    session: &Arc<EspPlayerSession>,
+) -> Option<EspSenderStop> {
+    let message = format!(
+        "Paired with W1VE ESP32 Player {} at {}.",
+        session.player().id_hex(),
+        session.player().endpoint
+    );
+    let mut connection = shared.connection.lock().unwrap();
+    if !connection.permits_resource_install(operation) {
+        return None;
+    }
+    let sender_stop = EspSenderStop::new();
+    let sender_session = Arc::clone(session);
+    let sender_shared = Arc::clone(shared);
+    let callback_stop = sender_stop.clone();
+    shared.edge.begin_with_sender(*shared.epoch.lock().unwrap(), MonotonicClock.now(), move |frame| {
+        let session = Arc::clone(&sender_session);
+        let shared = Arc::clone(&sender_shared);
+        let sender_stop = callback_stop.clone();
+        async move {
+            if !esp_sender_is_current(&shared, operation, &sender_stop) {
+                return;
+            }
+            let _ = session.send_frame(&frame).await;
+        }
+    });
+    connection.esp_session = Some(ActiveEspSession {
+        operation,
+        session: Arc::clone(session),
+        sender_stop: sender_stop.clone(),
+    });
+    shared.emit(ClientEvent::Connection { state: "connected".into(), path: "esp".into() });
+    shared.log("info", message);
+    Some(sender_stop)
+}
+
+/// Runs one selected W1VE ESP32 Player session. It keeps the edge generator's ordered FIFO and
+/// resends its newest complete edge frame every 250 ms so the Player's key-state lease never
+/// depends on a separate state packet.
+async fn run_esp_player_session(
+    shared: &Arc<Shared>,
+    operation: OperationId,
+    session: Arc<EspPlayerSession>,
+) {
+    let Some(sender_stop) = install_esp_session(shared, operation, &session) else {
+        // This includes a pairing that completed after Stop. It cannot install the edge sender
+        // or ESP session, and it actively unpairs the resource it just created.
+        let _ = session.send_unpair().await;
+        return;
+    };
+
+    let mut refresh_ticker = tokio::time::interval(LAN_PLAYER_REFRESH_INTERVAL);
+    let mut ping_ticker = tokio::time::interval(ESP_PLAYER_PING_INTERVAL);
+    let mut pending_ping = None;
+    let mut missed_pings = 0u8;
+    let reason = loop {
+        if !esp_sender_is_current(shared, operation, &sender_stop) {
+            return;
+        }
+        tokio::select! {
+            incoming = session.recv() => match incoming {
+                Ok(Some(EspPlayerInbound::Unpaired)) => break "W1VE ESP32 Player requested unpair",
+                Ok(_) => {}
+                Err(_) => break "W1VE ESP32 Player stopped responding",
+            },
+            _ = refresh_ticker.tick() => {
+                if let Some(frame) = shared.edge.latest_frame() {
+                    if !esp_sender_is_current(shared, operation, &sender_stop) {
+                        return;
+                    }
+                    if let Err(error) = session.send_frame(&frame).await {
+                        if session.sequence_exhausted() {
+                            break "W1VE ESP32 Player envelope sequence exhausted";
+                        }
+                        if !log_client_if_current(
+                            shared,
+                            operation,
+                            "warn",
+                            format!("W1VE ESP32 Player frame refresh failed: {error}"),
+                        ) {
+                            return;
+                        }
+                    }
+                }
+                if !esp_sender_is_current(shared, operation, &sender_stop) {
+                    return;
+                }
+            }
+            _ = ping_ticker.tick() => {
+                let mut counted_miss = false;
+                if let Some(stamp) = pending_ping.take() {
+                    if session.ping_was_acknowledged(stamp) {
+                        missed_pings = 0;
+                    } else {
+                        missed_pings = missed_pings.saturating_add(1);
+                        counted_miss = true;
+                        if missed_pings >= ESP_PLAYER_MISSED_PING_LIMIT {
+                            break "W1VE ESP32 Player missed three matching PONG replies";
+                        }
+                    }
+                }
+
+                match session.send_ping().await {
+                    Ok(stamp) => pending_ping = Some(stamp),
+                    Err(error) => {
+                        if session.sequence_exhausted() {
+                            break "W1VE ESP32 Player envelope sequence exhausted";
+                        }
+                        // A failed send accounts for one interval only if the preceding missed
+                        // PONG was not already counted on this tick.
+                        if !counted_miss {
+                            missed_pings = missed_pings.saturating_add(1);
+                        }
+                        if missed_pings >= ESP_PLAYER_MISSED_PING_LIMIT {
+                            break "W1VE ESP32 Player missed three matching PONG replies";
+                        }
+                        if !log_client_if_current(
+                            shared,
+                            operation,
+                            "warn",
+                            format!("W1VE ESP32 Player ping send failed: {error}"),
+                        ) {
+                            return;
+                        }
+                    }
+                }
+                let ms = session
+                    .rtt()
+                    .map(|duration| u32::try_from(duration.as_millis()).unwrap_or(u32::MAX));
+                if !emit_client_rtt_if_current(shared, operation, ms) {
+                    return;
+                }
+            }
+        }
+    };
+
+    let edge_drain = {
+        let mut connection = shared.connection.lock().unwrap();
+        if !connection.permits(operation) {
+            None
+        } else {
+            let owns_session = match connection.esp_session.as_ref() {
+                Some(current) => {
+                    current.operation == operation && Arc::ptr_eq(&current.session, &session)
+                }
+                None => false,
+            };
+            if !owns_session {
+                None
+            } else {
+                let current = connection.esp_session.take().expect("owned ESP session");
+                // Revoke this session's callback before detaching its queue. The returned handle
+                // cannot refer to a replacement queue because both actions happen under the gate.
+                current.sender_stop.stop();
+                let edge_drain = shared.edge.detach_with_drain();
+                shared.emit(ClientEvent::Rtt { ms: None });
+                shared.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
+                shared.log("warn", format!("{reason}; disconnected."));
+                Some(edge_drain)
+            }
+        }
+    };
+    if let Some(edge_drain) = edge_drain {
+        // A terminal authenticated unpair is safe even if the Player already closed its side.
+        // It follows the stopped callback's completed drain, never a replacement operation.
+        edge_drain.wait().await;
+        let _ = session.send_unpair().await;
+    }
+}
+
+/// Tears this operation's tunnel pairing down without emitting "disconnected" or touching the
+/// selected-LAN browse task, so the WAN supervisor can reconnect cleanly. A stale supervisor
+/// cannot detach a newer operation's edge or take its session.
+async fn teardown_session(shared: &Arc<Shared>, operation: OperationId) -> bool {
+    let session = {
+        let mut connection = shared.connection.lock().unwrap();
+        if !connection.permits(operation) {
+            return false;
+        }
+        connection.transport = None;
+        // Tunnel callers do not send an ESP terminal message, so cancellation is sufficient.
+        let _ = shared.edge.detach();
+        connection.session.take()
+    };
+    if let Some(mut session) = session {
         session.shutdown().await;
     }
+    true
 }
 
 /// Shared tail of both the WAN and LAN connect paths: start the session, open the keying edge
-/// over the tunnel, install it, and report connected. Returns the live [`EdgeTransport`] so the
-/// caller can watch it for peer liveness, or [`None`] if bring-up failed.
-async fn bring_up_keying(shared: &Arc<Shared>, connected: tunnel::Connected) -> Option<Arc<EdgeTransport>> {
+/// over the tunnel, and atomically install it while this operation is still current. A Session
+/// created by stale work is always shut down before returning, never published to shared state.
+async fn bring_up_keying(
+    shared: &Arc<Shared>,
+    operation: OperationId,
+    connected: tunnel::Connected,
+) -> Option<Arc<EdgeTransport>> {
+    if !client_operation_is_current(shared, operation) {
+        return None;
+    }
     let path = format!("{:?}", connected.path).to_lowercase();
     let config = shared.config.lock().unwrap().clone();
-    let session = match Session::start(connected, &config) {
-        Ok(s) => s,
-        Err(e) => {
-            fail(shared, format!("session failed: {e}"));
+    let mut session = match Session::start(connected, &config) {
+        Ok(session) => session,
+        Err(error) => {
+            fail_client_operation(shared, operation, format!("session failed: {error}"));
             return None;
         }
     };
+    if !client_operation_is_current(shared, operation) {
+        session.shutdown().await;
+        return None;
+    }
     let net = session.handle();
     let conn = match net.open_udp(EDGE_PORT).await {
-        Ok(c) => c,
-        Err(e) => {
-            fail(shared, format!("edge open failed: {e}"));
+        Ok(conn) => conn,
+        Err(error) => {
+            fail_client_operation(shared, operation, format!("edge open failed: {error}"));
+            session.shutdown().await;
             return None;
         }
     };
+    if !client_operation_is_current(shared, operation) {
+        session.shutdown().await;
+        return None;
+    }
     let edge = Arc::new(EdgeTransport::over_tunnel(conn));
     let peer = std::net::SocketAddr::new(
         std::net::IpAddr::V4(Role::Client.peer_inner_address()),
         EDGE_PORT,
     );
     edge.set_peer(peer).await;
+    if !client_operation_is_current(shared, operation) {
+        session.shutdown().await;
+        return None;
+    }
 
-    // A new pairing restarts the edge stream at sequence 0 and starts its ordered tunnel FIFO.
-    // The Station builds a fresh replayer per session, so it accepts the restart.
-    shared.edge.begin(*shared.epoch.lock().unwrap(), MonotonicClock.now(), Arc::clone(&edge));
-    *shared.transport.lock().unwrap() = Some(Arc::clone(&edge));
-
-    *shared.session.lock().await = Some(session);
-    // The epoch is intentionally NOT bumped here. Both edge sources (the paddle poller and
-    // the type-ahead send worker) sample `shared.epoch` independently, so a bump would make
-    // them disagree and the Server would F4 whichever source sent second. The server adopts
-    // the first frame's epoch of each fresh session and re-anchors on reconnect, so a stable
-    // epoch is both correct and necessary.
-    shared.emit(ClientEvent::Connection { state: "connected".into(), path: path.clone() });
-    shared.log("info", format!("Paired with the Player over the {path} path."));
+    let message = format!("Paired with the Player over the {path} path.");
+    let mut session_to_install = Some(session);
+    let installed = {
+        let mut connection = shared.connection.lock().unwrap();
+        if !connection.permits_resource_install(operation) {
+            false
+        } else {
+            // A new pairing restarts the edge stream at sequence 0 and starts its ordered tunnel
+            // FIFO. The Station builds a fresh replayer per session, so it accepts the restart.
+            shared.edge.begin(*shared.epoch.lock().unwrap(), MonotonicClock.now(), Arc::clone(&edge));
+            connection.transport = Some(Arc::clone(&edge));
+            connection.session = session_to_install.take();
+            // The epoch is intentionally NOT bumped here. Both edge sources (the paddle poller
+            // and the type-ahead send worker) sample `shared.epoch` independently, so a bump
+            // would make them disagree and the Server would F4 whichever source sent second.
+            shared.emit(ClientEvent::Connection { state: "connected".into(), path: path.clone() });
+            shared.log("info", message);
+            true
+        }
+    };
+    if !installed {
+        if let Some(mut session) = session_to_install.take() {
+            session.shutdown().await;
+        }
+        return None;
+    }
     Some(edge)
 }
 
@@ -1047,11 +1953,6 @@ impl Drop for ClientController {
         self.shared.send.shutdown();
         self.disconnect();
     }
-}
-
-fn fail(shared: &Arc<Shared>, message: String) {
-    shared.log("warn", message);
-    shared.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
 }
 
 /// Loads or creates the persisted config for `role`, saving a fresh one so the identity is
@@ -1374,6 +2275,82 @@ fn read_keyer_settings(shared: &Arc<Shared>) -> (u32, u32, KeyerMode, bool) {
     (s.wpm, s.weight, s.mode, s.paddle_reverse)
 }
 
+/// Derives the compact W1VE ESP32 Player protocol id from the stable persisted identity key.
+fn keyer_id_from_public_key(public_key: [u8; 32]) -> [u8; 6] {
+    let mut keyer_id = [0u8; 6];
+    keyer_id.copy_from_slice(&public_key[..6]);
+    keyer_id
+}
+
+/// Parses the fixed-width hexadecimal ESP32 Player identity used by the tagged UI selection.
+fn parse_esp_player_id(value: &str) -> Option<[u8; 6]> {
+    if value.len() != 12 || !value.is_ascii() {
+        return None;
+    }
+    let mut id = [0u8; 6];
+    for (slot, pair) in id.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        *slot = hex_nibble(pair[0])? << 4 | hex_nibble(pair[1])?;
+    }
+    Some(id)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Turns a UI selection into only browser-owned data. A UI caller cannot substitute an endpoint,
+/// pick an expired/unknown Player, or pair with a Player that reports itself busy.
+fn validate_lan_selection(
+    players: &LanPlayerCatalog,
+    selection: &LanPlayerSelection,
+) -> Result<ValidatedLanSelection, String> {
+    if players.generation == 0 {
+        return Err("LAN browsing is not active. Refresh the Player list and try again.".into());
+    }
+    match selection {
+        LanPlayerSelection::Desktop { id, endpoint } => {
+            let public_key = rwk_core::config::base64_decode(id)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .ok_or_else(|| "Invalid desktop Player selection.".to_string())?;
+            let endpoint = endpoint
+                .parse::<SocketAddr>()
+                .map_err(|_| "Invalid desktop Player address.".to_string())?;
+            if players
+                .desktop
+                .iter()
+                .any(|player| player.public_key == public_key && player.endpoint == endpoint)
+            {
+                Ok(ValidatedLanSelection::Desktop { public_key, endpoint })
+            } else {
+                Err("The selected desktop Player is no longer in the current LAN list.".into())
+            }
+        }
+        LanPlayerSelection::Esp { id, endpoint } => {
+            let player_id = parse_esp_player_id(id)
+                .ok_or_else(|| "Invalid W1VE ESP32 Player selection.".to_string())?;
+            let endpoint = endpoint
+                .parse::<SocketAddr>()
+                .map_err(|_| "Invalid W1VE ESP32 Player address.".to_string())?;
+            let player = players
+                .esp
+                .iter()
+                .find(|player| player.player_id == player_id && player.endpoint == endpoint)
+                .cloned()
+                .ok_or_else(|| "The selected W1VE ESP32 Player is no longer in the current LAN list.".to_string())?;
+            if player.busy() {
+                return Err("The selected W1VE ESP32 Player is busy. Choose another Player or refresh the list.".into());
+            }
+            Ok(ValidatedLanSelection::Esp(player))
+        }
+    }
+}
+
 fn parse_mode(name: &str) -> KeyerMode {
     match name {
         "iambicA" => KeyerMode::IambicA,
@@ -1397,4 +2374,146 @@ fn mode_name(mode: KeyerMode) -> &'static str {
 /// Whether `selected` names a port that is not in `present` (and is `Some`).
 fn port_missing(selected: &Option<String>, present: &[String]) -> bool {
     matches!(selected, Some(name) if !present.iter().any(|p| p == name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_client_setting_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("wrk-client-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("client.json");
+        let _ = std::fs::remove_file(&path);
+        let sink: EventSink = Arc::new(|_| {});
+
+        let first = ClientController::start_with_config(Arc::clone(&sink), Some(path.clone()));
+        first.set_speed(33);
+        first.set_weight(60);
+        first.set_mode("ultimatic");
+        first.set_paddle_reverse(true);
+        first.set_tone_frequency(750);
+        first.set_tone_volume(35);
+        first.select_audio_device(Some(String::new()));
+        first.set_relay("198.51.100.9:9999");
+        first.set_transport("lan");
+        // Port names that do not exist still record the operator's selection.
+        first.select_paddle_port(Some("W1VE-TEST-PADDLE".into()));
+        first.select_logger_port(Some("W1VE-TEST-LOGGER".into()));
+        first.shared.settings.lock().unwrap().token = "ab12cd".into();
+        first.shared.persist();
+        drop(first);
+
+        let second = ClientController::start_with_config(sink, Some(path.clone()));
+        let s = second.shared.settings.lock().unwrap().clone();
+        drop(second);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(s.wpm, 33);
+        assert_eq!(s.weight, 60);
+        assert_eq!(mode_name(s.mode), "ultimatic");
+        assert!(s.paddle_reverse);
+        assert_eq!(s.tone_hz, 750);
+        assert_eq!(s.tone_volume, 35);
+        assert_eq!(s.audio_device.as_deref(), Some(""));
+        assert_eq!(s.relay, "198.51.100.9:9999");
+        assert_eq!(s.transport, Transport::Lan);
+        assert_eq!(s.paddle_port.as_deref(), Some("W1VE-TEST-PADDLE"));
+        assert_eq!(s.logger_port.as_deref(), Some("W1VE-TEST-LOGGER"));
+        assert_eq!(s.token, "ab12cd");
+    }
+
+    #[test]
+    fn stale_operation_id_cannot_pass_client_installation_gate() {
+        let mut connection = ClientConnection::default();
+        let stale = connection.gate.replace();
+        let current = connection.gate.replace();
+
+        assert!(!connection.permits_resource_install(stale));
+        assert!(connection.permits_resource_install(current));
+    }
+
+    #[test]
+    fn persisted_identity_key_derives_the_first_six_keyer_id_bytes() {
+        let mut public_key = [0u8; 32];
+        public_key[..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(keyer_id_from_public_key(public_key), [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn esp_player_ids_must_be_exact_hex_six_byte_values() {
+        assert_eq!(parse_esp_player_id("0A1B2C3D4E5F"), Some([10, 27, 44, 61, 78, 95]));
+        assert_eq!(parse_esp_player_id("0a1b2c3d4e5f"), Some([10, 27, 44, 61, 78, 95]));
+        assert_eq!(parse_esp_player_id("0A1B2C3D4E5"), None);
+        assert_eq!(parse_esp_player_id("0A1B2C3D4E5G"), None);
+    }
+
+    #[test]
+    fn lan_selection_must_match_a_current_discovery_record() {
+        let endpoint: SocketAddr = "192.168.1.25:4995".parse().unwrap();
+        let player = EspPlayerAdvertisement::from_parts(
+            [1, 2, 3, 4, 5, 6],
+            "Radio room".into(),
+            endpoint,
+            0,
+        );
+        let players = LanPlayerCatalog {
+            generation: 7,
+            desktop: vec![DesktopPlayer {
+                public_key: [9u8; 32],
+                name: "Desktop".into(),
+                endpoint: "192.168.1.20:51820".parse().unwrap(),
+            }],
+            esp: vec![player],
+        };
+        let desktop_id = rwk_core::config::base64_encode(&[9u8; 32]);
+
+        assert!(matches!(
+            validate_lan_selection(
+                &players,
+                &LanPlayerSelection::Desktop {
+                    id: desktop_id,
+                    endpoint: "192.168.1.99:51820".into(),
+                },
+            ),
+            Err(_)
+        ));
+        assert!(matches!(
+            validate_lan_selection(
+                &players,
+                &LanPlayerSelection::Esp {
+                    id: "010203040506".into(),
+                    endpoint: endpoint.to_string(),
+                },
+            ),
+            Ok(ValidatedLanSelection::Esp(_))
+        ));
+    }
+
+    #[test]
+    fn busy_esp_player_selection_is_rejected_before_pairing() {
+        let endpoint: SocketAddr = "192.168.1.25:4995".parse().unwrap();
+        let players = LanPlayerCatalog {
+            generation: 1,
+            desktop: Vec::new(),
+            esp: vec![EspPlayerAdvertisement::from_parts(
+                [1, 2, 3, 4, 5, 6],
+                "Busy radio room".into(),
+                endpoint,
+                1,
+            )],
+        };
+
+        assert!(matches!(
+            validate_lan_selection(
+                &players,
+                &LanPlayerSelection::Esp {
+                    id: "010203040506".into(),
+                    endpoint: endpoint.to_string(),
+                },
+            ),
+            Err(message) if message.contains("busy")
+        ));
+    }
 }

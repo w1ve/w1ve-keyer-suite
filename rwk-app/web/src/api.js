@@ -43,11 +43,11 @@ export const api = {
   connect: (relay, code) => invoke("connect", { relay, code }),
   disconnect: () => invoke("disconnect"),
 
-  // Pairing — transport + LAN (this keyer advertises itself; the Station picks it)
+  // Pairing — LAN: this operating Keyer browses tagged desktop and W1VE ESP32 Players, then
+  // asks the backend to validate and connect the selected record.
   setTransport: (transport) => invoke("set_transport", { transport }),
-  setCallsign: (callsign) => invoke("set_callsign", { callsign }),
-  setKeyerId: (keyerId) => invoke("set_keyer_id", { keyerId }),
-  lanAdvertise: (on) => invoke("lan_advertise", { on }),
+  browseLanPlayers: () => invoke("lan_browse_players"),
+  connectLanPlayer: (playerType, id) => invoke("lan_connect_player", { playerType, id }),
 
   // Ham Router (port forwarding)
   forwardRulesRefresh: () => invoke("forward_rules_refresh"),

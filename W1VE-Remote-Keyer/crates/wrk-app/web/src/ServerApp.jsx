@@ -10,9 +10,9 @@ import { APP_NAME_SERVER } from "./app-info.js";
 // How long the splash popup stays up once the main UI has loaded.
 const SPLASH_MS = 5000;
 
-// The Remote Keyer Server: keying-output configuration, WAN/LAN choice, the pairing token to
-// hand the Client, KEY/PTT indicators, and a fail-safe banner. Same look-and-feel as the
-// Keyer-Router Station.
+// The Remote Keyer Player: keying-output configuration, WAN/LAN choice, the pairing token to
+// hand the Client, the persisted LAN display identity it advertises, KEY/PTT indicators, and a
+// fail-safe banner.
 export default function ServerApp() {
   const [settings, setSettings] = useState({
     keyingPort: null,
@@ -23,6 +23,8 @@ export default function ServerApp() {
     transport: "wan",
     relay: "",
     token: "",
+    callsign: "",
+    keyerId: "",
   });
   const [connection, setConnection] = useState({ state: "disconnected", path: "none" });
   const [keyDown, setKeyDown] = useState(false);
@@ -32,8 +34,7 @@ export default function ServerApp() {
   const [log, setLog] = useState([]);
   const [ports, setPorts] = useState([]);
   const [errors, setErrors] = useState({}); // control -> short red message
-  const [lanPeers, setLanPeers] = useState([]);
-  const [pickedKey, setPickedKey] = useState("");
+  const [advertising, setAdvertising] = useState(false);
   const [tab, setTab] = useState("main"); // "main" | "connections"
   const [aboutOpen, setAboutOpen] = useState(false);
   // The two snapshots that make the main UI complete: first settings snapshot and ports.
@@ -54,6 +55,8 @@ export default function ServerApp() {
             transport: ev.transport,
             relay: ev.relay,
             token: ev.token,
+            callsign: ev.callsign ?? "",
+            keyerId: ev.keyer_id ?? "",
           });
           break;
         case "connection":
@@ -72,8 +75,8 @@ export default function ServerApp() {
         case "failSafe":
           setLastFailSafe({ code: ev.code, message: ev.message });
           break;
-        case "lanPeers":
-          setLanPeers(ev.peers || []);
+        case "advertising":
+          setAdvertising(ev.active);
           break;
         case "ports":
           setPorts(ev.available || []);
@@ -128,17 +131,9 @@ export default function ServerApp() {
     };
   }, []);
 
-  // Keep the picked keyer valid as the live list changes.
-  useEffect(() => {
-    if (pickedKey && !lanPeers.some((p) => p.key === pickedKey)) {
-      setPickedKey(lanPeers[0]?.key || "");
-    } else if (!pickedKey && lanPeers.length > 0) {
-      setPickedKey(lanPeers[0].key);
-    }
-  }, [lanPeers, pickedKey]);
-
   const running = connection.state === "connected";
   const connecting = connection.state === "connecting";
+  const hasPlayerIdentity = Boolean(settings.callsign.trim() || settings.keyerId.trim());
   const pathText =
     running ? (connection.path === "relay" ? "DERP" : "Direct") : connecting ? "Waiting…" : "Stopped";
   const linkColor = running ? "var(--good)" : connecting ? "var(--warn)" : "var(--text-dim)";
@@ -298,8 +293,8 @@ export default function ServerApp() {
                   value={settings.transport}
                   disabled={running || connecting}
                   onChange={(t) => {
+                    setSettings((s) => ({ ...s, transport: t }));
                     api.setTransport(t);
-                    if (t === "lan") api.lanBrowse();
                   }}
                 />
               </div>
@@ -337,41 +332,46 @@ export default function ServerApp() {
                 </>
               ) : (
                 <>
-                  <div className="field" style={{ marginBottom: 0, minWidth: 220 }}>
-                    <label>Available keyers</label>
-                    <select
-                      value={pickedKey}
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label>Player callsign</label>
+                    <input
+                      type="text"
+                      value={settings.callsign}
+                      placeholder="Station callsign"
                       disabled={running || connecting}
-                      onChange={(e) => setPickedKey(e.target.value)}
-                    >
-                      {lanPeers.length === 0 && <option value="">(searching…)</option>}
-                      {lanPeers.map((p) => (
-                        <option key={p.key} value={p.key}>
-                          {p.name}
-                        </option>
-                      ))}
-                    </select>
+                      onChange={(e) => {
+                        setSettings((s) => ({ ...s, callsign: e.target.value }));
+                        api.setCallsign(e.target.value);
+                      }}
+                      style={{ width: 150 }}
+                    />
                   </div>
-                  <div style={{ alignSelf: "flex-end" }}>
-                    <button onClick={() => api.lanBrowse()} disabled={running || connecting}>
-                      Refresh
-                    </button>
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label>Player ID</label>
+                    <input
+                      type="text"
+                      value={settings.keyerId}
+                      placeholder="20m, etc."
+                      disabled={running || connecting}
+                      onChange={(e) => {
+                        setSettings((s) => ({ ...s, keyerId: e.target.value }));
+                        api.setKeyerId(e.target.value);
+                      }}
+                      style={{ width: 130 }}
+                    />
                   </div>
                   <div style={{ alignSelf: "flex-end" }}>
                     {running || connecting ? (
-                      <button onClick={() => api.disconnect()} style={{ background: "#5a2d2d" }}>
-                        {connecting ? "Cancel" : "Stop"}
+                      <button onClick={() => api.lanAdvertise(false)} style={{ background: "#5a2d2d" }}>
+                        {connecting ? "Stop" : "Unpair"}
                       </button>
                     ) : (
                       <button
-                        onClick={() => {
-                          const peer = lanPeers.find((p) => p.key === pickedKey);
-                          if (peer) api.connectLan(peer.key, peer.endpoint);
-                        }}
-                        disabled={!pickedKey}
+                        onClick={() => api.lanAdvertise(true)}
+                        disabled={!hasPlayerIdentity}
                         style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
                       >
-                        Connect
+                        Advertise
                       </button>
                     )}
                   </div>
@@ -381,7 +381,9 @@ export default function ServerApp() {
             <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0, marginTop: 8 }}>
               {settings.transport === "wan"
                 ? "Start and give the token to the Client. A keying port is optional — without one the KEY LED still follows the Client; pick or change the port any time."
-                : "Pick a keyer advertising on your LAN, then Connect. A keying port is optional and can be set or changed any time. No relay, no internet."}
+                : advertising
+                  ? `Advertising ${playerName(settings)} as a desktop Player. The operating Keyer can select it on this LAN.`
+                  : "Enter a callsign and optional Player ID, then Advertise. The operating Keyer selects this desktop Player; no relay or internet is needed."}
             </p>
           </div>
 
@@ -403,6 +405,13 @@ export default function ServerApp() {
       {aboutOpen && <AboutDialog name={APP_NAME_SERVER} onClose={() => setAboutOpen(false)} />}
     </div>
   );
+}
+
+function playerName(settings) {
+  const callsign = settings.callsign.trim();
+  const keyerId = settings.keyerId.trim();
+  if (callsign && keyerId) return `${callsign}-${keyerId}`;
+  return callsign || keyerId || "(unnamed Player)";
 }
 
 function Indicator({ label, on, onColor }) {

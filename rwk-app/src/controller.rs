@@ -2,26 +2,30 @@
 //!
 //! This mirrors the C# `ClientController`. The UI never touches the engine directly; it
 //! sends commands here and renders [`ClientEvent`]s this controller emits. All blocking and
-//! async work (CW playback timing, the WireGuard link, keying over the tunnel) happens on
+//! async work (CW playback timing, WireGuard links, and direct ESP Player keying) happens on
 //! controller-owned threads, so the UI thread only marshals small messages.
 //!
-//! Slice 1 scope (the Keyer tab): keyer timing settings, local sidetone, CW text keying,
-//! optional serial key-line output, pairing-code connect, and keying over the tunnel. Paddle
-//! serial input and the WinKeyer host are later increments; the port pickers accept a
-//! selection and persist it, but driving a physical paddle is not wired yet (see
-//! [`ClientController::select_paddle_port`]).
+//! Current scope includes keyer timing, local sidetone, CW text keying, serial paddle input,
+//! an optional local key line, WinKeyer hosting, WAN pairing, and direct LAN Player selection.
+//! All blocking and async work stays on controller-owned threads; the web UI sends commands and
+//! renders [`ClientEvent`]s only.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
-use rwk_core::config::{base64_decode, Config, ForwardRuleConfig, Role};
+use rwk_core::config::{base64_decode, base64_encode, Config, ForwardRuleConfig, Role};
 use rwk_core::engine::audio::SidetoneEngine;
 use rwk_core::engine::control::{is_reserved_port, ControlLink, ControlMessage};
 use rwk_core::engine::debounce::ContactDebouncer;
 use rwk_core::engine::edge_session::EdgeSession;
+use rwk_core::engine::esp_player::{
+    EspPlayerAdvertisement, EspPlayerBrowser, EspPlayerInbound, EspPlayerSession,
+    ESP_PLAYER_MISSED_PING_LIMIT, ESP_PLAYER_PING_INTERVAL,
+};
 use rwk_core::engine::flex_discovery::DiscoveryEmitter;
+use rwk_core::engine::lan_discovery::LanPeer;
 use rwk_core::engine::keying::{KeyerElement, KeyerElementTiming};
 use rwk_core::engine::logger_host::{HostReport, HostReporter, LoggerHost, TextSink};
 use rwk_core::engine::network::EdgeTransport;
@@ -270,10 +274,11 @@ impl TextSink for ClientLogger {
 pub enum ClientEvent {
     /// The key line changed state (for the KEY indicator and status strip).
     KeyState { down: bool },
-    /// The link to the station changed. `path` is "none" | "direct" | "relay".
+    /// The link to the selected Player changed. `path` is "none" | "direct" | "relay" |
+    /// "esp".
     Connection { state: String, path: String },
-    /// The round-trip time to the Station in ms, refreshed about once a second while paired.
-    /// `None` until measured (and when unpaired).
+    /// The round-trip time to the selected Player in ms, refreshed about once a second while
+    /// paired. `None` until measured (and when unpaired).
     Rtt { ms: Option<u32> },
     /// A human-readable log line for the Log tab.
     Log { level: String, message: String },
@@ -295,19 +300,21 @@ pub enum ClientEvent {
         paddle_port: Option<String>,
         winkeyer_port: Option<String>,
         transport: String,
-        callsign: String,
-        keyer_id: String,
         /// The relay address used for WAN pairing (empty until one is set).
         relay: String,
+        /// The remembered WAN pairing code (empty until one has been used).
+        pairing_code: String,
         /// The logger has host mode open and owns the speed; the Keyer's slider is locked.
         speed_locked: bool,
     },
+    /// The current LAN Player list. Each item is explicitly tagged as desktop or W1VE ESP32.
+    LanPlayers { players: Vec<LanPlayerView> },
+    /// Whether the active pairing can run Ham Router services. ESP Player pairings are CW-only.
+    RouterStatus { available: bool, esp_active: bool },
     /// The current forward-rule table, echoed whenever it changes (for the Ham Router tab).
     ForwardRules { rules: Vec<ForwardRuleView> },
     /// Whether FlexRadio discovery re-emission is enabled (for the Ham Router toggle).
     FlexDiscovery { enabled: bool },
-    /// Whether the LAN discovery beacon is currently being advertised.
-    Advertising { active: bool },
     /// The type-ahead/macro sender is actively keying CW.
     Sending { active: bool },
     /// The current serial-port inventory (numeric-sorted), pushed on change (PnP).
@@ -329,12 +336,13 @@ pub struct AudioDeviceView {
 }
 
 /// Which transport the operator chose for pairing: WAN (relay + code) or LAN (relay-free
-/// broadcast discovery). The Keyer-Router's WAN path is the existing relay rendezvous.
+/// Player discovery). The Keyer-Router's WAN path is the existing relay rendezvous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     /// Over the internet via the relay (the existing `connect(relay, code)` path).
     Wan,
-    /// Relay-free on the local network (broadcast discovery; the radio site picks this keyer).
+    /// Relay-free on the local network: the operating Keyer browses and initiates a selected
+    /// desktop or W1VE ESP32 Player.
     Lan,
 }
 
@@ -383,6 +391,132 @@ impl From<&ForwardRuleConfig> for ForwardRuleView {
     }
 }
 
+/// A LAN Player that the operating Keyer may select. The tag intentionally keeps desktop
+/// WireGuard Players separate from CW-only W1VE ESP32 Players at the Tauri boundary.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "playerType", rename_all = "camelCase")]
+pub enum LanPlayerView {
+    /// A desktop Player that advertises a RWKP v2 beacon.
+    Desktop {
+        /// Base64 WireGuard public key, used only as the stable selection identifier.
+        id: String,
+        name: String,
+        router_capable: bool,
+    },
+    /// A W1VE ESP32 Player discovered through its LAN advertisement.
+    Esp32Player {
+        /// Twelve-digit hexadecimal ESP Player identifier.
+        id: String,
+        name: String,
+        busy: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouterAccess {
+    /// No live Player session: router configuration remains editable for a future desktop link.
+    Inactive,
+    /// A desktop Player is paired, with its advertised Router capability recorded.
+    Desktop { router_capable: bool },
+    /// A W1VE ESP32 Player is paired. This transport is deliberately CW-only.
+    Esp32Player,
+}
+
+impl RouterAccess {
+    fn status(self) -> (bool, bool) {
+        match self {
+            Self::Inactive | Self::Desktop { router_capable: true } => (true, false),
+            Self::Desktop { router_capable: false } => (false, false),
+            Self::Esp32Player => (false, true),
+        }
+    }
+
+    fn block_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Inactive | Self::Desktop { router_capable: true } => None,
+            Self::Desktop { router_capable: false } => Some(
+                "The selected desktop Player does not advertise Router capability; forwarding and Flex are unavailable for this pairing.",
+            ),
+            Self::Esp32Player => Some(
+                "W1VE ESP32 Player connections are CW-only; forwarding and Flex are unavailable until it is disconnected.",
+            ),
+        }
+    }
+}
+
+/// A selected browser record retained only long enough to validate a Tauri selection.
+#[derive(Clone)]
+enum DiscoveredLanPlayer {
+    Desktop(LanPeer),
+    Esp32Player(EspPlayerAdvertisement),
+}
+
+#[derive(Default)]
+struct LanPlayerRegistry {
+    desktop: Vec<LanPeer>,
+    esp32: Vec<EspPlayerAdvertisement>,
+}
+
+/// Monotonic owner token for all resources created by one Client connection attempt.
+///
+/// This is intentionally separate from the wire edge epoch: both local edge sources sample the
+/// latter independently, while this token only controls installation and teardown ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientOperation(u64);
+
+/// A lifecycle resource together with the operation that is allowed to own it.
+struct OperationResource<T> {
+    operation: ClientOperation,
+    resource: T,
+}
+
+/// ESP transport state that must be stopped before the keyed-edge queue is detached.
+struct EspActiveSession {
+    operation: ClientOperation,
+    session: Arc<EspPlayerSession>,
+    stop: Arc<AtomicBool>,
+}
+
+/// The Client's installation gate. Every connection-facing resource is installed only while this
+/// mutex confirms that its owner token is still current. The gate is never held across network
+/// awaits; candidates are built locally and either committed here or explicitly shut down.
+#[derive(Default)]
+struct ClientLifecycle {
+    generation: u64,
+    transport: Option<OperationResource<Arc<EdgeTransport>>>,
+    lan_connect: Option<OperationResource<tokio::task::JoinHandle<()>>>,
+    esp_active: Option<EspActiveSession>,
+    control_tx: Option<OperationResource<tokio::sync::mpsc::UnboundedSender<ControlMessage>>>,
+    control_task: Option<OperationResource<tokio::task::JoinHandle<()>>>,
+    supervisor: Option<OperationResource<tokio::task::JoinHandle<()>>>,
+    session: Option<OperationResource<Arc<tokio::sync::Mutex<Session>>>>,
+}
+
+impl ClientLifecycle {
+    fn current(&self) -> ClientOperation {
+        ClientOperation(self.generation)
+    }
+
+    fn next_operation(&mut self) -> ClientOperation {
+        self.generation = self.generation.wrapping_add(1);
+        self.current()
+    }
+
+    fn is_current(&self, operation: ClientOperation) -> bool {
+        self.current() == operation
+    }
+}
+
+/// Resources retired by Stop or replacement. They are detached while holding the installation
+/// gate, then aborted or shut down after releasing it so a newer operation cannot be disturbed.
+struct RetiredClientResources {
+    supervisor: Option<tokio::task::JoinHandle<()>>,
+    lan_connect: Option<tokio::task::JoinHandle<()>>,
+    control_task: Option<tokio::task::JoinHandle<()>>,
+    esp_active: Option<EspActiveSession>,
+    session: Option<Arc<tokio::sync::Mutex<Session>>>,
+}
+
 /// A sink the host (Tauri) registers to receive [`ClientEvent`]s. Boxed so the controller
 /// does not depend on the UI framework.
 pub type EventSink = Arc<dyn Fn(ClientEvent) + Send + Sync>;
@@ -402,8 +536,6 @@ struct Settings {
     paddle_port: Option<String>,
     winkeyer_port: Option<String>,
     transport: Transport,
-    callsign: String,
-    keyer_id: String,
 }
 
 impl Default for Settings {
@@ -420,8 +552,27 @@ impl Default for Settings {
             paddle_port: None,
             winkeyer_port: None,
             transport: Transport::Wan,
-            callsign: String::new(),
-            keyer_id: String::new(),
+        }
+    }
+}
+
+impl Settings {
+    /// Restores every persisted UI setting, keeping the default for anything never saved.
+    fn from_config(config: &Config) -> Self {
+        let defaults = Self::default();
+        let k = &config.keyer;
+        Self {
+            wpm: k.wpm.unwrap_or(defaults.wpm).clamp(5, 60),
+            weight: k.weight.unwrap_or(defaults.weight).clamp(25, 75),
+            mode: k.mode.as_deref().map(parse_mode).unwrap_or(defaults.mode),
+            paddle_reverse: k.paddle_reverse.unwrap_or(defaults.paddle_reverse),
+            tone_hz: k.tone_hz.unwrap_or(defaults.tone_hz),
+            tone_volume: k.tone_volume.unwrap_or(defaults.tone_volume).min(100),
+            audio_device: k.audio_device.clone(),
+            keying_port: k.keying_port.clone(),
+            paddle_port: k.paddle_port.clone(),
+            winkeyer_port: k.logger_port.clone(),
+            transport: config.transport.as_deref().map(Transport::parse).unwrap_or(defaults.transport),
         }
     }
 }
@@ -437,8 +588,10 @@ struct Shared {
     /// Set once the sidetone thread is spawned (during `start`).
     sidetone: Mutex<Option<Sidetone>>,
     keying: Mutex<Option<SerialKeyingOutput>>,
-    /// The edge transport over the tunnel, present only while paired.
-    transport: Mutex<Option<Arc<EdgeTransport>>>,
+    /// The Client's installation gate plus every resource that belongs to one connection
+    /// operation. Stop and replacement advance the generation under this same mutex before
+    /// aborting tasks, so a late task can never publish into a newer lifecycle.
+    lifecycle: Mutex<ClientLifecycle>,
     /// Session epoch, incremented on each new pairing so the station re-anchors.
     epoch: Mutex<u16>,
     /// The shared session edge path (`rwk-core`): one sender for every edge source and one
@@ -452,20 +605,12 @@ struct Shared {
     logger: Mutex<Option<LoggerHost>>,
     /// True while the logger has host mode open. It owns the speed then, so the slider is locked.
     speed_from_logger: AtomicBool,
-    /// The running LAN advertiser task (operating-position side), present while advertising.
-    advertise: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Queue into the control channel to the Station, present only while that channel is up.
-    /// The control task owns the link, so a push is queued here rather than sent under a lock.
-    control_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<ControlMessage>>>,
-    /// The task that keeps the control channel dialled while paired; aborted on unpair.
-    control_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// The WAN reconnect supervisor task: pairs, keys, watches the Station's liveness and
-    /// reconnects within the shared 15 s window. Present only while a WAN connect is active;
-    /// aborted on unpair. The LAN responder does not use this (it runs under `advertise`).
-    supervisor: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// The live session, so the Client can restart its own forwards on a rule change. Shared
-    /// (rather than held only on the controller) so command handlers reach it.
-    session: tokio::sync::Mutex<Option<Session>>,
+    /// The LAN browser tasks (one desktop RWKP v2 browser and one ESP Player browser).
+    browse_tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Current browser records, retained only to validate a selected Player at the Tauri boundary.
+    lan_players: Mutex<LanPlayerRegistry>,
+    /// Runtime Router eligibility for the selected Player.
+    router_access: Mutex<RouterAccess>,
     /// The host-LAN FlexRadio discovery emitter, present while re-emission is enabled.
     flex_emitter: Mutex<Option<DiscoveryEmitter>>,
     /// The persisted config, held so pairing reuses a stable WireGuard identity across runs.
@@ -497,6 +642,15 @@ impl Shared {
 
     fn emit_settings(&self) {
         let s = self.settings.lock().unwrap();
+        // Read config fields under one short lock: a temporary guard inside the event literal
+        // would live to the end of the statement and deadlock a second `config.lock()`.
+        let (relay, pairing_code) = {
+            let config = self.config.lock().unwrap();
+            (
+                config.relay.as_ref().map(|r| r.address.to_string()).unwrap_or_default(),
+                config.pairing_code.clone().unwrap_or_default(),
+            )
+        };
         self.emit(ClientEvent::Settings {
             wpm: s.wpm,
             weight: s.weight,
@@ -509,38 +663,335 @@ impl Shared {
             paddle_port: s.paddle_port.clone(),
             winkeyer_port: s.winkeyer_port.clone(),
             transport: s.transport.as_str().into(),
-            callsign: s.callsign.clone(),
-            keyer_id: s.keyer_id.clone(),
-            relay: self
-                .config
-                .lock()
-                .unwrap()
-                .relay
-                .as_ref()
-                .map(|r| r.address.to_string())
-                .unwrap_or_default(),
+            relay,
+            pairing_code,
             speed_locked: self.speed_from_logger.load(Ordering::SeqCst),
         });
+    }
+
+    /// Emits the merged, tagged LAN Player list used to validate selections from the webview.
+    fn emit_lan_players(&self) {
+        let players = {
+            let registry = self.lan_players.lock().unwrap();
+            let mut players = Vec::with_capacity(registry.desktop.len() + registry.esp32.len());
+            players.extend(registry.desktop.iter().map(|player| LanPlayerView::Desktop {
+                id: base64_encode(&player.public_key),
+                name: player.display_name(),
+                router_capable: player.supports_router(),
+            }));
+            players.extend(registry.esp32.iter().map(|player| LanPlayerView::Esp32Player {
+                id: player.id_hex(),
+                name: player.name.clone(),
+                busy: player.busy(),
+            }));
+            players
+        };
+        self.emit(ClientEvent::LanPlayers { players });
+    }
+
+    fn set_desktop_lan_players(&self, players: Vec<LanPeer>) {
+        self.lan_players.lock().unwrap().desktop = players;
+        self.emit_lan_players();
+    }
+
+    fn set_esp_lan_players(&self, players: Vec<EspPlayerAdvertisement>) {
+        self.lan_players.lock().unwrap().esp32 = players;
+        self.emit_lan_players();
+    }
+
+    fn clear_lan_players(&self) {
+        *self.lan_players.lock().unwrap() = LanPlayerRegistry::default();
+        self.emit_lan_players();
+    }
+
+    /// Resolves a webview-supplied type/id pair only against the current browser registry.
+    fn selected_lan_player(&self, player_type: &str, id: &str) -> Result<DiscoveredLanPlayer, String> {
+        match player_type {
+            "desktop" => {
+                let Some(public_key) = parse_desktop_player_id(id) else {
+                    return Err("Invalid desktop Player selection.".to_string());
+                };
+                self.lan_players
+                    .lock()
+                    .unwrap()
+                    .desktop
+                    .iter()
+                    .find(|player| player.public_key == public_key)
+                    .cloned()
+                    .map(DiscoveredLanPlayer::Desktop)
+                    .ok_or_else(|| "The selected desktop Player is no longer available.".to_string())
+            }
+            "esp32Player" => {
+                let Some(player_id) = parse_esp_player_id(id) else {
+                    return Err("Invalid W1VE ESP32 Player selection.".to_string());
+                };
+                self.lan_players
+                    .lock()
+                    .unwrap()
+                    .esp32
+                    .iter()
+                    .find(|player| player.player_id == player_id)
+                    .cloned()
+                    .map(DiscoveredLanPlayer::Esp32Player)
+                    .ok_or_else(|| "The selected W1VE ESP32 Player is no longer available.".to_string())
+            }
+            _ => Err("Invalid Player type.".to_string()),
+        }
+    }
+
+    fn emit_router_status(&self) {
+        let (available, esp_active) = self.router_access.lock().unwrap().status();
+        self.emit(ClientEvent::RouterStatus { available, esp_active });
+    }
+
+    fn router_block_reason(&self) -> Option<&'static str> {
+        self.router_access.lock().unwrap().block_reason()
+    }
+
+    /// Starts a fresh ownership generation after the prior operation has been retired.
+    fn begin_operation(&self) -> ClientOperation {
+        self.lifecycle.lock().unwrap().next_operation()
+    }
+
+    fn current_operation(&self) -> ClientOperation {
+        self.lifecycle.lock().unwrap().current()
+    }
+
+    fn is_current_operation(&self, operation: ClientOperation) -> bool {
+        self.lifecycle.lock().unwrap().is_current(operation)
+    }
+
+    /// Emits only while `operation` is still current. Connection-state events are generated
+    /// while holding the same gate used by Stop, so an old task cannot report itself live after
+    /// a newer Stop or replacement has won the lifecycle.
+    fn emit_for_operation(&self, operation: ClientOperation, event: ClientEvent) -> bool {
+        let lifecycle = self.lifecycle.lock().unwrap();
+        if !lifecycle.is_current(operation) {
+            return false;
+        }
+        self.emit(event);
+        true
+    }
+
+    fn log_for_operation(&self, operation: ClientOperation, level: &str, message: impl Into<String>) {
+        let lifecycle = self.lifecycle.lock().unwrap();
+        if lifecycle.is_current(operation) {
+            self.log(level, message);
+        }
+    }
+
+    fn fail_for_operation(&self, operation: ClientOperation, message: impl Into<String>) {
+        let message = message.into();
+        let lifecycle = self.lifecycle.lock().unwrap();
+        if lifecycle.is_current(operation) {
+            self.log("warn", message);
+            self.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
+        }
+    }
+
+    /// Persists a relay/code pair only while the WAN task still owns the live operation. Without
+    /// this gate, a cancelled connect task could overwrite the replacement's shared code.
+    fn persist_pairing_for_operation(
+        &self,
+        operation: ClientOperation,
+        relay: std::net::SocketAddr,
+        code: &str,
+    ) {
+        let lifecycle = self.lifecycle.lock().unwrap();
+        if lifecycle.is_current(operation) {
+            self.persist_pairing(relay, code);
+        }
+    }
+
+    /// Changes Router eligibility only while the owning pairing remains current. A CW-only
+    /// desktop pairing and the ESP pairing both use this gate to prevent a late desktop task
+    /// from recreating Router/Flex state after ESP selection.
+    fn set_router_access_for_operation(
+        &self,
+        operation: ClientOperation,
+        access: RouterAccess,
+        clear_flex: bool,
+    ) -> bool {
+        let lifecycle = self.lifecycle.lock().unwrap();
+        if !lifecycle.is_current(operation) {
+            return false;
+        }
+        if clear_flex {
+            *self.flex_emitter.lock().unwrap() = None;
+        }
+        *self.router_access.lock().unwrap() = access;
+        self.emit_router_status();
+        if clear_flex {
+            self.emit_flex_state();
+        }
+        true
+    }
+
+    /// Atomically enters the strictly CW-only ESP mode. The Flex emitter is removed and Router
+    /// access changes under the installation gate before the ESP task can publish an edge sender.
+    fn enter_esp_mode_for_operation(&self, operation: ClientOperation) -> bool {
+        self.set_router_access_for_operation(operation, RouterAccess::Esp32Player, true)
+    }
+
+    /// Installs or removes the local Flex emitter only if the command still belongs to the
+    /// current Router-capable lifecycle. An ESP transition cannot interleave after the check.
+    fn set_flex_for_operation(
+        &self,
+        operation: ClientOperation,
+        emitter: Option<DiscoveryEmitter>,
+    ) -> Result<(), &'static str> {
+        let lifecycle = self.lifecycle.lock().unwrap();
+        if !lifecycle.is_current(operation) {
+            return Err("the pairing was replaced or stopped");
+        }
+        if let Some(reason) = self.router_access.lock().unwrap().block_reason() {
+            return Err(reason);
+        }
+        *self.flex_emitter.lock().unwrap() = emitter;
+        self.emit_flex_state();
+        Ok(())
+    }
+
+    /// Stores an asynchronous WAN supervisor only if it still owns the current generation.
+    /// Replaced and stale handles are explicitly aborted rather than silently dropped.
+    fn register_supervisor(&self, operation: ClientOperation, handle: tokio::task::JoinHandle<()>) {
+        let discarded = {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            if lifecycle.is_current(operation) {
+                lifecycle
+                    .supervisor
+                    .replace(OperationResource { operation, resource: handle })
+                    .map(|owned| owned.resource)
+            } else {
+                Some(handle)
+            }
+        };
+        if let Some(handle) = discarded {
+            handle.abort();
+        }
+    }
+
+    /// Stores an asynchronous direct-LAN operation only if it is still current. This covers both
+    /// desktop WireGuard LAN attempts and CW-only ESP pairing/supervision.
+    fn register_lan_connect(&self, operation: ClientOperation, handle: tokio::task::JoinHandle<()>) {
+        let discarded = {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            if lifecycle.is_current(operation) {
+                lifecycle
+                    .lan_connect
+                    .replace(OperationResource { operation, resource: handle })
+                    .map(|owned| owned.resource)
+            } else {
+                Some(handle)
+            }
+        };
+        if let Some(handle) = discarded {
+            handle.abort();
+        }
+    }
+
+    /// Publishes a control sender only after the post-connect await has reconfirmed both the
+    /// operation and the specific desktop Session that created it. The session identity prevents
+    /// a late control dial from a prior WAN reconnect cycle from attaching to its successor.
+    fn install_control_sender(
+        &self,
+        operation: ClientOperation,
+        owner_session: &Arc<tokio::sync::Mutex<Session>>,
+        sender: tokio::sync::mpsc::UnboundedSender<ControlMessage>,
+    ) -> bool {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        if !lifecycle.is_current(operation)
+            || !matches!(
+                lifecycle.session.as_ref(),
+                Some(session)
+                    if session.operation == operation
+                        && Arc::ptr_eq(&session.resource, owner_session)
+            )
+        {
+            return false;
+        }
+        lifecycle.control_tx = Some(OperationResource { operation, resource: sender });
+        true
+    }
+
+    /// Returns whether `session` is still the desktop Session owned by `operation`.
+    fn owns_current_session(
+        &self,
+        operation: ClientOperation,
+        session: &Arc<tokio::sync::Mutex<Session>>,
+    ) -> bool {
+        let lifecycle = self.lifecycle.lock().unwrap();
+        lifecycle.is_current(operation)
+            && matches!(
+                lifecycle.session.as_ref(),
+                Some(current)
+                    if current.operation == operation && Arc::ptr_eq(&current.resource, session)
+            )
+    }
+
+    /// Clears only the sender installed by this operation and its specific Session, never a
+    /// newer redial or reconnect that happens to share the outer WAN supervisor.
+    fn clear_control_sender(
+        &self,
+        operation: ClientOperation,
+        owner_session: &Arc<tokio::sync::Mutex<Session>>,
+    ) {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        if lifecycle.is_current(operation)
+            && matches!(
+                lifecycle.session.as_ref(),
+                Some(session)
+                    if session.operation == operation
+                        && Arc::ptr_eq(&session.resource, owner_session)
+            )
+            && matches!(lifecycle.control_tx.as_ref(), Some(sender) if sender.operation == operation)
+        {
+            lifecycle.control_tx = None;
+        }
+    }
+
+    /// Invalidates all in-flight connection tasks and detaches every installed transport under
+    /// one gate. The returned resources are stopped after the gate is released, which prevents a
+    /// slow shutdown from taking resources installed by a newer operation.
+    fn retire_operation(&self) -> RetiredClientResources {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        lifecycle.next_operation();
+
+        let esp_active = lifecycle.esp_active.take();
+        if let Some(active) = &esp_active {
+            active.stop.store(true, Ordering::SeqCst);
+        }
+        self.edge.detach();
+        lifecycle.transport = None;
+        lifecycle.control_tx = None;
+
+        let supervisor = lifecycle.supervisor.take().map(|owned| owned.resource);
+        let lan_connect = lifecycle.lan_connect.take().map(|owned| owned.resource);
+        let control_task = lifecycle.control_task.take().map(|owned| owned.resource);
+        let session = lifecycle.session.take().map(|owned| owned.resource);
+
+        let clear_flex = matches!(*self.router_access.lock().unwrap(), RouterAccess::Esp32Player);
+        *self.router_access.lock().unwrap() = RouterAccess::Inactive;
+        if clear_flex {
+            *self.flex_emitter.lock().unwrap() = None;
+        }
+        self.emit_router_status();
+        if clear_flex {
+            self.emit_flex_state();
+        }
+        // This is deliberately emitted before the async resource shutdown. It is serialized with
+        // all later operation installs, so a late candidate cannot re-publish a connection after
+        // Stop has reported disconnected.
+        self.emit(ClientEvent::Rtt { ms: None });
+        self.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
+        self.log("info", "Unpaired.");
+
+        RetiredClientResources { supervisor, lan_connect, control_task, esp_active, session }
     }
 
     /// Interprets the persisted audio-device setting into a [`ToneDevice`].
     fn tone_device(&self) -> ToneDevice {
         ToneDevice::from_setting(&self.settings.lock().unwrap().audio_device)
-    }
-
-    /// Persists callsign/keyer_id into the config and writes it to disk.
-    fn persist_identity_labels(&self) {
-        let Some(path) = &self.config_path else { return };
-        {
-            let s = self.settings.lock().unwrap();
-            let mut config = self.config.lock().unwrap();
-            config.callsign = s.callsign.clone();
-            config.keyer_id = s.keyer_id.clone();
-        }
-        let config = self.config.lock().unwrap();
-        if let Err(e) = config.save(path) {
-            self.log("warn", format!("Could not save config: {e}"));
-        }
     }
 
     /// Remembers the relay + pairing code in the persisted config and writes it to disk, so
@@ -569,6 +1020,28 @@ impl Shared {
     fn emit_flex_state(&self) {
         let enabled = self.flex_emitter.lock().unwrap().is_some();
         self.emit(ClientEvent::FlexDiscovery { enabled });
+    }
+
+    /// Copies every live keyer/sidetone/port/transport setting into the config and writes it.
+    fn persist_settings(&self) {
+        {
+            let s = self.settings.lock().unwrap();
+            let mut config = self.config.lock().unwrap();
+            config.transport = Some(s.transport.as_str().to_string());
+            config.keyer = rwk_core::config::KeyerSettings {
+                wpm: Some(s.wpm),
+                weight: Some(s.weight),
+                mode: Some(mode_name(s.mode).to_string()),
+                paddle_reverse: Some(s.paddle_reverse),
+                tone_hz: Some(s.tone_hz),
+                tone_volume: Some(s.tone_volume),
+                audio_device: s.audio_device.clone(),
+                paddle_port: s.paddle_port.clone(),
+                logger_port: s.winkeyer_port.clone(),
+                keying_port: s.keying_port.clone(),
+            };
+        }
+        self.persist_config();
     }
 
     /// Writes the current config (including `forwards`) to disk. Logged, not fatal, on error.
@@ -619,26 +1092,21 @@ impl ClientController {
                 config
             }
         };
-        // Seed callsign/keyer_id from the persisted config so the LAN beacon name survives.
-        let mut settings = Settings::default();
-        settings.callsign = config.callsign.clone();
-        settings.keyer_id = config.keyer_id.clone();
+        let settings = Settings::from_config(&config);
         let shared = Arc::new(Shared {
             settings: Mutex::new(settings.clone()),
             sidetone: Mutex::new(None),
             keying: Mutex::new(None),
-            transport: Mutex::new(None),
+            lifecycle: Mutex::new(ClientLifecycle::default()),
             epoch: Mutex::new(1),
             edge: EdgeSession::new(MonotonicClock.frequency(), MonotonicClock.now()),
             paddle: Mutex::new(None),
             send: SendBuffer::default(),
             logger: Mutex::new(None),
             speed_from_logger: AtomicBool::new(false),
-            advertise: tokio::sync::Mutex::new(None),
-            control_tx: Mutex::new(None),
-            control_task: Mutex::new(None),
-            supervisor: tokio::sync::Mutex::new(None),
-            session: tokio::sync::Mutex::new(None),
+            browse_tasks: tokio::sync::Mutex::new(Vec::new()),
+            lan_players: Mutex::new(LanPlayerRegistry::default()),
+            router_access: Mutex::new(RouterAccess::Inactive),
             flex_emitter: Mutex::new(None),
             config: Mutex::new(config),
             config_path,
@@ -663,7 +1131,20 @@ impl ClientController {
         spawn_send_worker(Arc::clone(&shared), runtime.handle().clone());
 
         let controller = Self { shared, runtime, _clock: Arc::new(MonotonicClock) };
+        // Reopen the persisted local ports. Each opener reports its own "not available" error
+        // and keeps the remembered selection if the device is not present right now.
+        for (port, open) in [
+            (settings.keying_port.clone(), Self::select_keying_port as fn(&Self, Option<String>)),
+            (settings.paddle_port.clone(), Self::select_paddle_port),
+            (settings.winkeyer_port.clone(), Self::select_winkeyer_port),
+        ] {
+            if port.is_some() {
+                open(&controller, port);
+            }
+        }
         controller.shared.emit_settings();
+        controller.shared.emit_lan_players();
+        controller.shared.emit_router_status();
         controller.shared.emit_forward_rules();
         controller.shared.emit_flex_state();
         controller.emit_ports();
@@ -677,6 +1158,8 @@ impl ClientController {
     /// yet when `start` runs in Tauri's setup.
     pub fn request_state(&self) {
         self.shared.emit_settings();
+        self.shared.emit_lan_players();
+        self.shared.emit_router_status();
         self.shared.emit_forward_rules();
         self.shared.emit_flex_state();
         self.emit_ports();
@@ -693,73 +1176,154 @@ impl ClientController {
             return;
         }
         self.shared.settings.lock().unwrap().wpm = wpm;
+        self.shared.persist_settings();
         self.shared.log("debug", format!("Speed {wpm} WPM."));
     }
 
     /// Sets the keyer weight percentage (clamped 25..=75 downstream).
     pub fn set_weight(&self, weight: u32) {
         self.shared.settings.lock().unwrap().weight = weight;
+        self.shared.persist_settings();
     }
 
     /// Sets the keyer mode from a UI name ("iambicB", "iambicA", "ultimatic", "bug", "straight").
     pub fn set_mode(&self, mode: &str) {
         let parsed = parse_mode(mode);
         self.shared.settings.lock().unwrap().mode = parsed;
+        self.shared.persist_settings();
         self.shared.log("debug", format!("Mode {}.", mode_name(parsed)));
     }
 
     /// Sets whether the paddle dit/dah contacts are reversed.
     pub fn set_paddle_reverse(&self, reverse: bool) {
         self.shared.settings.lock().unwrap().paddle_reverse = reverse;
+        self.shared.persist_settings();
     }
 
-    // ─── Transport + LAN identity ──────────────────────────────────────────────
+    // ─── Transport + LAN Player discovery ─────────────────────────────────────
 
-    /// Selects the pairing transport: "wan" (relay + code) or "lan" (broadcast discovery).
+    /// Selects the pairing transport: "wan" (relay + code) or "lan" (direct Player discovery).
     pub fn set_transport(&self, transport: &str) {
         self.shared.settings.lock().unwrap().transport = Transport::parse(transport);
+        self.shared.persist_settings();
         self.shared.emit_settings();
     }
 
-    /// Sets the operator callsign used as the LAN beacon name.
-    pub fn set_callsign(&self, callsign: &str) {
-        self.shared.settings.lock().unwrap().callsign = callsign.to_string();
-        self.shared.persist_identity_labels();
-        self.shared.emit_settings();
-    }
-
-    /// Sets the position label (e.g. `20m`) appended to the callsign in the LAN beacon.
-    pub fn set_keyer_id(&self, keyer_id: &str) {
-        self.shared.settings.lock().unwrap().keyer_id = keyer_id.to_string();
-        self.shared.persist_identity_labels();
-        self.shared.emit_settings();
-    }
-
-    /// Starts (or stops) broadcasting this keyer's LAN beacon so a Station can find and pick
-    /// it. When a Station picks us, we come up as the responder and the keying edge opens.
-    /// Starting stops any WAN pairing first; advertising stops automatically once paired.
-    pub fn lan_advertise(&self, on: bool) {
-        if !on {
-            self.disconnect();
-            return;
-        }
-        self.disconnect();
-        let (callsign, keyer_id) = {
-            let s = self.shared.settings.lock().unwrap();
-            (s.callsign.clone(), s.keyer_id.clone())
+    /// Starts fresh desktop and ESP Player LAN browsers. Their live records are merged into one
+    /// tagged list, and the Tauri command later accepts only an id from that list.
+    pub fn lan_browse_players(&self) {
+        let self_key = match self.shared.config.lock().unwrap().identity.to_identity() {
+            Ok(identity) => identity.public_bytes(),
+            Err(error) => {
+                self.shared.log("warn", format!("identity error: {error}"));
+                return;
+            }
         };
-        let shared = Arc::clone(&self.shared);
-        shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
-        shared.emit(ClientEvent::Advertising { active: true });
-        shared.log("info", "Advertising on the LAN; waiting for a station to connect…");
-        let handle = self.runtime.spawn(async move {
-            lan_advertise_and_await(shared).await;
+        let esp_keyer_id = esp_keyer_id(self_key);
+        self.stop_lan_browse();
+
+        let desktop_shared = Arc::clone(&self.shared);
+        let desktop_task = self.runtime.spawn(async move {
+            browse_desktop_players(desktop_shared, self_key).await;
+        });
+        let esp_shared = Arc::clone(&self.shared);
+        let esp_task = self.runtime.spawn(async move {
+            browse_esp32_players(esp_shared, esp_keyer_id).await;
         });
         self.runtime.block_on(async {
-            *self.shared.advertise.lock().await = Some(handle);
+            let mut tasks = self.shared.browse_tasks.lock().await;
+            *tasks = vec![desktop_task, esp_task];
         });
-        // callsign/keyer_id captured for logging symmetry (the beacon reads them in the task).
-        let _ = (callsign, keyer_id);
+    }
+
+    /// Stops and drops both LAN browsers, then removes their stale selection records.
+    fn stop_lan_browse(&self) {
+        let shared = Arc::clone(&self.shared);
+        self.runtime.block_on(async move {
+            let mut tasks = shared.browse_tasks.lock().await;
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        });
+        self.shared.clear_lan_players();
+    }
+
+    /// Validates a selected Player against the current browser list, then starts the correct
+    /// direct transport. Desktop Players initiate WireGuard; W1VE ESP32 Players use only the
+    /// dedicated CW frame carrier.
+    pub fn connect_lan_player(&self, player_type: &str, id: &str) {
+        let selected = match self.shared.selected_lan_player(player_type, id) {
+            Ok(player) => player,
+            Err(message) => {
+                self.shared.log("warn", message);
+                return;
+            }
+        };
+        if let DiscoveredLanPlayer::Esp32Player(player) = &selected {
+            if player.busy() {
+                self.shared.log(
+                    "warn",
+                    format!("W1VE ESP32 Player {} is busy; select an available Player.", player.name),
+                );
+                return;
+            }
+        }
+
+        self.disconnect();
+        let operation = self.shared.begin_operation();
+        // Enter a capability guard before pairing so no concurrent Router command can create a
+        // Flex emitter or apply forwarding while a CW-only Player is being negotiated. The guard
+        // is owned by this operation, so a replaced attempt cannot change a newer selection.
+        match &selected {
+            DiscoveredLanPlayer::Esp32Player(_) => {
+                if !self.shared.enter_esp_mode_for_operation(operation) {
+                    return;
+                }
+            }
+            DiscoveredLanPlayer::Desktop(player) if !player.supports_router() => {
+                if !self.shared.set_router_access_for_operation(
+                    operation,
+                    RouterAccess::Desktop { router_capable: false },
+                    true,
+                ) {
+                    return;
+                }
+            }
+            DiscoveredLanPlayer::Desktop(_) => {}
+        }
+        let shared = Arc::clone(&self.shared);
+        if !shared.emit_for_operation(
+            operation,
+            ClientEvent::Connection { state: "connecting".into(), path: "none".into() },
+        ) {
+            return;
+        }
+        shared.log_for_operation(operation, "info", "Connecting to the selected LAN Player…");
+
+        let handle = self.runtime.spawn(async move {
+            if !shared.is_current_operation(operation) {
+                return;
+            }
+            match selected {
+                DiscoveredLanPlayer::Desktop(player) => {
+                    connect_desktop_lan_player(&shared, operation, player).await;
+                }
+                DiscoveredLanPlayer::Esp32Player(player) => {
+                    let keyer_id = match shared.config.lock().unwrap().identity.to_identity() {
+                        Ok(identity) => esp_keyer_id(identity.public_bytes()),
+                        Err(error) => {
+                            return fail_lan_connection(
+                                &shared,
+                                operation,
+                                format!("identity error: {error}"),
+                            )
+                        }
+                    };
+                    connect_esp32_player(&shared, operation, player, keyer_id).await;
+                }
+            }
+        });
+        self.shared.register_lan_connect(operation, handle);
     }
 
     // ─── Sidetone ──────────────────────────────────────────────────────────────
@@ -767,12 +1331,14 @@ impl ClientController {
     /// Sets the sidetone frequency in Hz and rebuilds the stream to apply it.
     pub fn set_tone_frequency(&self, hz: i32) {
         self.shared.settings.lock().unwrap().tone_hz = hz;
+        self.shared.persist_settings();
         self.restart_sidetone();
     }
 
     /// Sets the sidetone volume (0..=100) and rebuilds the stream to apply it.
     pub fn set_tone_volume(&self, percent: u32) {
         self.shared.settings.lock().unwrap().tone_volume = percent.min(100);
+        self.shared.persist_settings();
         self.restart_sidetone();
     }
 
@@ -780,6 +1346,7 @@ impl ClientController {
     /// string = "(None)" = sidetone off; any other string = that device by name.
     pub fn select_audio_device(&self, device: Option<String>) {
         self.shared.settings.lock().unwrap().audio_device = device;
+        self.shared.persist_settings();
         self.restart_sidetone();
         self.shared.emit_settings();
     }
@@ -927,6 +1494,7 @@ impl ClientController {
             }
         }
         self.shared.settings.lock().unwrap().keying_port = port.clone();
+        self.shared.persist_settings();
         {
             let mut guard = self.shared.keying.lock().unwrap();
             *guard = None; // release any previous port first
@@ -984,6 +1552,7 @@ impl ClientController {
             }
         }
         self.shared.settings.lock().unwrap().paddle_port = port.clone();
+        self.shared.persist_settings();
         // Stop any running poller first (changing ports is a normal operation).
         *self.shared.paddle.lock().unwrap() = None;
 
@@ -1038,6 +1607,7 @@ impl ClientController {
         *self.shared.logger.lock().unwrap() = None;
         self.shared.speed_from_logger.store(false, Ordering::SeqCst);
         self.shared.settings.lock().unwrap().winkeyer_port = port.clone();
+        self.shared.persist_settings();
         match port {
             None => {
                 self.shared.clear_error(control::WINKEYER);
@@ -1113,6 +1683,9 @@ impl ClientController {
         station_port: u16,
         station_target_address: &str,
     ) {
+        if !self.router_command_allowed("Adding a forward rule") {
+            return;
+        }
         let proto = if protocol.eq_ignore_ascii_case("udp") { "udp" } else { "tcp" };
         if is_reserved_port(client_port) || is_reserved_port(station_port) {
             self.shared.log("warn", "That port is reserved for RWK control traffic.");
@@ -1157,6 +1730,9 @@ impl ClientController {
         station_port: u16,
         station_target_address: &str,
     ) {
+        if !self.router_command_allowed("Updating a forward rule") {
+            return;
+        }
         let proto = if protocol.eq_ignore_ascii_case("udp") { "udp" } else { "tcp" };
         if is_reserved_port(client_port) || is_reserved_port(station_port) {
             self.shared.log("warn", "That port is reserved for RWK control traffic.");
@@ -1193,6 +1769,9 @@ impl ClientController {
 
     /// Removes the forward rule with `id`.
     pub fn remove_forward_rule(&self, id: &str) {
+        if !self.router_command_allowed("Removing a forward rule") {
+            return;
+        }
         {
             let mut config = self.shared.config.lock().unwrap();
             config.forwards.retain(|r| r.id != id);
@@ -1204,6 +1783,9 @@ impl ClientController {
 
     /// Enables or disables the forward rule with `id`.
     pub fn set_forward_rule_enabled(&self, id: &str, enabled: bool) {
+        if !self.router_command_allowed("Changing a forward rule") {
+            return;
+        }
         {
             let mut config = self.shared.config.lock().unwrap();
             if let Some(rule) = config.forwards.iter_mut().find(|r| r.id == id) {
@@ -1217,6 +1799,9 @@ impl ClientController {
 
     /// Re-emits the current rule table to the UI (for an explicit refresh).
     pub fn refresh_forward_rules(&self) {
+        if !self.router_command_allowed("Refreshing forward rules") {
+            return;
+        }
         self.shared.emit_forward_rules();
     }
 
@@ -1224,10 +1809,19 @@ impl ClientController {
     /// forwards to match. Runs on the controller runtime; non-blocking for the caller.
     fn push_and_apply_rules(&self) {
         let shared = Arc::clone(&self.shared);
+        let operation = shared.current_operation();
         let rules = self.shared.forward_rules();
         self.runtime.spawn(async move {
-            push_rules(&shared, &rules).await;
+            push_rules(&shared, operation, &rules).await;
         });
+    }
+
+    fn router_command_allowed(&self, action: &str) -> bool {
+        let Some(reason) = self.shared.router_block_reason() else {
+            return true;
+        };
+        self.shared.log("warn", format!("{action} was not applied: {reason}"));
+        false
     }
 
     // ─── Ham Router: FlexRadio discovery re-emission ───────────────────────────
@@ -1237,26 +1831,42 @@ impl ClientController {
     /// stream) if absent; disabling removes the emitter and those rules. The real radio IP is
     /// filled into `station_target_address` when the first discovery announcement arrives.
     pub fn set_flex_discovery(&self, enabled: bool) {
+        let operation = self.shared.current_operation();
         if enabled {
-            match DiscoveryEmitter::new() {
-                Ok(emitter) => {
-                    *self.shared.flex_emitter.lock().unwrap() = Some(emitter);
-                    self.ensure_flex_rules();
-                    self.shared.log("info", "FlexRadio discovery re-emission enabled.");
-                }
+            let emitter = match DiscoveryEmitter::new() {
+                Ok(emitter) => emitter,
                 Err(e) => {
-                    self.shared.log("warn", format!("Flex re-emission unavailable: {e}"));
-                    self.shared.emit_flex_state();
+                    self.shared.log_for_operation(
+                        operation,
+                        "warn",
+                        format!("Flex re-emission unavailable: {e}"),
+                    );
                     return;
                 }
+            };
+            if let Err(reason) = self.shared.set_flex_for_operation(operation, Some(emitter)) {
+                self.shared.log_for_operation(
+                    operation,
+                    "warn",
+                    format!("Changing FlexRadio discovery was not applied: {reason}"),
+                );
+                return;
             }
+            self.ensure_flex_rules();
+            self.shared.log_for_operation(operation, "info", "FlexRadio discovery re-emission enabled.");
         } else {
-            *self.shared.flex_emitter.lock().unwrap() = None;
+            if let Err(reason) = self.shared.set_flex_for_operation(operation, None) {
+                self.shared.log_for_operation(
+                    operation,
+                    "warn",
+                    format!("Changing FlexRadio discovery was not applied: {reason}"),
+                );
+                return;
+            }
             self.remove_flex_rules();
-            self.shared.log("info", "FlexRadio discovery re-emission disabled.");
+            self.shared.log_for_operation(operation, "info", "FlexRadio discovery re-emission disabled.");
         }
         self.shared.persist_config();
-        self.shared.emit_flex_state();
         self.shared.emit_forward_rules();
         self.push_and_apply_rules();
     }
@@ -1309,30 +1919,43 @@ impl ClientController {
             }
         };
         let code = code.to_string();
-        // Cancel any prior pairing / supervisor so a re-Connect never leaves two loops running.
+        // Retire the previous pairing before assigning the operation token to this supervisor.
+        // `abort` remains useful, but every post-await install below also verifies this token.
         self.disconnect();
+        let operation = self.shared.begin_operation();
         let shared = Arc::clone(&self.shared);
 
-        shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
+        if !shared.emit_for_operation(
+            operation,
+            ClientEvent::Connection { state: "connecting".into(), path: "none".into() },
+        ) {
+            return;
+        }
 
         let handle = self.runtime.spawn(async move {
-            // Remember the relay + code for next launch.
-            shared.persist_pairing(relay_addr, &code);
-            // Supervised WAN connect, identical in shape to the Remote Keyer Client: pair, key,
-            // watch the Station's liveness, and reconnect automatically within the shared 15 s
-            // budget. The budget only resets after a link has stayed up for the stability
-            // threshold, so a pair-then-die flap cannot reconnect forever.
+            if !shared.is_current_operation(operation) {
+                return;
+            }
+            // Remember the relay + code for next launch, but never allow an old task to clobber
+            // a replacement's pairing code after it resumes from cancellation.
+            shared.persist_pairing_for_operation(operation, relay_addr, &code);
             let mut attempts: u32 = 0;
             let mut budget = ReconnectBudget::new();
             loop {
+                if !shared.is_current_operation(operation) {
+                    return;
+                }
                 let remaining = budget.remaining(std::time::Instant::now());
                 if remaining.is_zero() {
-                    shared.emit(ClientEvent::Error {
-                        control: "relay".into(),
-                        message: "Relay not reachable".into(),
-                    });
-                    fail(
-                        &shared,
+                    let _ = shared.emit_for_operation(
+                        operation,
+                        ClientEvent::Error {
+                            control: "relay".into(),
+                            message: "Relay not reachable".into(),
+                        },
+                    );
+                    shared.fail_for_operation(
+                        operation,
                         format!(
                             "Could not reach the Station within {}s; disconnected. Reconnect to try again.",
                             reconnect::RECONNECT_WINDOW.as_secs()
@@ -1357,42 +1980,64 @@ impl ClientController {
                 // shared helper retries the relay rendezvous once (750 ms) inside that budget.
                 let attempt =
                     tokio::time::timeout(remaining, connect_with_relay_retry(&config)).await;
+                if !shared.is_current_operation(operation) {
+                    // Any connected candidate is dropped here before it can create a Session.
+                    return;
+                }
                 match attempt {
-                    Err(_) => shared.log("warn", "link failed: reconnect budget elapsed"),
+                    Err(_) => shared.log_for_operation(operation, "warn", "link failed: reconnect budget elapsed"),
                     Ok(Ok(connected)) => {
-                        if let Some(edge) = bring_up_client(&shared, connected).await {
+                        if let Some(edge) = bring_up_client(&shared, operation, connected, true).await {
+                            if !shared.is_current_operation(operation) {
+                                return;
+                            }
                             attempts = 0;
                             let connected_at = std::time::Instant::now();
                             let rtt_shared = Arc::clone(&shared);
                             let outcome = watch_edge_liveness(edge, move |ms| {
-                                rtt_shared.emit(ClientEvent::Rtt { ms });
+                                let _ = rtt_shared.emit_for_operation(operation, ClientEvent::Rtt { ms });
                             })
                             .await;
                             budget.record_link_ended(connected_at, std::time::Instant::now());
-                            teardown_session(&shared).await;
+                            if !teardown_session(&shared, operation).await {
+                                return;
+                            }
+                            if !shared.is_current_operation(operation) {
+                                return;
+                            }
                             if outcome == Liveness::Closed {
                                 // A deliberate local teardown (unpair) ends the supervisor.
                                 return;
                             }
-                            shared.log("warn", "The Station stopped responding; reconnecting…");
-                            shared.emit(ClientEvent::Connection {
-                                state: "connecting".into(),
-                                path: "none".into(),
-                            });
+                            shared.log_for_operation(
+                                operation,
+                                "warn",
+                                "The Station stopped responding; reconnecting…",
+                            );
+                            let _ = shared.emit_for_operation(
+                                operation,
+                                ClientEvent::Connection { state: "connecting".into(), path: "none".into() },
+                            );
                             continue;
                         }
                     }
-                    Ok(Err(e)) => shared.log("warn", format!("link failed: {e}")),
+                    Ok(Err(e)) => shared.log_for_operation(operation, "warn", format!("link failed: {e}")),
                 }
 
+                if !shared.is_current_operation(operation) {
+                    return;
+                }
                 attempts += 1;
                 if attempts >= MAX_RECONNECT_ATTEMPTS {
-                    shared.emit(ClientEvent::Error {
-                        control: "relay".into(),
-                        message: "Relay not reachable".into(),
-                    });
-                    fail(
-                        &shared,
+                    let _ = shared.emit_for_operation(
+                        operation,
+                        ClientEvent::Error {
+                            control: "relay".into(),
+                            message: "Relay not reachable".into(),
+                        },
+                    );
+                    shared.fail_for_operation(
+                        operation,
                         format!(
                             "Could not reach the Station after {MAX_RECONNECT_ATTEMPTS} attempts; \
                              giving up. Reconnect to try again."
@@ -1400,216 +2045,721 @@ impl ClientController {
                     );
                     return;
                 }
-                shared.log(
+                shared.log_for_operation(
+                    operation,
                     "info",
                     format!("Reconnect attempt {attempts}/{MAX_RECONNECT_ATTEMPTS}…"),
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
-        self.runtime.block_on(async {
-            *self.shared.supervisor.lock().await = Some(handle);
-        });
+        self.shared.register_supervisor(operation, handle);
     }
 
-    /// Tears the session, control channel, LAN advertiser and keying edge down.
+    /// Stops the current pairing, LAN browsers, control path, and keyed-edge carrier. A paired
+    /// W1VE ESP32 Player receives an explicit terminal unpair before its socket is released.
     pub fn disconnect(&self) {
-        *self.shared.transport.lock().unwrap() = None;
-        // Ends the pairing's ordered tunnel FIFO; the next pairing starts a fresh one.
-        self.shared.edge.detach();
-        let shared = Arc::clone(&self.shared);
-        self.runtime.block_on(async move {
-            if let Some(task) = shared.supervisor.lock().await.take() {
-                task.abort();
-            }
-            if let Some(task) = shared.advertise.lock().await.take() {
-                task.abort();
-            }
-            if let Some(task) = shared.control_task.lock().unwrap().take() {
-                task.abort();
-            }
-            *shared.control_tx.lock().unwrap() = None;
-            if let Some(mut session) = shared.session.lock().await.take() {
-                session.shutdown().await;
-            }
-        });
-        self.shared.emit(ClientEvent::Advertising { active: false });
-        self.shared.emit(ClientEvent::Rtt { ms: None });
-        self.shared
-            .emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
-        self.shared.log("info", "Unpaired.");
+        self.stop_lan_browse();
+        // Retire before requesting task cancellation. `abort` is not a join barrier, so the
+        // generation transition and resource detachment are the actual safety boundary.
+        let retired = self.shared.retire_operation();
+        self.runtime.block_on(dispose_retired_client_resources(retired));
     }
 }
 
-/// Tears the current pairing's edge, control channel and session down **without** emitting
-/// "disconnected" or touching the LAN advertiser, so the WAN supervisor can reconnect cleanly.
-/// The time-critical keyer threads key into `shared.edge`, which is detached here; with no
-/// transport the frames are dropped until the next `bring_up_client` reinstalls one.
-async fn teardown_session(shared: &Arc<Shared>) {
-    *shared.transport.lock().unwrap() = None;
-    shared.edge.detach();
-    if let Some(task) = shared.control_task.lock().unwrap().take() {
+/// Stops resources detached by [`Shared::retire_operation`]. This runs after the installation
+/// gate has advanced, so it can never take a Session or edge installed by a newer operation.
+async fn dispose_retired_client_resources(retired: RetiredClientResources) {
+    if let Some(task) = retired.supervisor {
         task.abort();
     }
-    *shared.control_tx.lock().unwrap() = None;
-    // Report the teardown before awaiting the session, so the UI cannot stay on a live pairing.
-    shared.emit(ClientEvent::Rtt { ms: None });
-    *shared.control_tx.lock().unwrap() = None;
-    if let Some(mut session) = shared.session.lock().await.take() {
-        session.shutdown().await;
+    if let Some(task) = retired.lan_connect {
+        task.abort();
+    }
+    if let Some(task) = retired.control_task {
+        task.abort();
+    }
+    if let Some(active) = retired.esp_active {
+        let _ = active.session.send_unpair().await;
+    }
+    if let Some(session) = retired.session {
+        session.lock().await.shutdown().await;
     }
 }
 
-/// Shared post-connect wiring for the Client (operating position), used by both the WAN
-/// `connect` and the LAN advertise paths: start the session, open the keying edge, open the
-/// control channel and push the forward rules, and report connected. Returns the live
-/// [`EdgeTransport`] so the caller can watch it for peer liveness, or [`None`] if bring-up failed.
+/// Tears this desktop operation's edge, control channel, and WireGuard session down **without**
+/// changing its generation, so the WAN supervisor can reconnect cleanly. It does nothing once a
+/// Stop or replacement has advanced the installation gate.
+async fn teardown_session(shared: &Arc<Shared>, operation: ClientOperation) -> bool {
+    let (control_task, session) = {
+        let mut lifecycle = shared.lifecycle.lock().unwrap();
+        if !lifecycle.is_current(operation) {
+            return false;
+        }
+        let owns_transport = matches!(
+            lifecycle.transport.as_ref(),
+            Some(transport) if transport.operation == operation
+        );
+        let owns_session = matches!(
+            lifecycle.session.as_ref(),
+            Some(session) if session.operation == operation
+        );
+        if !owns_transport && !owns_session {
+            return false;
+        }
+        if owns_transport {
+            lifecycle.transport = None;
+        }
+        shared.edge.detach();
+        let control_task = if matches!(
+            lifecycle.control_task.as_ref(),
+            Some(task) if task.operation == operation
+        ) {
+            lifecycle.control_task.take().map(|task| task.resource)
+        } else {
+            None
+        };
+        if matches!(
+            lifecycle.control_tx.as_ref(),
+            Some(sender) if sender.operation == operation
+        ) {
+            lifecycle.control_tx = None;
+        }
+        let session = if owns_session {
+            lifecycle.session.take().map(|session| session.resource)
+        } else {
+            None
+        };
+        // Report the teardown while holding the same gate that accepts a new edge/session.
+        shared.emit(ClientEvent::Rtt { ms: None });
+        (control_task, session)
+    };
+    if let Some(task) = control_task {
+        task.abort();
+    }
+    if let Some(session) = session {
+        session.lock().await.shutdown().await;
+    }
+    true
+}
+
+/// Shared post-connect wiring for a desktop Player. WAN always permits the Router path; a LAN
+/// Player must advertise Router capability before control, forwarding, or Flex starts. Every
+/// post-await candidate is checked against `operation`; a rejected Session is shut down locally.
 async fn bring_up_client(
     shared: &Arc<Shared>,
+    operation: ClientOperation,
     connected: tunnel::Connected,
+    router_capable: bool,
 ) -> Option<Arc<EdgeTransport>> {
     let path = format!("{:?}", connected.path).to_lowercase();
     let config = shared.config.lock().unwrap().clone();
-    let session = match Session::start(connected, &config) {
-        Ok(s) => s,
-        Err(e) => {
-            fail(shared, format!("session failed: {e}"));
+    let mut session = match Session::start(connected, &config) {
+        Ok(session) => session,
+        Err(error) => {
+            shared.fail_for_operation(operation, format!("session failed: {error}"));
             return None;
         }
     };
+    if !shared.is_current_operation(operation) {
+        session.shutdown().await;
+        return None;
+    }
     let net = session.handle();
 
     let conn = match net.open_udp(EDGE_PORT).await {
-        Ok(c) => c,
-        Err(e) => {
-            fail(shared, format!("edge open failed: {e}"));
+        Ok(conn) => conn,
+        Err(error) => {
+            session.shutdown().await;
+            shared.fail_for_operation(operation, format!("edge open failed: {error}"));
             return None;
         }
     };
+    if !shared.is_current_operation(operation) {
+        session.shutdown().await;
+        return None;
+    }
     let transport = Arc::new(EdgeTransport::over_tunnel(conn));
     let peer = std::net::SocketAddr::new(
         std::net::IpAddr::V4(Role::Client.peer_inner_address()),
         EDGE_PORT,
     );
     transport.set_peer(peer).await;
-
-    // Keep the control channel to the Station dialled for the whole pairing: it carries the
-    // forward rules out and FlexRadio discovery announcements back.
-    let station_inner = std::net::IpAddr::V4(Role::Client.peer_inner_address());
-    // Retire the previous pairing's control link first. Left running, its task keeps redialling
-    // a dead netstack, and when it ends it clears `control_tx`, which silently drops rule pushes
-    // on the new link. The LAN responder re-pairs without a disconnect, so this path matters.
-    if let Some(old) = shared.control_task.lock().unwrap().take() {
-        old.abort();
+    if !shared.is_current_operation(operation) {
+        session.shutdown().await;
+        return None;
     }
-    *shared.control_tx.lock().unwrap() = None;
-    let control = spawn_control_link(Arc::clone(shared), net.clone(), station_inner);
-    *shared.control_task.lock().unwrap() = Some(control);
 
-    // A new pairing restarts the edge stream at sequence 0 and starts its ordered tunnel FIFO.
-    // The Station builds a fresh replayer per session, so it accepts the restart.
-    shared.edge.begin(*shared.epoch.lock().unwrap(), MonotonicClock.now(), Arc::clone(&transport));
-    *shared.transport.lock().unwrap() = Some(Arc::clone(&transport));
+    // Wrap the Session only after all connection awaits. The installation block below is the
+    // linearization point for edge, session, control, Router, and connected-state publication.
+    let session = Arc::new(tokio::sync::Mutex::new(session));
+    let committed = {
+        let mut lifecycle = shared.lifecycle.lock().unwrap();
+        if !lifecycle.is_current(operation) {
+            None
+        } else {
+            let old_control = lifecycle.control_task.take().map(|task| task.resource);
+            lifecycle.control_tx = None;
+            let old_session = lifecycle.session.take().map(|session| session.resource);
 
-    if let Some(mut old) = shared.session.lock().await.replace(session) {
-        old.shutdown().await;
-    }
-    // The epoch is intentionally NOT bumped here. Both edge sources (the paddle poller and
-    // the type-ahead send worker) sample `shared.epoch` independently, so a bump would make
-    // them disagree and the Station would F4 whichever source sent second. The station adopts
-    // the first frame's epoch of each fresh session and re-anchors on reconnect (it tears the
-    // replayer down and back up per pairing), so a stable epoch is both correct and necessary.
-    shared.emit(ClientEvent::Connection { state: "connected".into(), path: path.clone() });
-    shared.log("info", format!("Paired over the {path} path."));
-    // Hand the live transport back so the supervisor (WAN) or the LAN loop can watch liveness.
-    Some(Arc::clone(&transport))
-}
+            if router_capable {
+                let player_inner = std::net::IpAddr::V4(Role::Client.peer_inner_address());
+                let control = spawn_control_link(
+                    Arc::clone(shared),
+                    operation,
+                    Arc::clone(&session),
+                    net.clone(),
+                    player_inner,
+                );
+                lifecycle.control_task = Some(OperationResource { operation, resource: control });
+            } else {
+                // A CW-only desktop Player retains the tunnel edge path but never inherits Flex
+                // or Router service from a previous desktop pairing.
+                *shared.flex_emitter.lock().unwrap() = None;
+                shared.emit_flex_state();
+                shared.log(
+                    "info",
+                    "Selected desktop Player is CW-only; Ham Router control, forwarding, and Flex are disabled.",
+                );
+            }
 
-/// The operating-position LAN flow: a **persistent responder**. The operator arms it once
-/// (Advertise); it then keeps answering Stations until unpaired. Each cycle binds a fresh
-/// WireGuard socket, broadcasts the beacon with that port, waits for a Station to pick this
-/// keyer, and brings the link up as the responder. When a later pick supersedes it (e.g. the
-/// Station reconnects after a drop), the loop re-binds and re-advertises — so the keyer
-/// reconnects without the operator re-arming. The Station resolves this keyer's *current* port
-/// from the live beacon at connect time, so a re-bound port is never stale.
-///
-/// Runs as one task; aborting it (unpair) stops the beacon and the wait.
-async fn lan_advertise_and_await(shared: Arc<Shared>) {
-    let (identity, callsign, keyer_id) = {
-        let config = shared.config.lock().unwrap();
-        let s = shared.settings.lock().unwrap();
-        match config.identity.to_identity() {
-            Ok(id) => (id, s.callsign.clone(), s.keyer_id.clone()),
-            Err(e) => return fail(&shared, format!("identity error: {e}")),
+            // A new pairing restarts the edge stream at sequence 0 and starts its ordered tunnel
+            // FIFO. The wire epoch remains stable because the paddle and type-ahead sources both
+            // sample it independently.
+            shared.edge.begin(*shared.epoch.lock().unwrap(), MonotonicClock.now(), Arc::clone(&transport));
+            lifecycle.transport = Some(OperationResource {
+                operation,
+                resource: Arc::clone(&transport),
+            });
+            lifecycle.session = Some(OperationResource {
+                operation,
+                resource: Arc::clone(&session),
+            });
+            *shared.router_access.lock().unwrap() = RouterAccess::Desktop { router_capable };
+            shared.emit_router_status();
+            shared.emit(ClientEvent::Connection { state: "connected".into(), path: path.clone() });
+            shared.log("info", format!("Paired over the {path} path."));
+            Some((old_control, old_session))
         }
     };
 
+    let Some((old_control, old_session)) = committed else {
+        session.lock().await.shutdown().await;
+        return None;
+    };
+    if let Some(task) = old_control {
+        task.abort();
+    }
+    if let Some(session) = old_session {
+        session.lock().await.shutdown().await;
+    }
+    Some(transport)
+}
+
+/// The ESP Player safety refresh repeats the newest complete RWK-PADDLE frame often enough to
+/// repair a lost terminal edge without creating a second edge sender.
+const ESP_FRAME_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// Wait briefly for broadcasts before probing the local /24 for ESP Players.
+const ESP_DISCOVERY_FALLBACK_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Pace the bounded ESP discovery fallback to at most ten unicast queries per second.
+const ESP_DISCOVERY_QUERY_PACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Runs the desktop Player browser until cancelled, updating the shared tagged selection list.
+async fn browse_desktop_players(shared: Arc<Shared>, self_key: [u8; 32]) {
+    let mut browser = match rwk_core::engine::lan_discovery::LanBrowser::bind(self_key) {
+        Ok(browser) => browser,
+        Err(error) => {
+            shared.log("warn", format!("Desktop Player LAN browse failed: {error}"));
+            shared.set_desktop_lan_players(Vec::new());
+            return;
+        }
+    };
+    shared.log("info", "Browsing the LAN for desktop Players…");
+    shared.set_desktop_lan_players(browser.peers());
     loop {
-        let (socket, wg_port) = match tunnel::lan_bind().await {
-            Ok(pair) => pair,
-            Err(e) => return fail(&shared, format!("LAN bind failed: {e}")),
-        };
-
-        let beacon = rwk_core::engine::lan_discovery::Beacon {
-            callsign: callsign.clone(),
-            keyer_id: keyer_id.clone(),
-            public_key: identity.public_bytes(),
-            wg_port,
-        };
-        let advertiser = match rwk_core::engine::lan_discovery::LanAdvertiser::new(beacon) {
-            Ok(a) => a,
-            Err(e) => return fail(&shared, format!("LAN advertise failed: {e}")),
-        };
-        let beacon_task = tokio::spawn(advertiser.run());
-        shared.emit(ClientEvent::Advertising { active: true });
-
-        let connected = match tunnel::lan_await_initiator(socket, &identity).await {
-            Ok(c) => c,
-            Err(e) => {
-                beacon_task.abort();
-                shared.log("warn", format!("LAN listen cycle ended: {e}; re-advertising."));
-                continue;
+        match tokio::time::timeout(std::time::Duration::from_secs(1), browser.recv_once()).await {
+            Ok(Ok(_)) | Err(_) => shared.set_desktop_lan_players(browser.peers()),
+            Ok(Err(error)) => {
+                shared.log("warn", format!("Desktop Player LAN browse stopped: {error}"));
+                break;
             }
-        };
-        beacon_task.abort();
-        shared.emit(ClientEvent::Advertising { active: false });
-
-        // Bring the link up, then watch the Station's liveness. When it stops responding (closed
-        // or dropped), tear the dead session down and loop to re-advertise, so the Station can
-        // re-establish without the operator re-arming. The LAN responder is deliberately
-        // unbounded (a rebooting Station should always find the beacon waiting).
-        if let Some(edge) = bring_up_client(&shared, connected).await {
-            let rtt_shared = Arc::clone(&shared);
-            let _ = watch_edge_liveness(edge, move |ms| {
-                rtt_shared.emit(ClientEvent::Rtt { ms });
-            })
-            .await;
-            teardown_session(&shared).await;
-            shared.emit(ClientEvent::Connection { state: "connecting".into(), path: "none".into() });
-            shared.log("info", "The Station stopped responding; re-advertising on the LAN…");
         }
     }
+    shared.set_desktop_lan_players(Vec::new());
+}
+
+/// Runs the ESP Player browser plus its deliberately bounded, paced unicast fallback. The core
+/// browser limits a pass to 254 candidates; this loop sends no more than ten probes per second.
+async fn browse_esp32_players(shared: Arc<Shared>, keyer_id: [u8; 6]) {
+    let mut browser = match EspPlayerBrowser::bind(keyer_id).await {
+        Ok(browser) => browser,
+        Err(error) => {
+            shared.log("warn", format!("W1VE ESP32 Player LAN browse failed: {error}"));
+            shared.set_esp_lan_players(Vec::new());
+            return;
+        }
+    };
+    shared.log("info", "Browsing the LAN for W1VE ESP32 Players…");
+    shared.set_esp_lan_players(browser.players());
+    browser.request_discovery();
+    let mut query_active = true;
+    let mut next_refresh = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut next_query = tokio::time::Instant::now() + ESP_DISCOVERY_FALLBACK_DELAY;
+
+    loop {
+        // Keep this receive bounded so the same mutable browser can safely prune records and
+        // send at most one fallback query per pacing interval without concurrent borrows.
+        match tokio::time::timeout(ESP_DISCOVERY_QUERY_PACE, browser.recv_once()).await {
+            Ok(Ok(_)) => shared.set_esp_lan_players(browser.players()),
+            Ok(Err(error)) => {
+                shared.log("warn", format!("W1VE ESP32 Player LAN browse stopped: {error}"));
+                break;
+            }
+            Err(_) => {}
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= next_refresh {
+            shared.set_esp_lan_players(browser.players());
+            next_refresh = now + std::time::Duration::from_secs(1);
+        }
+        if query_active && now >= next_query {
+            match browser.send_next_discovery_query().await {
+                Ok(more) => query_active = more,
+                Err(error) => {
+                    query_active = false;
+                    shared.log("warn", format!("W1VE ESP32 Player discovery fallback stopped: {error}"));
+                }
+            }
+            next_query = tokio::time::Instant::now() + ESP_DISCOVERY_QUERY_PACE;
+        }
+    }
+    shared.set_esp_lan_players(Vec::new());
+}
+
+/// Resolves a selected desktop Player from a fresh RWKP v2 beacon so its current endpoint and
+/// Router capability, not a stale webview snapshot, decide the direct connection path.
+async fn resolve_desktop_player(
+    self_key: [u8; 32],
+    player_key: [u8; 32],
+    timeout: std::time::Duration,
+) -> Result<LanPeer, String> {
+    let mut browser = rwk_core::engine::lan_discovery::LanBrowser::bind(self_key)
+        .map_err(|error| format!("LAN Player resolution failed: {error}"))?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("the selected desktop Player is no longer advertising".to_string());
+        }
+        match tokio::time::timeout(remaining, browser.recv_once()).await {
+            Ok(Ok(_)) => {
+                if let Some(player) = browser
+                    .peers()
+                    .into_iter()
+                    .find(|player| player.public_key == player_key)
+                {
+                    return Ok(player);
+                }
+            }
+            Ok(Err(error)) => return Err(error.to_string()),
+            Err(_) => return Err("the selected desktop Player is no longer advertising".to_string()),
+        }
+    }
+}
+
+/// Resolves a selected desktop Player again from a fresh RWKP v2 beacon, then brings the direct
+/// WireGuard tunnel up as the initiating Keyer. Only Router-capable Players get the Router path.
+async fn connect_desktop_lan_player(
+    shared: &Arc<Shared>,
+    operation: ClientOperation,
+    player: LanPeer,
+) {
+    if !shared.is_current_operation(operation) {
+        return;
+    }
+    let identity = match shared.config.lock().unwrap().identity.to_identity() {
+        Ok(identity) => identity,
+        Err(error) => return fail_lan_connection(shared, operation, format!("identity error: {error}")),
+    };
+    let player = match resolve_desktop_player(
+        identity.public_bytes(),
+        player.public_key,
+        std::time::Duration::from_secs(4),
+    )
+    .await
+    {
+        Ok(player) => player,
+        Err(error) => {
+            return fail_lan_connection(
+                shared,
+                operation,
+                format!("Selected desktop Player is no longer advertising: {error}"),
+            )
+        }
+    };
+    if !shared.is_current_operation(operation) {
+        return;
+    }
+    let router_capable = player.supports_router();
+    // Publish the fresh RWKP v2 capability only under this operation's gate. A late desktop
+    // resolver can therefore never undo the CW-only ESP guard installed by a replacement.
+    if !shared.set_router_access_for_operation(
+        operation,
+        RouterAccess::Desktop { router_capable },
+        !router_capable,
+    ) {
+        return;
+    }
+    let connected = match tunnel::lan_connect_to(&identity, player.public_key, player.endpoint).await {
+        Ok(connected) => connected,
+        Err(error) => return fail_lan_connection(shared, operation, format!("LAN link failed: {error}")),
+    };
+    if !shared.is_current_operation(operation) {
+        // `connected` drops before it can be promoted into a Session.
+        return;
+    }
+    let Some(edge) = bring_up_client(shared, operation, connected, router_capable).await else {
+        let _ = shared.set_router_access_for_operation(operation, RouterAccess::Inactive, false);
+        return;
+    };
+
+    let rtt_shared = Arc::clone(shared);
+    let outcome = watch_edge_liveness(edge, move |ms| {
+        let _ = rtt_shared.emit_for_operation(operation, ClientEvent::Rtt { ms });
+    })
+    .await;
+    if !teardown_session(shared, operation).await {
+        return;
+    }
+    if !shared.set_router_access_for_operation(operation, RouterAccess::Inactive, false) {
+        return;
+    }
+    let _ = shared.emit_for_operation(
+        operation,
+        ClientEvent::Connection { state: "disconnected".into(), path: "none".into() },
+    );
+    match outcome {
+        Liveness::Closed => {
+            shared.log_for_operation(operation, "info", "Desktop Player session closed.");
+        }
+        _ => {
+            shared.log_for_operation(operation, "warn", "Desktop Player stopped responding; disconnected.");
+        }
+    }
+}
+
+/// Pairs with a selected available W1VE ESP32 Player. This path must never construct a
+/// WireGuard `Session`, control link, forwarder, Flex emitter, or Router route.
+async fn connect_esp32_player(
+    shared: &Arc<Shared>,
+    operation: ClientOperation,
+    player: EspPlayerAdvertisement,
+    keyer_id: [u8; 6],
+) {
+    if player.busy() {
+        return fail_lan_connection(
+            shared,
+            operation,
+            format!("W1VE ESP32 Player {} is busy.", player.name),
+        );
+    }
+    if !shared.is_current_operation(operation) {
+        return;
+    }
+    let session = match EspPlayerSession::pair(player, keyer_id).await {
+        Ok(session) => Arc::new(session),
+        Err(error) => {
+            return fail_lan_connection(
+                shared,
+                operation,
+                format!("W1VE ESP32 Player pairing failed: {error}"),
+            )
+        }
+    };
+    if !shared.is_current_operation(operation) {
+        // Pairing allocates the ESP carrier before its first await returns. Explicitly release it
+        // if Stop/replacement won while pairing rather than merely dropping the Arc.
+        let _ = session.send_unpair().await;
+        return;
+    }
+    run_esp32_player_session(shared, operation, session).await;
+}
+
+/// Drives the CW-only ESP transport. The existing `EdgeSession` remains the single ordered
+/// RWK-PADDLE frame source; this function supplies its sender, repeats the newest complete frame
+/// every 250 ms, and runs one-second ping/pong supervision with a three-miss limit.
+async fn run_esp32_player_session(
+    shared: &Arc<Shared>,
+    operation: ClientOperation,
+    session: Arc<EspPlayerSession>,
+) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let sender_session = Arc::clone(&session);
+    let sender_stop = Arc::clone(&stop);
+    let sender_shared = Arc::clone(shared);
+
+    // The edge sender, ESP active state, Router isolation, and connected event all commit under
+    // the one lifecycle gate. A stale paired ESP socket is explicitly unpaired below.
+    let committed = {
+        let mut lifecycle = shared.lifecycle.lock().unwrap();
+        if !lifecycle.is_current(operation) {
+            None
+        } else {
+            let old_esp = lifecycle.esp_active.take();
+            if let Some(active) = &old_esp {
+                active.stop.store(true, Ordering::SeqCst);
+            }
+            let old_control = lifecycle.control_task.take().map(|task| task.resource);
+            let old_session = lifecycle.session.take().map(|session| session.resource);
+            lifecycle.control_tx = None;
+            lifecycle.transport = None;
+
+            shared.edge.begin_with_sender(*shared.epoch.lock().unwrap(), MonotonicClock.now(), move |frame| {
+                let session = Arc::clone(&sender_session);
+                let stop = Arc::clone(&sender_stop);
+                let shared = Arc::clone(&sender_shared);
+                async move {
+                    if stop.load(Ordering::SeqCst) || !shared.is_current_operation(operation) {
+                        return;
+                    }
+                    if let Err(error) = session.send_frame(&frame).await {
+                        if !stop.load(Ordering::SeqCst) && shared.is_current_operation(operation) {
+                            shared.log_for_operation(
+                                operation,
+                                "warn",
+                                format!("W1VE ESP32 Player frame send failed: {error}"),
+                            );
+                        }
+                    }
+                }
+            });
+            lifecycle.esp_active = Some(EspActiveSession {
+                operation,
+                session: Arc::clone(&session),
+                stop: Arc::clone(&stop),
+            });
+            // Entering ESP always removes desktop Router/Flex resources. No desktop control or
+            // session is installed by this branch, preserving strict CW-only isolation.
+            *shared.flex_emitter.lock().unwrap() = None;
+            *shared.router_access.lock().unwrap() = RouterAccess::Esp32Player;
+            shared.emit_router_status();
+            shared.emit_flex_state();
+            shared.emit(ClientEvent::Connection { state: "connected".into(), path: "esp".into() });
+            shared.log(
+                "info",
+                format!(
+                    "Paired with W1VE ESP32 Player {} at {} (CW only).",
+                    session.player().name,
+                    session.player().endpoint
+                ),
+            );
+            Some((old_esp, old_control, old_session))
+        }
+    };
+
+    let Some((old_esp, old_control, old_session)) = committed else {
+        stop.store(true, Ordering::SeqCst);
+        let _ = session.send_unpair().await;
+        return;
+    };
+    if let Some(task) = old_control {
+        task.abort();
+    }
+    if let Some(active) = old_esp {
+        let _ = active.session.send_unpair().await;
+    }
+    if let Some(session) = old_session {
+        session.lock().await.shutdown().await;
+    }
+
+    let mut refresh_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + ESP_FRAME_REFRESH_INTERVAL,
+        ESP_FRAME_REFRESH_INTERVAL,
+    );
+    let mut ping_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + ESP_PLAYER_PING_INTERVAL,
+        ESP_PLAYER_PING_INTERVAL,
+    );
+    let mut pending_ping = None;
+    let mut missed_pings = 0u8;
+    let mut send_terminal_unpair = true;
+    let reason = loop {
+        if stop.load(Ordering::SeqCst) || !shared.is_current_operation(operation) {
+            break "W1VE ESP32 Player session stopped locally".to_string();
+        }
+        tokio::select! {
+            incoming = session.recv() => match incoming {
+                Ok(Some(EspPlayerInbound::Unpaired)) => {
+                    send_terminal_unpair = false;
+                    break "W1VE ESP32 Player requested unpair".to_string();
+                }
+                Ok(_) => {}
+                Err(error) => break format!("W1VE ESP32 Player receive failed: {error}"),
+            },
+            _ = refresh_tick.tick() => {
+                if !stop.load(Ordering::SeqCst) && shared.is_current_operation(operation) {
+                    if let Some(frame) = shared.edge.latest_frame() {
+                        if let Err(error) = session.send_frame(&frame).await {
+                            if session.sequence_exhausted() {
+                                break "W1VE ESP32 Player envelope sequence exhausted".to_string();
+                            }
+                            if !stop.load(Ordering::SeqCst) && shared.is_current_operation(operation) {
+                                shared.log_for_operation(
+                                    operation,
+                                    "warn",
+                                    format!("W1VE ESP32 Player frame refresh failed: {error}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            },
+            _ = ping_tick.tick() => {
+                if stop.load(Ordering::SeqCst) || !shared.is_current_operation(operation) {
+                    break "W1VE ESP32 Player session stopped locally".to_string();
+                }
+                let prior_missed = if let Some(stamp) = pending_ping.take() {
+                    if session.ping_was_acknowledged(stamp) {
+                        missed_pings = 0;
+                        false
+                    } else {
+                        missed_pings = missed_pings.saturating_add(1);
+                        true
+                    }
+                } else {
+                    false
+                };
+                if missed_pings >= ESP_PLAYER_MISSED_PING_LIMIT {
+                    break "W1VE ESP32 Player missed three ping replies".to_string();
+                }
+                match session.send_ping().await {
+                    Ok(stamp) => pending_ping = Some(stamp),
+                    Err(error) => {
+                        if session.sequence_exhausted() {
+                            break "W1VE ESP32 Player envelope sequence exhausted".to_string();
+                        }
+                        if !prior_missed {
+                            missed_pings = missed_pings.saturating_add(1);
+                        }
+                        if missed_pings >= ESP_PLAYER_MISSED_PING_LIMIT {
+                            break "W1VE ESP32 Player missed three ping replies".to_string();
+                        }
+                        shared.log_for_operation(
+                            operation,
+                            "warn",
+                            format!("W1VE ESP32 Player ping send failed: {error}"),
+                        );
+                    }
+                }
+                let ms = session
+                    .rtt()
+                    .map(|duration| u32::try_from(duration.as_millis()).unwrap_or(u32::MAX));
+                let _ = shared.emit_for_operation(operation, ClientEvent::Rtt { ms });
+            }
+        }
+    };
+
+    // Only the active ESP owner may detach the edge and report terminal state. A Stop or
+    // replacement already detached and unpaired its own retired resource, so this stale task
+    // simply exits without touching the newer lifecycle.
+    let active = {
+        let mut lifecycle = shared.lifecycle.lock().unwrap();
+        let owns_session = lifecycle.is_current(operation)
+            && matches!(
+                lifecycle.esp_active.as_ref(),
+                Some(active)
+                    if active.operation == operation && Arc::ptr_eq(&active.session, &session)
+            );
+        if !owns_session {
+            None
+        } else {
+            let active = lifecycle.esp_active.take().expect("checked ESP owner");
+            active.stop.store(true, Ordering::SeqCst);
+            shared.edge.detach();
+            *shared.router_access.lock().unwrap() = RouterAccess::Inactive;
+            shared.emit_router_status();
+            shared.emit(ClientEvent::Rtt { ms: None });
+            shared.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
+            shared.log("warn", format!("{reason}; disconnected."));
+            Some(active)
+        }
+    };
+    if let Some(active) = active {
+        if send_terminal_unpair {
+            let _ = active.session.send_unpair().await;
+        }
+    }
+}
+
+/// Reports a LAN-selection failure and restores normal Router configuration availability only if
+/// the failed attempt still owns the lifecycle.
+fn fail_lan_connection(shared: &Arc<Shared>, operation: ClientOperation, message: String) {
+    let _ = shared.set_router_access_for_operation(operation, RouterAccess::Inactive, false);
+    shared.fail_for_operation(operation, message);
 }
 
 /// Pushes `rules` to the Station over the control channel (if paired) and restarts the
 /// Client's own forward tasks to match. Safe to call when not paired (does nothing).
-async fn push_rules(shared: &Arc<Shared>, rules: &[ForwardRuleConfig]) {
+async fn push_rules(
+    shared: &Arc<Shared>,
+    operation: ClientOperation,
+    rules: &[ForwardRuleConfig],
+) {
+    let (sender, session, has_transport, block_reason) = {
+        let lifecycle = shared.lifecycle.lock().unwrap();
+        if !lifecycle.is_current(operation) {
+            return;
+        }
+        let block_reason = shared.router_access.lock().unwrap().block_reason();
+        let sender = lifecycle
+            .control_tx
+            .as_ref()
+            .filter(|sender| sender.operation == operation)
+            .map(|sender| sender.resource.clone());
+        let session = lifecycle
+            .session
+            .as_ref()
+            .filter(|session| session.operation == operation)
+            .map(|session| Arc::clone(&session.resource));
+        let has_transport = matches!(
+            lifecycle.transport.as_ref(),
+            Some(transport) if transport.operation == operation
+        );
+        (sender, session, has_transport, block_reason)
+    };
+    if let Some(reason) = block_reason {
+        shared.log_for_operation(operation, "warn", format!("Forwarding was not applied: {reason}"));
+        return;
+    }
+    if !shared.is_current_operation(operation) {
+        return;
+    }
     // Queue the push for the Station. While the control channel is down nothing is queued: the
     // next dial sends the rules from the config.
-    match shared.control_tx.lock().unwrap().as_ref() {
-        Some(tx) => {
-            let _ = tx.send(ControlMessage::ForwardRules { rules: rules.to_vec() });
+    match sender {
+        Some(sender) => {
+            let _ = sender.send(ControlMessage::ForwardRules { rules: rules.to_vec() });
         }
-        None if shared.transport.lock().unwrap().is_some() => shared.log(
-            "warn",
-            "Control channel is down; rule change not sent to the Station.",
-        ),
+        None if has_transport => {
+            shared.log_for_operation(
+                operation,
+                "warn",
+                "Control channel is down; rule change not sent to the Station.",
+            );
+        }
         None => {}
     }
-    // Restart the Client's own forwards (binds local ports for enabled rules).
-    if let Some(session) = shared.session.lock().await.as_mut() {
+    // Restart the Client's own forwards only on the Session that remains installed for this
+    // operation. Stop removes that Session from the gate before it begins shutdown.
+    if let Some(session_handle) = session {
+        let mut session = session_handle.lock().await;
+        if !shared.owns_current_session(operation, &session_handle) {
+            return;
+        }
         let started = session.apply_forwards(rules).await;
-        shared.log("info", format!("{started} forward rule(s) active locally."));
+        drop(session);
+        shared.log_for_operation(operation, "info", format!("{started} forward rule(s) active locally."));
     }
 }
 
@@ -1624,27 +2774,57 @@ const CONTROL_REDIAL_MAX: std::time::Duration = std::time::Duration::from_secs(5
 /// FlexRadio announcements back, and is redialled when it ends.
 fn spawn_control_link(
     shared: Arc<Shared>,
+    operation: ClientOperation,
+    owner_session: Arc<tokio::sync::Mutex<Session>>,
     net: rwk_core::engine::netstack_driver::NetStackHandle,
     station_inner: std::net::IpAddr,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        if !shared.owns_current_session(operation, &owner_session)
+            || shared.router_block_reason().is_some()
+        {
+            return;
+        }
         let mut delay = CONTROL_REDIAL_MIN;
         loop {
+            if !shared.owns_current_session(operation, &owner_session)
+                || shared.router_block_reason().is_some()
+            {
+                return;
+            }
             match ControlLink::connect(&net, station_inner).await {
                 Ok(mut link) => {
+                    if !shared.owns_current_session(operation, &owner_session)
+                        || shared.router_block_reason().is_some()
+                    {
+                        return;
+                    }
                     delay = CONTROL_REDIAL_MIN;
-                    shared.log("info", "Control channel dialled.");
                     let (tx, mut outgoing) = tokio::sync::mpsc::unbounded_channel();
                     // Queue the current rules first; they go out once the link is up.
                     let rules = shared.config.lock().unwrap().forwards.clone();
                     let _ = tx.send(ControlMessage::ForwardRules { rules });
-                    *shared.control_tx.lock().unwrap() = Some(tx);
+                    if !shared.install_control_sender(operation, &owner_session, tx) {
+                        return;
+                    }
+                    shared.log_for_operation(operation, "info", "Control channel dialled.");
+                    let mut keep_running = true;
                     loop {
+                        if !shared.owns_current_session(operation, &owner_session)
+                            || shared.router_block_reason().is_some()
+                        {
+                            keep_running = false;
+                            break;
+                        }
                         tokio::select! {
                             queued = outgoing.recv() => match queued {
                                 Some(message) => {
-                                    if let Err(e) = link.send(&message).await {
-                                        shared.log("warn", format!("Control channel send failed: {e}"));
+                                    if let Err(error) = link.send(&message).await {
+                                        shared.log_for_operation(
+                                            operation,
+                                            "warn",
+                                            format!("Control channel send failed: {error}"),
+                                        );
                                         break;
                                     }
                                 }
@@ -1652,24 +2832,53 @@ fn spawn_control_link(
                             },
                             incoming = link.recv() => match incoming {
                                 Ok(Some(ControlMessage::DiscoveryAnnounce { payload })) => {
-                                    handle_discovery_announce(&shared, &payload);
+                                    handle_discovery_announce(
+                                        &shared,
+                                        operation,
+                                        &owner_session,
+                                        &payload,
+                                    );
                                 }
                                 Ok(Some(_)) => {} // the Client ignores other message types
                                 Ok(None) => {
-                                    shared.log("warn", "Control channel ended by the station.");
+                                    shared.log_for_operation(
+                                        operation,
+                                        "warn",
+                                        "Control channel ended by the station.",
+                                    );
                                     break;
                                 }
-                                Err(e) => {
-                                    shared.log("warn", format!("Control channel read failed: {e}"));
+                                Err(error) => {
+                                    shared.log_for_operation(
+                                        operation,
+                                        "warn",
+                                        format!("Control channel read failed: {error}"),
+                                    );
                                     break;
                                 }
                             },
                         }
                     }
-                    *shared.control_tx.lock().unwrap() = None;
-                    shared.log("warn", "Control channel to the station closed; redialling.");
+                    shared.clear_control_sender(operation, &owner_session);
+                    if !keep_running || !shared.owns_current_session(operation, &owner_session) {
+                        return;
+                    }
+                    shared.log_for_operation(
+                        operation,
+                        "warn",
+                        "Control channel to the station closed; redialling.",
+                    );
                 }
-                Err(e) => shared.log("warn", format!("Control channel unavailable: {e}")),
+                Err(error) => {
+                    if !shared.owns_current_session(operation, &owner_session) {
+                        return;
+                    }
+                    shared.log_for_operation(
+                        operation,
+                        "warn",
+                        format!("Control channel unavailable: {error}"),
+                    );
+                }
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(CONTROL_REDIAL_MAX);
@@ -1678,21 +2887,40 @@ fn spawn_control_link(
 }
 
 /// Rewrites a captured Flex discovery packet to the local forwarded endpoint and re-broadcasts
-/// it on the Client LAN. Also learns the radio's real IP and fills it into the Flex rules'
-/// `station_target_address` so the Station dials the right device.
-fn handle_discovery_announce(shared: &Arc<Shared>, payload_b64: &str) {
+/// it on the Client LAN. The control task must still own the current desktop Session at the final
+/// mutation point, so a stale link cannot revive Flex behavior after ESP selection or reconnect.
+fn handle_discovery_announce(
+    shared: &Arc<Shared>,
+    operation: ClientOperation,
+    owner_session: &Arc<tokio::sync::Mutex<Session>>,
+    payload_b64: &str,
+) {
     let Ok(packet) = base64_decode(payload_b64) else {
         return;
     };
-    // Learn the radio's real address from the packet and set it on the Flex rules.
-    if let Ok(radio) = flex_vita::parse(&packet) {
+    let radio = flex_vita::parse(&packet).ok();
+
+    let lifecycle = shared.lifecycle.lock().unwrap();
+    if !lifecycle.is_current(operation)
+        || !matches!(
+            lifecycle.session.as_ref(),
+            Some(session)
+                if session.operation == operation && Arc::ptr_eq(&session.resource, owner_session)
+        )
+        || shared.router_access.lock().unwrap().block_reason().is_some()
+    {
+        return;
+    }
+    // Learn the radio's real address from the packet and set it on the Flex rules. Invalid
+    // packets are still re-broadcast below, matching the existing Flex relay behavior.
+    if let Some(radio) = radio {
         let mut changed = false;
         {
             let mut config = shared.config.lock().unwrap();
-            for rule in config.forwards.iter_mut().filter(|r| r.id.starts_with("flex-")) {
-                let addr = radio.address.to_string();
-                if rule.station_target_address != addr {
-                    rule.station_target_address = addr;
+            for rule in config.forwards.iter_mut().filter(|rule| rule.id.starts_with("flex-")) {
+                let address = radio.address.to_string();
+                if rule.station_target_address != address {
+                    rule.station_target_address = address;
                     changed = true;
                 }
             }
@@ -1706,12 +2934,6 @@ fn handle_discovery_announce(shared: &Arc<Shared>, payload_b64: &str) {
     if let Some(emitter) = shared.flex_emitter.lock().unwrap().as_ref() {
         let _ = emitter.rebroadcast(&packet, std::net::Ipv4Addr::LOCALHOST, 4992);
     }
-}
-
-/// Reports a pairing failure through the event sink.
-fn fail(shared: &Arc<Shared>, message: String) {
-    shared.log("warn", message);
-    shared.emit(ClientEvent::Connection { state: "disconnected".into(), path: "none".into() });
 }
 
 impl Drop for ClientController {
@@ -1896,12 +3118,9 @@ fn drive_edge(
     }
     // 3. UI indicator.
     shared.emit(ClientEvent::KeyState { down: key_down });
-    // 4. Tunnel transport when paired — hand the frame to the ordered outbound queue
-    //    (non-blocking, FIFO). A single drain task sends them over the tunnel in order, so the
-    //    keyer thread never waits on the network and datagrams never reorder — the latter is
-    //    what broke keying above ~39 WPM (concurrent spawned sends could arrive out of order
-    //    and the Station discarded the lower sequence as a duplicate). The frame carries its
-    //    own timestamp, so the Station reconstructs spacing regardless of send jitter.
+    // 4. Selected transport when paired — hand the complete frame to the single ordered FIFO.
+    //    The carrier is either the WireGuard edge transport or the CW-only W1VE ESP32 Player
+    //    session, but all key sources share this one sender and sequence timeline.
     shared.edge.push_edge(key_down, timestamp_ticks);
     let _ = rt;
 }
@@ -2047,6 +3266,40 @@ fn held_by_other(port: &str, others: &[(&Option<String>, &'static str)]) -> Opti
         .map(|(_, label)| *label)
 }
 
+/// Derives the stable six-byte ESP Keyer identity from the persisted WireGuard public key.
+fn esp_keyer_id(public_key: [u8; 32]) -> [u8; 6] {
+    let mut keyer_id = [0u8; 6];
+    keyer_id.copy_from_slice(&public_key[..6]);
+    keyer_id
+}
+
+/// Validates the base64 public-key identifier returned by a desktop Player browser.
+fn parse_desktop_player_id(id: &str) -> Option<[u8; 32]> {
+    base64_decode(id).ok().and_then(|bytes| bytes.try_into().ok())
+}
+
+/// Validates the exact six-byte hexadecimal identifier returned by an ESP Player browser.
+fn parse_esp_player_id(id: &str) -> Option<[u8; 6]> {
+    let bytes = id.as_bytes();
+    if bytes.len() != 12 {
+        return None;
+    }
+    let mut player_id = [0u8; 6];
+    for (index, slot) in player_id.iter_mut().enumerate() {
+        *slot = (hex_nibble(bytes[index * 2])? << 4) | hex_nibble(bytes[index * 2 + 1])?;
+    }
+    Some(player_id)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Maps a UI mode name to a [`KeyerMode`], defaulting to Iambic B.
 fn parse_mode(name: &str) -> KeyerMode {
     match name {
@@ -2159,6 +3412,48 @@ mod tests {
     }
 
     #[test]
+    fn every_keyer_setting_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("rwk-client-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("client.json");
+        let _ = std::fs::remove_file(&path);
+
+        let (sink, _events) = recording_sink();
+        let first = ClientController::start_with_config(sink, Some(path.clone()));
+        first.set_speed(28);
+        first.set_weight(45);
+        first.set_mode("iambicA");
+        first.set_paddle_reverse(true);
+        first.set_tone_frequency(680);
+        first.set_tone_volume(25);
+        first.select_audio_device(Some(String::new()));
+        first.set_transport("lan");
+        // Port names that do not exist still record the operator's selection.
+        first.select_keying_port(Some("W1VE-TEST-KEY".into()));
+        first.select_paddle_port(Some("W1VE-TEST-PADDLE".into()));
+        first.select_winkeyer_port(Some("W1VE-TEST-WK".into()));
+        drop(first);
+
+        let (sink2, _events2) = recording_sink();
+        let second = ClientController::start_with_config(sink2, Some(path.clone()));
+        let s = second.shared.settings.lock().unwrap().clone();
+        drop(second);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(s.wpm, 28);
+        assert_eq!(s.weight, 45);
+        assert_eq!(mode_name(s.mode), "iambicA");
+        assert!(s.paddle_reverse);
+        assert_eq!(s.tone_hz, 680);
+        assert_eq!(s.tone_volume, 25);
+        assert_eq!(s.audio_device.as_deref(), Some(""));
+        assert_eq!(s.transport, Transport::Lan);
+        assert_eq!(s.keying_port.as_deref(), Some("W1VE-TEST-KEY"));
+        assert_eq!(s.paddle_port.as_deref(), Some("W1VE-TEST-PADDLE"));
+        assert_eq!(s.winkeyer_port.as_deref(), Some("W1VE-TEST-WK"));
+    }
+
+    #[test]
     fn update_forward_rule_edits_in_place_and_keeps_id() {
         let (sink, _events) = recording_sink();
         let controller = ClientController::start_with_config(sink, None);
@@ -2199,5 +3494,28 @@ mod tests {
         }
         // Unknown names fall back to Iambic B.
         assert_eq!(parse_mode("nonsense"), KeyerMode::IambicB);
+    }
+
+    #[test]
+    fn lan_player_selection_ids_have_strict_boundaries() {
+        assert_eq!(parse_esp_player_id("000102aBcDeF"), Some([0, 1, 2, 0xAB, 0xCD, 0xEF]));
+        assert_eq!(parse_esp_player_id("000102ABCDEF0"), None);
+        assert_eq!(parse_esp_player_id("000102ABCDE?"), None);
+
+        let desktop_key = [9u8; 32];
+        let encoded = base64_encode(&desktop_key);
+        assert_eq!(parse_desktop_player_id(&encoded), Some(desktop_key));
+        assert_eq!(parse_desktop_player_id("not-a-player-key"), None);
+    }
+
+    #[test]
+    fn esp_router_access_is_cw_only_and_resets_when_inactive() {
+        assert_eq!(RouterAccess::Esp32Player.status(), (false, true));
+        assert!(RouterAccess::Esp32Player.block_reason().is_some());
+        assert_eq!(RouterAccess::Inactive.status(), (true, false));
+        assert_eq!(RouterAccess::Inactive.block_reason(), None);
+        let mut public_key = [0u8; 32];
+        public_key[..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(esp_keyer_id(public_key), [1, 2, 3, 4, 5, 6]);
     }
 }

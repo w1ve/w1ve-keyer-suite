@@ -1,11 +1,8 @@
 //! The Server controller for W1VE Remote Keyer: receives keyed edges and keys the radio.
 //!
-//! This is the Keyer-Router Station's replay path, distilled to the Remote Keyer's job. It
-//! reuses `rwk-core`'s replay engine (jitter buffer, fail-safes, the time-critical replay
-//! thread), serial keying output, and [`KeyingArbiter`], and the same WAN/LAN pairing as the
-//! Client. When the operator changes the keying port or control lines while paired, the
-//! arbiter's adapter is swapped in place without restarting the replay driver or disturbing
-//! the logger host.
+//! The Player is the LAN desktop responder: it advertises its persisted station identity as an
+//! RWKP v2 CW-capable Player, then waits for an operating Keyer to initiate the WireGuard tunnel.
+//! WAN pairing retains its existing shared-token relay path.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,6 +11,7 @@ use rwk_core::config::{Config, Role};
 use rwk_core::engine::bus::{CoreEvent, EventBus};
 use rwk_core::engine::edge_station::{pump_edges, tunnel_replayer};
 use rwk_core::engine::keying_arbiter::{KeyingArbiter, LineObserver, LineUpdate};
+use rwk_core::engine::lan_discovery::{Beacon, LanAdvertiser, CAPABILITY_CW};
 use rwk_core::engine::network::EdgeTransport;
 use rwk_core::engine::reconnect::{connect_with_relay_retry, PEER_SILENCE_TIMEOUT};
 use rwk_core::engine::replay::{spawn_driver, EdgeJitterProfile, SerialKeyingAdapter};
@@ -56,29 +54,19 @@ pub enum ServerEvent {
         transport: String,
         relay: String,
         token: String,
+        callsign: String,
+        keyer_id: String,
         logger_port: Option<String>,
         ptt_hang_ms: u64,
     },
+    /// Whether this desktop Player is currently advertising its LAN identity.
+    Advertising { active: bool },
     /// The Player's logger input is sending CW (`true`) or idle (`false`).
     LoggerSending { active: bool },
-    /// The live list of LAN keyers available to connect to (for the dropdown).
-    LanPeers { peers: Vec<LanPeerView> },
     /// The current serial-port inventory.
     Ports { available: Vec<String> },
     /// A short, per-control error (empty `message` clears it). Full detail is also logged.
     Error { control: String, message: String },
-}
-
-/// A LAN keyer as the Server UI shows it in the dropdown.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LanPeerView {
-    /// Base64 public key — the stable id passed back to `connect_lan`.
-    pub key: String,
-    /// `callsign-keyerId` display name.
-    pub name: String,
-    /// The keyer's endpoint (`ip:port`), passed back to `connect_lan`.
-    pub endpoint: String,
 }
 
 /// A sink the host (Tauri) registers for [`ServerEvent`]s.
@@ -112,6 +100,9 @@ struct Settings {
     relay: String,
     /// The pairing token the Server generated for this run (shown so the Client can enter it).
     token: String,
+    /// Display identity advertised by this desktop Player on the LAN.
+    callsign: String,
+    keyer_id: String,
 }
 
 impl Default for Settings {
@@ -125,6 +116,8 @@ impl Default for Settings {
             transport: Transport::Wan,
             relay: pairing::DEFAULT_WAN_RELAY.to_string(),
             token: pairing::generate_token(),
+            callsign: String::new(),
+            keyer_id: String::new(),
         }
     }
 }
@@ -134,20 +127,6 @@ struct Shared {
     config: Mutex<Config>,
     config_path: Option<std::path::PathBuf>,
     sink: EventSink,
-}
-
-/// Emits the browser's current peer list as a [`ServerEvent::LanPeers`].
-fn emit_peers(shared: &Arc<Shared>, browser: &mut rwk_core::engine::lan_discovery::LanBrowser) {
-    let peers = browser
-        .peers()
-        .into_iter()
-        .map(|p| LanPeerView {
-            key: rwk_core::config::base64_encode(&p.public_key),
-            name: p.display_name(),
-            endpoint: p.endpoint.to_string(),
-        })
-        .collect();
-    shared.emit(ServerEvent::LanPeers { peers });
 }
 
 impl Shared {
@@ -179,6 +158,8 @@ impl Shared {
             transport: s.transport.as_str().into(),
             relay: s.relay.clone(),
             token: s.token.clone(),
+            callsign: s.callsign.clone(),
+            keyer_id: s.keyer_id.clone(),
             logger_port: s.logger_port.clone(),
             ptt_hang_ms: s.ptt_hang_ms,
         });
@@ -196,11 +177,39 @@ impl Shared {
             config.station.logger_port = s.logger_port.clone();
             config.station.logger_enabled = s.logger_port.is_some();
             config.station.ptt_hang_ms = Some(s.ptt_hang_ms);
+            config.callsign = s.callsign.clone();
+            config.keyer_id = s.keyer_id.clone();
+            config.transport = Some(s.transport.as_str().to_string());
+            if let Ok(address) = s.relay.parse() {
+                config.relay = Some(rwk_core::config::RelayConfig { address });
+            }
+            config.pairing_code = Some(s.token.clone());
         }
         let config = self.config.lock().unwrap();
         if let Err(e) = config.save(path) {
             self.log("warn", format!("Could not save config: {e}"));
         }
+    }
+}
+
+/// Identifies one Server listen/advertise operation. Every newer operation invalidates older
+/// asynchronous pairing work before it can install replay resources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperationId(u64);
+
+#[derive(Default)]
+struct OperationGate {
+    generation: u64,
+}
+
+impl OperationGate {
+    fn replace(&mut self) -> OperationId {
+        self.generation = self.generation.wrapping_add(1);
+        OperationId(self.generation)
+    }
+
+    fn permits(&self, operation: OperationId) -> bool {
+        self.generation == operation.0
     }
 }
 
@@ -211,9 +220,14 @@ impl Shared {
 /// serial adapter is swapped in place (`apply_keying_live`) without restarting the replay
 /// driver, re-anchoring the jitter buffer, or resetting the logger host.
 struct ActiveSession {
+    /// Operation that installed this replay stack. Its heartbeat can only tear down this exact
+    /// generation, never a replacement session.
+    operation: OperationId,
     session: Session,
     pump: tokio::task::JoinHandle<rwk_core::Result<()>>,
     stop_bus: Arc<AtomicBool>,
+    /// Set after the session shutdown completes, so LAN re-advertising never overlaps teardown.
+    finished: Arc<AtomicBool>,
     /// The logger-WinKeyer host, if running. Declared before `arbiter` so it drops first.
     logger: Option<LoggerHost>,
     /// The keying arbiter the logger and remote replay share. Swapped in place on port/line changes.
@@ -221,6 +235,80 @@ struct ActiveSession {
     /// Sends a liveness heartbeat to the Client ~once a second so the Client can tell the
     /// Player is still up even when no CW is flowing. Aborted on disconnect.
     heartbeat: tokio::task::JoinHandle<()>,
+}
+
+/// Server-owned connection state guarded by the installation gate. Network setup never holds
+/// this mutex across an await; it locks only to verify a generation and atomically install or
+/// detach task/session resources and their visible connection state.
+struct ServerConnection {
+    gate: OperationGate,
+    /// Set when a WAN listener or LAN responder has announced connecting. It closes the
+    /// spawn-to-handle window so Stop still reports disconnected before a task is registered.
+    operation_active: bool,
+    /// Mirrors the last advertising event for the current operation, including the interval
+    /// between spawning a responder and publishing its JoinHandle.
+    advertising: bool,
+    active: Option<ActiveSession>,
+    /// Long-lived desktop LAN responder task, including its advertising/listening loop.
+    advertise: Option<(OperationId, tokio::task::JoinHandle<()>)>,
+    /// Pending WAN connection task. Tracking it lets Cancel stop a listener before it installs
+    /// an `ActiveSession`.
+    pending: Option<(OperationId, tokio::task::JoinHandle<()>)>,
+}
+
+impl ServerConnection {
+    fn permits(&self, operation: OperationId) -> bool {
+        self.gate.permits(operation)
+    }
+
+    fn permits_replay_install(&self, operation: OperationId) -> bool {
+        self.permits(operation) && self.operation_active && self.active.is_none()
+    }
+}
+
+impl Default for ServerConnection {
+    fn default() -> Self {
+        Self {
+            gate: OperationGate::default(),
+            operation_active: false,
+            advertising: false,
+            active: None,
+            advertise: None,
+            pending: None,
+        }
+    }
+}
+
+/// Resources detached from the installation gate for cleanup. They are deliberately owned by
+/// value, preventing an older operation from touching any replacement stack.
+struct RetiredServerConnection {
+    active: Option<ActiveSession>,
+    advertise: Option<(OperationId, tokio::task::JoinHandle<()>)>,
+    pending: Option<(OperationId, tokio::task::JoinHandle<()>)>,
+}
+
+/// Aborts a child task if its owning LAN responder is cancelled at any await point. A Tokio
+/// `JoinHandle` otherwise detaches on drop, which would let an old beacon continue advertising.
+struct AbortOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self { handle: Some(handle) }
+    }
+
+    fn abort(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.abort();
+    }
 }
 
 /// How often the Player beacons a liveness heartbeat to the Client. It must stay well inside the
@@ -233,9 +321,8 @@ const RTT_EVERY_TICKS: u32 = 4;
 pub struct ServerController {
     shared: Arc<Shared>,
     runtime: tokio::runtime::Runtime,
-    active: Arc<Mutex<Option<ActiveSession>>>,
-    /// The running LAN browse task (radio-site side), present while browsing.
-    browse: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Generation plus task/replay slots. This is the sole installation gate for WAN and LAN.
+    connection: Arc<Mutex<ServerConnection>>,
 }
 
 impl ServerController {
@@ -277,7 +364,21 @@ impl ServerController {
                 .ptt_hang_ms
                 .unwrap_or(PTT_HANG_DEFAULT_MS)
                 .clamp(u64::from(PTT_HANG_MIN_MS), u64::from(PTT_HANG_MAX_MS)),
-            ..Settings::default()
+            callsign: config.callsign.clone(),
+            keyer_id: config.keyer_id.clone(),
+            transport: config.transport.as_deref().map(Transport::parse).unwrap_or(Transport::Wan),
+            relay: config
+                .relay
+                .as_ref()
+                .map(|r| r.address.to_string())
+                .unwrap_or_else(|| pairing::DEFAULT_WAN_RELAY.to_string()),
+            // Keep the WAN token across launches so the operator's Keyer can reuse it; a fresh
+            // one is generated only for a new install or when the operator regenerates it.
+            token: config
+                .pairing_code
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(pairing::generate_token),
         };
         let shared = Arc::new(Shared {
             settings: Mutex::new(settings),
@@ -292,9 +393,10 @@ impl ServerController {
         let controller = Self {
             shared,
             runtime,
-            active: Arc::new(Mutex::new(None)),
-            browse: Mutex::new(None),
+            connection: Arc::new(Mutex::new(ServerConnection::default())),
         };
+        // Save once at startup so a token generated for a fresh config is stable from now on.
+        controller.shared.persist();
         controller.shared.emit_settings();
         controller.emit_ports();
         controller
@@ -324,7 +426,7 @@ impl ServerController {
     /// output is opened at pairing in [`bring_up_replay`], so a selection is only "held" while
     /// an active session exists.
     fn is_paired(&self) -> bool {
-        self.active.lock().unwrap().is_some()
+        self.connection.lock().unwrap().active.is_some()
     }
 
     /// Re-enumerates serial ports and reconciles the keying selection. While **not** paired, a
@@ -382,7 +484,7 @@ impl ServerController {
     /// so a changed port or control line takes effect immediately without restarting the replay
     /// driver, re-anchoring the jitter buffer, or disturbing the logger host.
     fn apply_keying_live(&self) {
-        let arbiter = match self.active.lock().unwrap().as_ref() {
+        let arbiter = match self.connection.lock().unwrap().active.as_ref() {
             Some(active) => Arc::clone(&active.arbiter),
             None => return,
         };
@@ -398,18 +500,32 @@ impl ServerController {
     /// Restarts the logger input on the running session for the current logger port.
     /// The old host is stopped first, so its port is free before the new one opens.
     fn apply_logger_live(&self) {
-        let arbiter = match self.active.lock().unwrap().as_ref() {
-            Some(active) => Arc::clone(&active.arbiter),
-            None => return,
+        let (operation, arbiter, old) = {
+            let mut connection = self.connection.lock().unwrap();
+            let Some(active) = connection.active.as_mut() else {
+                return;
+            };
+            (active.operation, Arc::clone(&active.arbiter), active.logger.take())
         };
-        let old = self.active.lock().unwrap().as_mut().and_then(|a| a.logger.take());
         if let Some(mut host) = old {
             host.stop();
         }
         let port = self.shared.settings.lock().unwrap().logger_port.clone();
-        let logger = open_logger(&self.shared, &arbiter, port);
-        if let Some(active) = self.active.lock().unwrap().as_mut() {
-            active.logger = logger;
+        let mut logger = open_logger(&self.shared, &arbiter, port);
+        let mut connection = self.connection.lock().unwrap();
+        let current = connection.permits(operation)
+            && connection
+                .active
+                .as_ref()
+                .is_some_and(|active| active.operation == operation);
+        if current {
+            connection.active.as_mut().expect("checked active session").logger = logger.take();
+        }
+        drop(connection);
+        // Stop a logger opened after the active pairing was replaced instead of attaching it to
+        // the replacement's replay stack.
+        if let Some(mut logger) = logger {
+            logger.stop();
         }
     }
 
@@ -524,25 +640,51 @@ impl ServerController {
     }
 
     pub fn set_transport(&self, transport: &str) {
-        self.shared.settings.lock().unwrap().transport = Transport::parse(transport);
+        let transport = Transport::parse(transport);
+        let leaving_lan = {
+            let mut settings = self.shared.settings.lock().unwrap();
+            let leaving_lan = settings.transport == Transport::Lan && transport != Transport::Lan;
+            settings.transport = transport;
+            leaving_lan
+        };
+        self.shared.persist();
+        if leaving_lan {
+            self.disconnect();
+        }
         self.shared.emit_settings();
     }
 
     pub fn set_relay(&self, relay: &str) {
         self.shared.settings.lock().unwrap().relay = relay.to_string();
+        self.shared.persist();
+        self.shared.emit_settings();
+    }
+
+    /// Sets the desktop Player callsign advertised as its LAN display identity.
+    pub fn set_callsign(&self, callsign: &str) {
+        self.shared.settings.lock().unwrap().callsign = callsign.to_string();
+        self.shared.persist();
+        self.shared.emit_settings();
+    }
+
+    /// Sets the optional desktop Player label (for example, `20m`) advertised on the LAN.
+    pub fn set_keyer_id(&self, keyer_id: &str) {
+        self.shared.settings.lock().unwrap().keyer_id = keyer_id.to_string();
+        self.shared.persist();
         self.shared.emit_settings();
     }
 
     /// Regenerates the pairing token (a fresh code for a new pairing).
     pub fn regenerate_token(&self) {
         self.shared.settings.lock().unwrap().token = pairing::generate_token();
+        self.shared.persist();
         self.shared.emit_settings();
     }
 
     // ─── Pairing ──────────────────────────────────────────────────────────────
 
-    /// Begins listening: the Server waits for the Client to pair over the current transport +
-    /// token, then replays received edges onto the radio.
+    /// Begins WAN listening: the Server waits for the Client's shared-token relay pairing, then
+    /// replays received edges onto the radio.
     pub fn listen(&self) {
         let (transport, relay, token, keying_port, logger_port, key_line, ptt_line) = {
             let s = self.shared.settings.lock().unwrap();
@@ -560,188 +702,92 @@ impl ServerController {
         // shows keying on the KEY LED (nothing is wired to the radio). The port is opened
         // best-effort in `bring_up_replay`.
         self.shared.clear_error(control::KEYING);
-        self.disconnect();
+        let operation = self.replace_operation();
 
         let shared = Arc::clone(&self.shared);
-        let active_slot = Arc::clone(&self.active);
-        shared.emit(ServerEvent::Connection { state: "connecting".into(), path: "none".into() });
-        shared.log("info", "Waiting for the Client to pair…");
-
-        self.runtime.spawn(async move {
-            let base = shared.config.lock().unwrap().clone();
-            let config =
-                match pairing::build_config(&base, Role::Station, transport, &token, &relay) {
-                    Ok(c) => c,
-                    Err(e) => return fail(&shared, e),
-                };
-
-            // Retry the relay rendezvous once (750 ms) via the shared helper, so a transient
-            // relay race just after a Client restart does not fail the listen immediately — the
-            // same resilience the Client's connect path has.
-            let connected = match connect_with_relay_retry(&config).await {
-                Ok(c) => c,
-                Err(e) => return fail(&shared, format!("link failed: {e}")),
-            };
-            let config = config;
-            bring_up_replay(
-                &shared,
-                &active_slot,
-                connected,
-                &config,
-                keying_port,
-                logger_port,
-                key_line,
-                ptt_line,
-            )
-                .await;
-        });
-    }
-
-    // ─── LAN: browse available keyers and pick one ─────────────────────────────
-
-    /// Starts browsing the LAN for advertised keyers, emitting a [`ServerEvent::LanPeers`]
-    /// list the UI renders as a dropdown. Runs until the controller stops browsing (a new
-    /// browse call, a `listen`/`connect_lan`, or disconnect).
-    pub fn lan_browse(&self) {
-        // Stop any prior browse.
-        self.stop_browse();
-        let self_key = match self.shared.config.lock().unwrap().identity.to_identity() {
-            Ok(id) => id.public_bytes(),
-            Err(e) => {
-                self.shared.log("warn", format!("identity error: {e}"));
-                return;
-            }
-        };
-        let shared = Arc::clone(&self.shared);
-        let handle = self.runtime.spawn(async move {
-            let mut browser = match rwk_core::engine::lan_discovery::LanBrowser::bind(self_key) {
-                Ok(b) => b,
-                Err(e) => {
-                    shared.log("warn", format!("LAN browse failed: {e}"));
-                    return;
-                }
-            };
-            shared.log("info", "Browsing the LAN for keyers…");
-            // Emit the (possibly empty) list promptly, then on every change and on a timer so
-            // stale entries prune out of the dropdown.
-            emit_peers(&shared, &mut browser);
-            loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(1), browser.recv_once())
-                    .await
-                {
-                    Ok(Ok(true)) => emit_peers(&shared, &mut browser),
-                    Ok(Ok(false)) => {}
-                    Ok(Err(_)) => break,
-                    Err(_) => emit_peers(&shared, &mut browser), // timeout: re-emit (prunes)
-                }
-            }
-        });
-        *self.browse.lock().unwrap() = Some(handle);
-    }
-
-    fn stop_browse(&self) {
-        if let Some(task) = self.browse.lock().unwrap().take() {
-            task.abort();
-        }
-    }
-
-    /// Picks a browsed keyer by its base64 public key and brings the link up as the initiator,
-    /// then starts replaying its edges onto the radio.
-    pub fn connect_lan(&self, peer_key_b64: &str, peer_endpoint: &str) {
-        let (keying_port, logger_port, key_line, ptt_line) = {
-            let s = self.shared.settings.lock().unwrap();
-            (s.keying_port.clone(), s.logger_port.clone(), s.key_line, s.ptt_line)
-        };
-        // A keying port is not required (see `listen`): best-effort open in `bring_up_replay`.
-        self.shared.clear_error(control::KEYING);
-        let peer_key = match rwk_core::config::base64_decode(peer_key_b64)
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-        {
-            Some(k) => k,
-            None => {
-                self.shared.log("warn", "Invalid keyer selection.");
-                return;
-            }
-        };
-        // The passed endpoint is a hint from the last browse; we re-resolve the keyer's
-        // *current* endpoint just before connecting (below) so a keyer that re-armed on a new
-        // port is still reached. Parse the hint only to validate the UI gave us something.
-        if peer_endpoint.parse::<std::net::SocketAddr>().is_err() {
-            self.shared.log("warn", "Invalid keyer address.");
+        if !announce_server_connecting(
+            &shared,
+            &self.connection,
+            operation,
+            false,
+            "Waiting for the Client to pair…",
+        ) {
             return;
         }
-        let endpoint_hint = peer_endpoint.to_string();
-        self.stop_browse();
-        self.disconnect();
-
-        let shared = Arc::clone(&self.shared);
-        let active_slot = Arc::clone(&self.active);
-        shared.emit(ServerEvent::Connection { state: "connecting".into(), path: "none".into() });
-        shared.log("info", "Connecting to the selected keyer…");
-
-        self.runtime.spawn(async move {
-            let config = shared.config.lock().unwrap().clone();
-            let identity = match config.identity.to_identity() {
-                Ok(id) => id,
-                Err(e) => return fail(&shared, format!("identity error: {e}")),
-            };
-            // Resolve the keyer's current endpoint from a fresh beacon (it may have re-armed on
-            // a new port since the operator browsed), falling back to the browse hint.
-            let self_key = identity.public_bytes();
-            let endpoint = match rwk_core::engine::lan_discovery::LanBrowser::resolve(
-                self_key,
-                peer_key,
-                std::time::Duration::from_secs(4),
-            )
-            .await
-            {
-                Ok(addr) => addr,
-                Err(_) => match endpoint_hint.parse() {
-                    Ok(addr) => addr,
-                    Err(e) => return fail(&shared, format!("invalid keyer address: {e}")),
-                },
-            };
-            let connected = match tunnel::lan_connect_to(&identity, peer_key, endpoint).await {
-                Ok(c) => c,
-                Err(e) => return fail(&shared, format!("LAN link failed: {e}")),
-            };
-            bring_up_replay(
-                &shared,
-                &active_slot,
-                connected,
-                &config,
+        let task_shared = Arc::clone(&shared);
+        let connection = Arc::clone(&self.connection);
+        let handle = self.runtime.spawn(async move {
+            listen_wan(
+                task_shared,
+                connection,
+                operation,
+                transport,
+                relay,
+                token,
                 keying_port,
                 logger_port,
                 key_line,
                 ptt_line,
             )
-                .await;
+            .await;
         });
+        install_server_pending(&self.connection, operation, handle);
+    }
+
+    // ─── LAN advertising (radio-site side) ────────────────────────────────────
+
+    /// Starts or stops the desktop Player's relay-free LAN responder. The Player advertises a
+    /// CW-capable RWKP v2 beacon and waits for the operating Keyer to initiate the tunnel.
+    pub fn lan_advertise(&self, on: bool) {
+        if !on {
+            self.disconnect();
+            return;
+        }
+        let (transport, callsign, keyer_id) = {
+            let settings = self.shared.settings.lock().unwrap();
+            (settings.transport, settings.callsign.clone(), settings.keyer_id.clone())
+        };
+        if transport != Transport::Lan {
+            self.shared.log("warn", "Select LAN before advertising this desktop Player.");
+            return;
+        }
+        if callsign.trim().is_empty() && keyer_id.trim().is_empty() {
+            self.shared.log("warn", "Enter a Player callsign or Player ID before advertising.");
+            return;
+        }
+
+        let operation = self.replace_operation();
+        let display_name = player_display_name(&callsign, &keyer_id);
+        let shared = Arc::clone(&self.shared);
+        if !announce_server_connecting(
+            &shared,
+            &self.connection,
+            operation,
+            true,
+            format!(
+                "Advertising desktop Player {display_name} on the LAN; waiting for an operating Keyer…"
+            ),
+        ) {
+            return;
+        }
+        let task_shared = Arc::clone(&shared);
+        let connection = Arc::clone(&self.connection);
+        let handle = self.runtime.spawn(async move {
+            lan_advertise_and_await(task_shared, connection, operation, callsign, keyer_id).await;
+        });
+        install_server_advertise(&self.connection, operation, handle);
     }
 
     pub fn disconnect(&self) {
-        self.stop_browse();
-        let active = self.active.lock().unwrap().take();
-        if let Some(mut active) = active {
-            active.stop_bus.store(true, Ordering::SeqCst);
-            if let Some(mut logger) = active.logger.take() {
-                logger.stop();
-            }
-            active.heartbeat.abort();
-            active.pump.abort();
-            // Report the teardown before blocking on the session, so the UI cannot stay on a
-            // live link behind a stuck shutdown.
-            self.shared.emit(ServerEvent::KeyState { down: false });
-            self.shared.emit(ServerEvent::Ptt { asserted: false });
-            self.shared.emit(ServerEvent::LoggerSending { active: false });
-            self.shared.emit(ServerEvent::Rtt { ms: None });
-            self.shared
-                .emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
-            self.shared.log("info", "Stopped.");
-            let mut session = active.session;
-            self.runtime.block_on(async { session.shutdown().await });
-        }
+        let _ = self.replace_operation();
+    }
+
+    /// Invalidates all pending setup before any task is aborted or session shutdown is awaited.
+    /// A task that wakes after this point can only discard resources it created privately.
+    fn replace_operation(&self) -> OperationId {
+        let (operation, retired) = replace_server_operation(&self.shared, &self.connection);
+        self.runtime.block_on(shutdown_retired_server_connection(retired));
+        operation
     }
 }
 
@@ -751,31 +797,442 @@ impl Drop for ServerController {
     }
 }
 
-/// The Client stopped sending: end the pairing as `disconnect` does, then report disconnected.
-///
-/// The session is taken out of the slot first, so a later `listen` or `connect_lan` can start at
-/// once. The keying output is forced up by the session's shutdown and the replay driver's own
-/// fail-safes, so the radio is never left keyed. A session already removed by an operator Stop is
-/// left alone, which keeps teardown idempotent.
-async fn drop_lost_peer(shared: &Arc<Shared>, slot: &Arc<Mutex<Option<ActiveSession>>>) {
-    let Some(mut active) = slot.lock().unwrap().take() else {
-        return;
+/// Invalidates the old generation and detaches every externally reachable resource while holding
+/// the same mutex used for replay installation. Shutdown and task abort happen only after the
+/// state becomes unreachable, so old async work cannot affect a replacement operation.
+fn replace_server_operation(
+    shared: &Arc<Shared>,
+    connection: &Arc<Mutex<ServerConnection>>,
+) -> (OperationId, RetiredServerConnection) {
+    let mut state = connection.lock().unwrap();
+    let operation = state.gate.replace();
+    let had_operation = state.operation_active
+        || state.active.is_some()
+        || state.advertise.is_some()
+        || state.pending.is_some();
+    let was_advertising = state.advertising;
+    state.operation_active = false;
+    state.advertising = false;
+    let retired = RetiredServerConnection {
+        active: state.active.take(),
+        advertise: state.advertise.take(),
+        pending: state.pending.take(),
     };
+    if was_advertising {
+        shared.emit(ServerEvent::Advertising { active: false });
+    }
+    if had_operation {
+        // This happens while the installation gate is held. A stale pairing cannot emit a later
+        // connected/replay state after Stop has visibly ended this operation.
+        emit_server_stopped_state(shared);
+    }
+    (operation, retired)
+}
+
+async fn shutdown_retired_server_connection(mut retired: RetiredServerConnection) {
+    if let Some((_operation, task)) = retired.pending.take() {
+        task.abort();
+    }
+    if let Some((_operation, task)) = retired.advertise.take() {
+        task.abort();
+    }
+    if let Some(active) = retired.active.take() {
+        shutdown_active_session(active, true).await;
+    }
+}
+
+/// Stops all replay-side resources owned by a detached active session. `abort_heartbeat` is
+/// false only when the heartbeat itself is doing the liveness teardown.
+async fn shutdown_active_session(mut active: ActiveSession, abort_heartbeat: bool) {
     active.stop_bus.store(true, Ordering::SeqCst);
     if let Some(mut logger) = active.logger.take() {
         logger.stop();
     }
-    // The heartbeat task is the caller and returns right after this, so it is not aborted here.
+    if abort_heartbeat {
+        active.heartbeat.abort();
+    }
     active.pump.abort();
-    // Report the teardown before awaiting the session, so the UI cannot stay on a live link
-    // behind a blocked shutdown.
+    active.session.shutdown().await;
+    active.finished.store(true, Ordering::SeqCst);
+}
+
+fn emit_server_stopped_state(shared: &Arc<Shared>) {
     shared.emit(ServerEvent::KeyState { down: false });
     shared.emit(ServerEvent::Ptt { asserted: false });
     shared.emit(ServerEvent::LoggerSending { active: false });
     shared.emit(ServerEvent::Rtt { ms: None });
     shared.emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
-    shared.log("warn", "The Client stopped responding; disconnected.");
-    active.session.shutdown().await;
+    shared.log("info", "Stopped.");
+}
+
+/// Announces a current operation and records its visible state under the installation gate.
+/// Recording this before spawning closes Stop's spawn-to-handle registration window.
+fn announce_server_connecting(
+    shared: &Arc<Shared>,
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    advertising: bool,
+    message: impl Into<String>,
+) -> bool {
+    let mut state = connection.lock().unwrap();
+    if !state.permits(operation) {
+        return false;
+    }
+    state.operation_active = true;
+    state.advertising = advertising;
+    shared.emit(ServerEvent::Connection { state: "connecting".into(), path: "none".into() });
+    if advertising {
+        shared.emit(ServerEvent::Advertising { active: true });
+    }
+    shared.log("info", message);
+    true
+}
+
+fn install_server_pending(
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut state = connection.lock().unwrap();
+    if state.permits(operation) && state.operation_active {
+        if let Some((_previous_operation, previous)) = state.pending.replace((operation, handle)) {
+            previous.abort();
+        }
+    } else {
+        handle.abort();
+    }
+}
+
+fn install_server_advertise(
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut state = connection.lock().unwrap();
+    if state.permits(operation) && state.operation_active {
+        if let Some((_previous_operation, previous)) = state.advertise.replace((operation, handle)) {
+            previous.abort();
+        }
+    } else {
+        handle.abort();
+    }
+}
+
+fn server_operation_is_current(
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+) -> bool {
+    connection.lock().unwrap().permits(operation)
+}
+
+fn emit_server_advertising_if_current(
+    shared: &Arc<Shared>,
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    active: bool,
+) -> bool {
+    let mut state = connection.lock().unwrap();
+    if !state.permits(operation) {
+        return false;
+    }
+    state.advertising = active;
+    shared.emit(ServerEvent::Advertising { active });
+    true
+}
+
+fn emit_server_rtt_if_current(
+    shared: &Arc<Shared>,
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    ms: Option<u32>,
+) -> bool {
+    let state = connection.lock().unwrap();
+    if !state.permits(operation) {
+        return false;
+    }
+    shared.emit(ServerEvent::Rtt { ms });
+    true
+}
+
+fn log_server_if_current(
+    shared: &Arc<Shared>,
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    level: &str,
+    message: impl Into<String>,
+) -> bool {
+    let state = connection.lock().unwrap();
+    if !state.permits(operation) {
+        return false;
+    }
+    shared.log(level, message);
+    true
+}
+
+fn fail_server_operation(
+    shared: &Arc<Shared>,
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    message: impl Into<String>,
+) {
+    let state = connection.lock().unwrap();
+    if !state.permits(operation) {
+        return;
+    }
+    shared.log("warn", message);
+    shared.emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
+}
+
+/// Runs one WAN listener operation without changing relay or token semantics. The operation
+/// gate is checked before and after the relay await, then again by replay installation.
+#[allow(clippy::too_many_arguments)]
+async fn listen_wan(
+    shared: Arc<Shared>,
+    connection: Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    transport: Transport,
+    relay: String,
+    token: String,
+    keying_port: Option<String>,
+    logger_port: Option<String>,
+    key_line: KeyingLine,
+    ptt_line: Option<KeyingLine>,
+) {
+    if !server_operation_is_current(&connection, operation) {
+        return;
+    }
+    let base = shared.config.lock().unwrap().clone();
+    let config = match pairing::build_config(&base, Role::Station, transport, &token, &relay) {
+        Ok(config) => config,
+        Err(error) => {
+            fail_server_operation(&shared, &connection, operation, error);
+            return;
+        }
+    };
+    if !server_operation_is_current(&connection, operation) {
+        return;
+    }
+
+    // Retry the relay rendezvous once (750 ms) via the shared helper, so a transient relay race
+    // just after a Client restart does not fail the listen immediately — the same resilience the
+    // Client's connect path has.
+    let connected = connect_with_relay_retry(&config).await;
+    if !server_operation_is_current(&connection, operation) {
+        // A completed `Connected` is dropped before it is turned into a Session.
+        return;
+    }
+    let connected = match connected {
+        Ok(connected) => connected,
+        Err(error) => {
+            fail_server_operation(&shared, &connection, operation, format!("link failed: {error}"));
+            return;
+        }
+    };
+    let _ = bring_up_replay(
+        &shared,
+        &connection,
+        operation,
+        connected,
+        &config,
+        keying_port,
+        logger_port,
+        key_line,
+        ptt_line,
+    )
+    .await;
+}
+
+/// Persistent desktop Player LAN responder. Each cycle binds a fresh WireGuard listener,
+/// broadcasts its RWKP v2 CW-capability beacon, waits for the Keyer's initiator handshake, and
+/// resumes advertising after the selected Keyer session ends.
+async fn lan_advertise_and_await(
+    shared: Arc<Shared>,
+    connection: Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    callsign: String,
+    keyer_id: String,
+) {
+    if !server_operation_is_current(&connection, operation) {
+        return;
+    }
+    let identity = match shared.config.lock().unwrap().identity.to_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = emit_server_advertising_if_current(&shared, &connection, operation, false);
+            fail_server_operation(&shared, &connection, operation, format!("identity error: {error}"));
+            return;
+        }
+    };
+    let public_key = identity.public_bytes();
+    let display_name = player_display_name(&callsign, &keyer_id);
+
+    loop {
+        if !server_operation_is_current(&connection, operation) {
+            return;
+        }
+        let bound = tunnel::lan_bind().await;
+        if !server_operation_is_current(&connection, operation) {
+            // The newly bound socket is dropped before it can advertise or accept a tunnel.
+            return;
+        }
+        let (socket, wg_port) = match bound {
+            Ok(bound) => bound,
+            Err(error) => {
+                let _ = emit_server_advertising_if_current(&shared, &connection, operation, false);
+                fail_server_operation(&shared, &connection, operation, format!("LAN bind failed: {error}"));
+                return;
+            }
+        };
+        let beacon = Beacon {
+            callsign: callsign.clone(),
+            keyer_id: keyer_id.clone(),
+            public_key,
+            wg_port,
+            capabilities: CAPABILITY_CW,
+        };
+        let advertiser = match LanAdvertiser::new(beacon) {
+            Ok(advertiser) => advertiser,
+            Err(error) => {
+                let _ = emit_server_advertising_if_current(&shared, &connection, operation, false);
+                fail_server_operation(&shared, &connection, operation, format!("LAN advertise failed: {error}"));
+                return;
+            }
+        };
+        if !server_operation_is_current(&connection, operation) {
+            return;
+        }
+        // The wrapper aborts the child if this responder is cancelled while awaiting the
+        // initiator. A parent JoinHandle dropping would otherwise detach the beacon task.
+        let mut beacon_task = AbortOnDrop::new(tokio::spawn(advertiser.run()));
+        if !emit_server_advertising_if_current(&shared, &connection, operation, true) {
+            return;
+        }
+
+        // This Player owns the bound socket and stays the WireGuard responder. The operating
+        // Keyer resolves the beacon, validates it locally, and calls `lan_connect_to`.
+        let connected = tunnel::lan_await_initiator(socket, &identity).await;
+        beacon_task.abort();
+        if !emit_server_advertising_if_current(&shared, &connection, operation, false) {
+            return;
+        }
+
+        match connected {
+            Ok(connected) => {
+                if !server_operation_is_current(&connection, operation) {
+                    return;
+                }
+                let config = shared.config.lock().unwrap().clone();
+                let (keying_port, logger_port, key_line, ptt_line) = {
+                    let settings = shared.settings.lock().unwrap();
+                    (
+                        settings.keying_port.clone(),
+                        settings.logger_port.clone(),
+                        settings.key_line,
+                        settings.ptt_line,
+                    )
+                };
+                if !server_operation_is_current(&connection, operation) {
+                    return;
+                }
+                if let Some(finished) = bring_up_replay(
+                    &shared,
+                    &connection,
+                    operation,
+                    connected,
+                    &config,
+                    keying_port,
+                    logger_port,
+                    key_line,
+                    ptt_line,
+                )
+                .await
+                {
+                    wait_for_active_session_end(&connection, operation, &finished).await;
+                }
+                if !announce_server_connecting(
+                    &shared,
+                    &connection,
+                    operation,
+                    false,
+                    format!(
+                        "Operating Keyer disconnected; advertising desktop Player {display_name} again."
+                    ),
+                ) {
+                    return;
+                }
+            }
+            Err(error) => {
+                if !log_server_if_current(
+                    &shared,
+                    &connection,
+                    operation,
+                    "warn",
+                    format!("LAN responder cycle ended: {error}; advertising again."),
+                ) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Waits only for the active session owned by this LAN operation. A replacement generation
+/// returns immediately rather than waiting on or observing a newer replay stack.
+async fn wait_for_active_session_end(
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    finished: &Arc<AtomicBool>,
+) {
+    loop {
+        let still_waiting = {
+            let state = connection.lock().unwrap();
+            if !state.permits(operation) {
+                return;
+            }
+            state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.operation == operation)
+                || !finished.load(Ordering::SeqCst)
+        };
+        if !still_waiting {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// The Client stopped sending: end this operation's pairing as `disconnect` does, then report
+/// disconnected. The operation and active-session identity checks prevent an old heartbeat from
+/// taking a newer session after a replacement listener or LAN responder has started.
+async fn drop_lost_peer(
+    shared: &Arc<Shared>,
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+) {
+    let active = {
+        let mut state = connection.lock().unwrap();
+        if !state.permits(operation)
+            || !state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.operation == operation)
+        {
+            return;
+        }
+        let active = state.active.take().expect("checked active session");
+        // Report teardown while holding the same gate as replay installation, so an old
+        // heartbeat cannot emit disconnected for a newer operation.
+        shared.emit(ServerEvent::KeyState { down: false });
+        shared.emit(ServerEvent::Ptt { asserted: false });
+        shared.emit(ServerEvent::LoggerSending { active: false });
+        shared.emit(ServerEvent::Rtt { ms: None });
+        shared.emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
+        shared.log("warn", "The Client stopped responding; disconnected.");
+        active
+    };
+    // The heartbeat task is the caller and returns right after this, so it is not aborted here.
+    shutdown_active_session(active, false).await;
 }
 
 /// The edge's round-trip time in whole milliseconds, or [`None`] before the first pong.
@@ -783,93 +1240,157 @@ fn rtt_millis(edge: &EdgeTransport) -> Option<u32> {
     edge.rtt().map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
 }
 
-fn fail(shared: &Arc<Shared>, message: String) {
-    shared.log("warn", message);
-    shared.emit(ServerEvent::Connection { state: "disconnected".into(), path: "none".into() });
+/// Starts the Server liveness task for one installed replay stack. Each awaited edge operation
+/// is bracketed by a generation check, and `drop_lost_peer` additionally requires the matching
+/// active-session operation before it can remove anything.
+fn spawn_server_heartbeat(
+    shared: Arc<Shared>,
+    connection: Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
+    edge: Arc<EdgeTransport>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let mut beats: u32 = 0;
+        loop {
+            tick.tick().await;
+            if !server_operation_is_current(&connection, operation) {
+                return;
+            }
+            // Silence watchdog: the Client's heartbeats and pings arrive on the same edge, so a
+            // long gap means it has closed or lost its link. Tear this pairing down now.
+            if edge.peer_silent_for() >= PEER_SILENCE_TIMEOUT {
+                drop_lost_peer(&shared, &connection, operation).await;
+                return;
+            }
+            if edge.send_heartbeat().await.is_err() {
+                // A failed heartbeat is already folded into PathHealth/F9; keep beaconing.
+            }
+            if !server_operation_is_current(&connection, operation) {
+                return;
+            }
+            let _ = edge.send_ping().await;
+            if !server_operation_is_current(&connection, operation) {
+                return;
+            }
+            beats = beats.wrapping_add(1);
+            if beats % RTT_EVERY_TICKS == 0
+                && !emit_server_rtt_if_current(
+                    &shared,
+                    &connection,
+                    operation,
+                    rtt_millis(&edge),
+                )
+            {
+                return;
+            }
+        }
+    })
 }
 
-/// Shared post-connect setup for both the WAN (`listen`) and LAN (`connect_lan`) paths: open
-/// the keying edge over the tunnel, open the serial keying output, spawn the replay driver,
-/// and install the running session. Reports connected (or fails) through the sink.
+/// Shared post-connect setup for WAN (`listen`) and desktop LAN responder (`lan_advertise`):
+/// open the keying edge over the tunnel and atomically install the replay stack while this
+/// operation remains current. A stale Session is shut down without ever starting a driver,
+/// edge pump, heartbeat, logger, or active-slot publication.
 #[allow(clippy::too_many_arguments)]
 async fn bring_up_replay(
     shared: &Arc<Shared>,
-    active_slot: &Arc<Mutex<Option<ActiveSession>>>,
+    connection: &Arc<Mutex<ServerConnection>>,
+    operation: OperationId,
     connected: tunnel::Connected,
     config: &Config,
     keying_port: Option<String>,
     logger_port: Option<String>,
     key_line: KeyingLine,
     ptt_line: Option<KeyingLine>,
-) {
+) -> Option<Arc<AtomicBool>> {
+    if !server_operation_is_current(connection, operation) {
+        return None;
+    }
     let path = format!("{:?}", connected.path).to_lowercase();
-    let session = match Session::start(connected, config) {
-        Ok(s) => s,
-        Err(e) => return fail(shared, format!("session failed: {e}")),
+    let mut session = match Session::start(connected, config) {
+        Ok(session) => session,
+        Err(error) => {
+            fail_server_operation(shared, connection, operation, format!("session failed: {error}"));
+            return None;
+        }
     };
+    if !server_operation_is_current(connection, operation) {
+        session.shutdown().await;
+        return None;
+    }
     let net = session.handle();
     let conn = match net.open_udp(EDGE_PORT).await {
-        Ok(c) => c,
-        Err(e) => return fail(shared, format!("edge open failed: {e}")),
+        Ok(conn) => conn,
+        Err(error) => {
+            fail_server_operation(shared, connection, operation, format!("edge open failed: {error}"));
+            session.shutdown().await;
+            return None;
+        }
     };
+    if !server_operation_is_current(connection, operation) {
+        session.shutdown().await;
+        return None;
+    }
     let edge = Arc::new(EdgeTransport::over_tunnel(conn));
     let peer = std::net::SocketAddr::new(
         std::net::IpAddr::V4(Role::Station.peer_inner_address()),
         EDGE_PORT,
     );
     edge.set_peer(peer).await;
+    if !server_operation_is_current(connection, operation) {
+        session.shutdown().await;
+        return None;
+    }
 
-    let clock: Arc<dyn Clock> = Arc::new(MonotonicClock);
-    let (pump, stop_bus, logger, arbiter) = start_replay_driver(
-        shared,
-        &edge,
-        &clock,
-        keying_port,
-        key_line,
-        ptt_line,
-        logger_port,
-    );
-
-    // Beacon a liveness heartbeat to the Client so it can tell the Player is up even when no
-    // CW is flowing. The Client times out and reconnects if these stop arriving.
-    // Each tick also sends a ping the Client answers, so this side can measure the round trip
-    // the UI shows.
-    let hb_edge = Arc::clone(&edge);
-    let rtt_shared = Arc::clone(shared);
-    let watch_slot = Arc::clone(active_slot);
-    let watch_edge = Arc::clone(&edge);
-    let heartbeat = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
-        let mut beats: u32 = 0;
-        loop {
-            tick.tick().await;
-            // Silence watchdog: the Client's heartbeats and pings arrive on the same edge, so a
-            // long gap means it has closed or lost its link. Tear the pairing down now.
-            if watch_edge.peer_silent_for() >= PEER_SILENCE_TIMEOUT {
-                drop_lost_peer(&rtt_shared, &watch_slot).await;
-                return;
-            }
-            if hb_edge.send_heartbeat().await.is_err() {
-                // A failed heartbeat is already folded into PathHealth/F9; keep beaconing.
-            }
-            let _ = hb_edge.send_ping().await;
-            beats = beats.wrapping_add(1);
-            if beats % RTT_EVERY_TICKS == 0 {
-                rtt_shared.emit(ServerEvent::Rtt { ms: rtt_millis(&hb_edge) });
-            }
+    let message = format!("Paired with the keyer over the {path} path.");
+    let mut session_to_install = Some(session);
+    let finished = {
+        // Resource construction is synchronous, so holding this short gate through driver,
+        // pump, heartbeat, and active-slot creation makes Stop/replacement either win before
+        // any replay resources exist or take the complete stack immediately afterwards.
+        let mut state = connection.lock().unwrap();
+        if !state.permits_replay_install(operation) {
+            None
+        } else {
+            let clock: Arc<dyn Clock> = Arc::new(MonotonicClock);
+            let (pump, stop_bus, logger, arbiter) = start_replay_driver(
+                shared,
+                &edge,
+                &clock,
+                keying_port,
+                key_line,
+                ptt_line,
+                logger_port,
+            );
+            let finished = Arc::new(AtomicBool::new(false));
+            let heartbeat = spawn_server_heartbeat(
+                Arc::clone(shared),
+                Arc::clone(connection),
+                operation,
+                Arc::clone(&edge),
+            );
+            state.active = Some(ActiveSession {
+                operation,
+                session: session_to_install.take().expect("session not yet installed"),
+                pump,
+                stop_bus,
+                finished: Arc::clone(&finished),
+                logger,
+                arbiter,
+                heartbeat,
+            });
+            shared.emit(ServerEvent::Connection { state: "connected".into(), path: path.clone() });
+            shared.log("info", message);
+            Some(finished)
         }
-    });
-
-    *active_slot.lock().unwrap() = Some(ActiveSession {
-        session,
-        pump,
-        stop_bus,
-        logger,
-        arbiter,
-        heartbeat,
-    });
-    shared.emit(ServerEvent::Connection { state: "connected".into(), path: path.clone() });
-    shared.log("info", format!("Paired with the keyer over the {path} path."));
+    };
+    if finished.is_none() {
+        if let Some(mut session) = session_to_install.take() {
+            session.shutdown().await;
+        }
+    }
+    finished
 }
 
 /// The keying output for `port` with the given lines: a serial adapter when a port is chosen and
@@ -1090,9 +1611,30 @@ fn line_name(line: KeyingLine) -> &'static str {
     }
 }
 
+/// The human-friendly identity a desktop Player advertises and logs on the LAN.
+fn player_display_name(callsign: &str, keyer_id: &str) -> String {
+    match (callsign.trim(), keyer_id.trim()) {
+        ("", "") => "(unnamed Player)".to_string(),
+        (callsign, "") => callsign.to_string(),
+        ("", keyer_id) => keyer_id.to_string(),
+        (callsign, keyer_id) => format!("{callsign}-{keyer_id}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_operation_id_cannot_pass_server_replay_installation_gate() {
+        let mut connection = ServerConnection::default();
+        let stale = connection.gate.replace();
+        let current = connection.gate.replace();
+        connection.operation_active = true;
+
+        assert!(!connection.permits_replay_install(stale));
+        assert!(connection.permits_replay_install(current));
+    }
 
     fn recording_sink() -> (EventSink, Arc<Mutex<Vec<ServerEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1103,6 +1645,13 @@ mod tests {
 
     fn controller(sink: EventSink) -> ServerController {
         ServerController::start_with_config(sink, None)
+    }
+
+    #[test]
+    fn player_display_name_keeps_the_callsign_and_optional_label() {
+        assert_eq!(player_display_name("W1VE", "20m"), "W1VE-20m");
+        assert_eq!(player_display_name(" W1VE ", ""), "W1VE");
+        assert_eq!(player_display_name("", "20m"), "20m");
     }
 
     #[test]
@@ -1130,6 +1679,11 @@ mod tests {
         let first = ServerController::start_with_config(sink, Some(path.clone()));
         first.select_keying_port(Some("COM3".into()));
         first.select_logger_port(Some("COM4".into()));
+        first.set_callsign("W1VE");
+        first.set_keyer_id("20m");
+        first.set_transport("lan");
+        first.set_relay("198.51.100.9:9999");
+        let token = first.shared.settings.lock().unwrap().token.clone();
         // Attempting to set keying port to logger port is rejected.
         first.select_keying_port(Some("COM4".into()));
         assert_eq!(first.shared.settings.lock().unwrap().keying_port.as_deref(), Some("COM3"));
@@ -1140,6 +1694,11 @@ mod tests {
         let s = second.shared.settings.lock().unwrap();
         assert_eq!(s.keying_port.as_deref(), Some("COM3"));
         assert_eq!(s.logger_port.as_deref(), Some("COM4"));
+        assert_eq!(s.callsign, "W1VE");
+        assert_eq!(s.keyer_id, "20m");
+        assert_eq!(s.transport, Transport::Lan);
+        assert_eq!(s.relay, "198.51.100.9:9999");
+        assert_eq!(s.token, token, "the WAN token survives a restart");
         drop(s);
         drop(second);
         let _ = std::fs::remove_file(&path);

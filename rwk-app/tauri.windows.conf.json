@@ -1,0 +1,17 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "W1VE Remote Keyer Router",
+        "backgroundColor": "#0f1115",
+        "visible": false,
+        "width": 980,
+        "height": 640,
+        "minWidth": 900,
+        "minHeight": 560,
+        "resizable": true
+      }
+    ]
+  }
+}

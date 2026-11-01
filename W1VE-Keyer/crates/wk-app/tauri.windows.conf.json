@@ -1,0 +1,17 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "W1VE Keyer",
+        "width": 580,
+        "height": 760,
+        "minWidth": 540,
+        "minHeight": 620,
+        "resizable": true,
+        "backgroundColor": "#0f1115",
+        "visible": false
+      }
+    ]
+  }
+}

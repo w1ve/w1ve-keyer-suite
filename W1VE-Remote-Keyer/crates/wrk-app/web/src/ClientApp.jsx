@@ -47,8 +47,8 @@ function loadMacros() {
   return DEFAULT_MACROS;
 }
 
-// The Remote Keyer Client: keyer settings, sidetone, input ports, CW macros, and a WAN/LAN
-// pairing panel where the operator enters the token the Player shows.
+// The Remote Keyer Client: keyer settings, sidetone, input ports, CW macros, and WAN/LAN
+// pairing controls. On LAN it browses and selects desktop or W1VE ESP32 Players.
 export default function ClientApp() {
   const [settings, setSettings] = useState({
     wpm: 20,
@@ -61,14 +61,13 @@ export default function ClientApp() {
     audioDevice: null,
     transport: "wan",
     relay: "",
-    callsign: "",
-    keyerId: "",
   });
   const [connection, setConnection] = useState({ state: "disconnected", path: "none" });
   const [keyDown, setKeyDown] = useState(false);
   const [rtt, setRtt] = useState(null); // round-trip ms to the Player, null until measured
   const [sending, setSending] = useState(false);
-  const [advertising, setAdvertising] = useState(false);
+  const [lanPlayers, setLanPlayers] = useState([]);
+  const [pickedSelection, setPickedSelection] = useState(null);
   const [log, setLog] = useState([]);
 
   const [ports, setPorts] = useState([]);
@@ -102,11 +101,11 @@ export default function ClientApp() {
             audioDevice: ev.audio_device ?? null,
             transport: ev.transport,
             relay: ev.relay,
-            callsign: ev.callsign ?? "",
-            keyerId: ev.keyer_id ?? "",
           });
           setPaddlePort(ev.paddle_port ?? "");
           setLoggerPort(ev.logger_port ?? "");
+          // Pre-fill the remembered token, but never overwrite what the operator is typing.
+          setToken((current) => current || ev.token || "");
           break;
         case "connection":
           setConnection({ state: ev.state, path: ev.path });
@@ -120,8 +119,8 @@ export default function ClientApp() {
         case "sending":
           setSending(ev.active);
           break;
-        case "advertising":
-          setAdvertising(ev.active);
+        case "lanPlayers":
+          setLanPlayers(ev.players || []);
           break;
         case "ports":
           setPorts(ev.available || []);
@@ -180,6 +179,22 @@ export default function ClientApp() {
     };
   }, []);
 
+  // Start one fresh combined discovery pass whenever LAN becomes the selected transport. The
+  // backend owns the bounded query cadence and does not create a session until Connect.
+  useEffect(() => {
+    if (settingsLoaded && settings.transport === "lan") {
+      api.lanBrowse().catch(() => {});
+    }
+  }, [settingsLoaded, settings.transport]);
+
+  // Keep the tagged selection valid as discovery records arrive, expire, or report ESP32 busy.
+  useEffect(() => {
+    const selected = lanPlayers.find((player) => sameSelection(player, pickedSelection));
+    if (selected && !(selected.kind === "esp" && selected.busy)) return;
+    const next = lanPlayers.find((player) => player.kind !== "esp" || !player.busy);
+    setPickedSelection(next ? selectionForPlayer(next) : null);
+  }, [lanPlayers, pickedSelection]);
+
   // Global ESC: abort sending from anywhere in the window (e.g. while a macro plays and the
   // type-ahead box is not focused). The type-ahead box also handles ESC to clear itself.
   useEffect(() => {
@@ -223,7 +238,15 @@ export default function ClientApp() {
   const paired = connection.state === "connected";
   const connecting = connection.state === "connecting";
   const pathText =
-    paired ? (connection.path === "relay" ? "DERP" : "Direct") : connecting ? "Pairing…" : "Disconnected";
+    paired
+      ? connection.path === "relay"
+        ? "DERP"
+        : connection.path === "esp"
+          ? "W1VE ESP32 Player LAN"
+          : "Direct"
+      : connecting
+        ? "Pairing…"
+        : "Disconnected";
   const linkColor = paired ? "var(--good)" : connecting ? "var(--warn)" : "var(--text-dim)";
 
   // Audio selection model: settings.audioDevice is null (follow system default), "" (off), or a
@@ -494,46 +517,45 @@ export default function ClientApp() {
               </>
             ) : (
               <>
-                <div className="field" style={{ marginBottom: 0 }}>
-                  <label>Station Callsign</label>
-                  <input
-                    type="text"
-                    value={settings.callsign}
-                    placeholder="Station Callsign"
+                <div className="field" style={{ marginBottom: 0, minWidth: 280 }}>
+                  <label>Available Players</label>
+                  <select
+                    value={pickedSelection ? selectionKey(pickedSelection) : ""}
                     disabled={paired || connecting}
                     onChange={(e) => {
-                      setSettings((s) => ({ ...s, callsign: e.target.value }));
-                      api.setCallsign(e.target.value);
+                      const player = lanPlayers.find((item) => selectionKey(item) === e.target.value);
+                      setPickedSelection(player ? selectionForPlayer(player) : null);
                     }}
-                    style={{ width: 130 }}
-                  />
+                  >
+                    <option value="">{lanPlayers.length ? "(choose a Player)" : "(searching…)"}</option>
+                    {lanPlayers.map((player) => (
+                      <option
+                        key={selectionKey(player)}
+                        value={selectionKey(player)}
+                        disabled={player.kind === "esp" && player.busy}
+                      >
+                        {playerOptionLabel(player)}
+                      </option>
+                    ))}
+                  </select>
                 </div>
-                <div className="field" style={{ marginBottom: 0 }}>
-                  <label>Keyer ID</label>
-                  <input
-                    type="text"
-                    value={settings.keyerId}
-                    placeholder="Keyer ID (20m, etc.)"
-                    disabled={paired || connecting}
-                    onChange={(e) => {
-                      setSettings((s) => ({ ...s, keyerId: e.target.value }));
-                      api.setKeyerId(e.target.value);
-                    }}
-                    style={{ width: 150 }}
-                  />
+                <div style={{ alignSelf: "flex-end" }}>
+                  <button onClick={() => api.lanBrowse()} disabled={paired || connecting}>
+                    Refresh
+                  </button>
                 </div>
-                <div>
+                <div style={{ alignSelf: "flex-end" }}>
                   {paired || connecting ? (
-                    <button onClick={() => api.lanAdvertise(false)} style={{ background: "#5a2d2d" }}>
-                      {connecting ? "Stop" : "Unpair"}
+                    <button onClick={() => api.disconnect()} style={{ background: "#5a2d2d" }}>
+                      {connecting ? "Cancel" : "Unpair"}
                     </button>
                   ) : (
                     <button
-                      onClick={() => api.lanAdvertise(true)}
-                      disabled={!settings.callsign.trim()}
+                      onClick={() => pickedSelection && api.connectLan(pickedSelection)}
+                      disabled={!pickedSelection}
                       style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
                     >
-                      Advertise
+                      Connect
                     </button>
                   )}
                 </div>
@@ -542,15 +564,14 @@ export default function ClientApp() {
             {connecting && !paired && (
               <div className="row" style={{ gap: 8, alignSelf: "flex-end" }}>
                 <RadarSweep size={56} />
-                <span style={{ fontSize: 13, color: "var(--text-dim)" }}>Pairing...</span>
+                <span style={{ fontSize: 13, color: "var(--text-dim)" }}>Pairing…</span>
               </div>
             )}
           </div>
           {settings.transport === "lan" && (
             <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0, marginTop: 8 }}>
-              {advertising
-                ? `Advertising as ${lanName(settings)} — pick this keyer on the Player.`
-                : "Enter your callsign (and an optional ID), then Advertise so the Player can find and pick this keyer. No relay, no internet."}
+              Choose an available desktop Player or W1VE ESP32 Player advertising on your LAN, then Connect.
+              W1VE ESP32 Players marked busy cannot be selected. No relay, no internet.
             </p>
           )}
         </div>
@@ -600,12 +621,30 @@ export default function ClientApp() {
   );
 }
 
-// The display name a keyer advertises: callsign-keyerId (or just callsign).
-function lanName(settings) {
-  const c = (settings.callsign || "").trim();
-  const id = (settings.keyerId || "").trim();
-  if (c && id) return `${c}-${id}`;
-  return c || id || "(unnamed)";
+// The selected value remains a tagged model, so a desktop tunnel identity can never be confused
+// with a W1VE ESP32 Player identity in the bridge call.
+function selectionForPlayer(player) {
+  return { kind: player.kind, id: player.id, endpoint: player.endpoint };
+}
+
+function sameSelection(player, selection) {
+  return Boolean(
+    selection &&
+      player.kind === selection.kind &&
+      player.id === selection.id &&
+      player.endpoint === selection.endpoint,
+  );
+}
+
+function selectionKey(selection) {
+  return `${selection.kind}|${selection.id}|${selection.endpoint}`;
+}
+
+function playerOptionLabel(player) {
+  if (player.kind === "esp") {
+    return `W1VE ESP32 Player — ${player.name}${player.busy ? " (busy)" : ""}`;
+  }
+  return `Desktop Player — ${player.name}`;
 }
 
 function PortSelect({ label, value, ports, error, onChange }) {

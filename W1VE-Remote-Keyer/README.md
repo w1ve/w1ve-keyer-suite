@@ -12,14 +12,19 @@ own, with no port forwarding or FlexRadio router.
 
 ## Transport: WAN / LAN
 
-A segmented slider on both apps chooses how the two ends meet:
+A segmented slider on each app chooses how the two ends meet:
 
 * **WAN** — the public W1VE relay on the internet. Zero network setup: no port forwarding, no
   static IP. The WireGuard tunnel goes peer-to-peer when NATs allow, else over the relay.
-* **LAN** — a relay reachable on the local network (often the Player itself). After the brief
-  rendezvous the two hole-punch and all keyed traffic stays on the LAN.
+* **LAN** — the desktop radio-site Player advertises its persisted callsign and optional Player
+  ID, such as `W1VE-20m`, in an RWKP v2 beacon with CW capability. It waits as the WireGuard
+  responder. The operating-position Client browses available desktop Players, validates the
+  selected identity and endpoint, and initiates the tunnel. A **W1VE ESP32 Player** advertises
+  separately; the Client lists it alongside desktop Players and runs one bounded, paced unicast
+  discovery pass when browsing starts for Wi-Fi networks that suppress broadcasts.
 
-The Player shows a short **pairing token**; the Operator enters it. No key copying by hand.
+WAN pairing uses a short pairing token. LAN selection uses no ESP PIN or persistent ESP secret;
+the ESP32 path is for trusted local networks only.
 
 ## Architecture
 
@@ -27,9 +32,9 @@ The Player shows a short **pairing token**; the Operator enters it. No key copyi
 W1VE-Remote-Keyer/
   Cargo.toml                     workspace (reuses ../common/rwk-core)
   crates/wrk-app/
-    src/pairing.rs               WAN/LAN transport + pairing token → rwk-core Config
-    src/client_controller.rs     Client: keyer, sidetone, paddle, send edges over the tunnel
-    src/server_controller.rs     Player: replay driver keys the radio from received edges
+    src/pairing.rs               WAN relay/token config and LAN boundary
+    src/client_controller.rs     Client: keyer, sidetone, Player browsing, edge sending
+    src/server_controller.rs     Player: LAN advertisement and radio replay driver
     src/app_paths.rs             per-user config.json (stable WireGuard identity)
     src/lib.rs                   two Tauri binaries (wrk-client, wrk-server) + commands
     web/                         React UI (ClientApp, ServerApp, WAN/LAN slider)

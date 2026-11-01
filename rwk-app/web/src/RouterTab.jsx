@@ -3,16 +3,23 @@ import { api } from "./api.js";
 import { WIZARD_CATALOG } from "./wizardCatalog.js";
 
 // The Ham Router tab: the forward-rule table, add/remove/enable controls, a port-forward
-// wizard, and the FlexRadio discovery re-emission toggle. Rules are managed on the Client and
-// pushed to the Station over the control channel, so the Station needs no manual config.
-export default function RouterTab({ rules, flexEnabled, connected }) {
+// wizard, and the FlexRadio discovery re-emission toggle. Desktop Players with Router capability
+// receive the rules over the control channel; the tab is not rendered for CW-only ESP sessions.
+export default function RouterTab({ rules, flexEnabled, connected, routerAvailable = true }) {
   const [wizardOpen, setWizardOpen] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
   // The rule being edited in the form, or null when adding a new one.
   const [editRule, setEditRule] = useState(null);
+  const unavailable = !routerAvailable;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }} aria-disabled={unavailable}>
+      {unavailable && (
+        <div className="panel" style={{ color: "var(--warn)", fontSize: 13 }}>
+          The selected desktop Player does not advertise Router capability. Forwarding and FlexRadio discovery are disabled for this pairing.
+        </div>
+      )}
+      <div style={unavailable ? { opacity: 0.5, pointerEvents: "none" } : undefined}>
       <div className="panel">
         <div className="row spread" style={{ marginBottom: 10 }}>
           <h3 style={{ margin: 0 }}>Port Forwarding</h3>
@@ -123,6 +130,7 @@ export default function RouterTab({ rules, flexEnabled, connected }) {
           }}
         />
       )}
+      </div>
     </div>
   );
 }

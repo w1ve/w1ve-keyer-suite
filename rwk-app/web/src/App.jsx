@@ -24,13 +24,11 @@ const DEFAULT_SETTINGS = {
   winkeyerPort: null,
   transport: "wan",
   relay: "",
-  callsign: "",
-  keyerId: "",
 };
 
-// The Client application shell: the Remote Keyer's status bar (RTT, then Disconnected / Pairing /
-// Direct / DERP at the top right), the Keyer and Ham Router tabs, and a log drawer. The bottom-left
-// shows whether FlexRadio discovery is enabled.
+// The Client application shell: its status bar reports relay, direct desktop, or W1VE ESP32
+// pairing; it contains the Keyer and capability-gated Ham Router tabs plus a log drawer. The
+// bottom-left shows whether FlexRadio discovery is enabled.
 export default function App() {
   const [tab, setTab] = useState("keyer");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
@@ -38,7 +36,8 @@ export default function App() {
   const [rtt, setRtt] = useState(null);
   const [keyDown, setKeyDown] = useState(false);
   const [sending, setSending] = useState(false);
-  const [advertising, setAdvertising] = useState(false);
+  const [lanPlayers, setLanPlayers] = useState([]);
+  const [routerStatus, setRouterStatus] = useState({ available: true, espActive: false });
   const [ports, setPorts] = useState([]);
   const [audioDevices, setAudioDevices] = useState([]);
   const [errors, setErrors] = useState({}); // control -> short red message
@@ -72,8 +71,7 @@ export default function App() {
             winkeyerPort: ev.winkeyer_port ?? null,
             transport: ev.transport ?? "wan",
             relay: ev.relay ?? "",
-            callsign: ev.callsign ?? "",
-            keyerId: ev.keyer_id ?? "",
+            pairingCode: ev.pairing_code ?? "",
           });
           break;
         case "ports":
@@ -104,8 +102,11 @@ export default function App() {
         case "sending":
           setSending(ev.active);
           break;
-        case "advertising":
-          setAdvertising(ev.active);
+        case "lanPlayers":
+          setLanPlayers(ev.players || []);
+          break;
+        case "routerStatus":
+          setRouterStatus({ available: ev.available ?? true, espActive: ev.esp_active ?? false });
           break;
         case "forwardRules":
           setForwardRules(ev.rules || []);
@@ -170,6 +171,12 @@ export default function App() {
     };
   }, []);
 
+  // ESP Player sessions are deliberately CW-only, so force any already-open Router view back to
+  // Keyer as soon as the backend reports that transport.
+  useEffect(() => {
+    if (routerStatus.espActive && tab === "router") setTab("keyer");
+  }, [routerStatus.espActive, tab]);
+
   // Pair through the relay in settings (the built-in one until the operator changes it).
   function onPair(token) {
     pendingToken.current = token;
@@ -189,7 +196,9 @@ export default function App() {
   const pathText = paired
     ? connection.path === "relay"
       ? "DERP"
-      : "Direct"
+      : connection.path === "esp"
+        ? "W1VE ESP32 Player"
+        : "Direct"
     : connecting
       ? "Pairing…"
       : "Disconnected";
@@ -212,9 +221,11 @@ export default function App() {
         <div className={`tab ${tab === "keyer" ? "active" : ""}`} onClick={() => setTab("keyer")}>
           Keyer
         </div>
-        <div className={`tab ${tab === "router" ? "active" : ""}`} onClick={() => setTab("router")}>
-          Ham Router
-        </div>
+        {!routerStatus.espActive && (
+          <div className={`tab ${tab === "router" ? "active" : ""}`} onClick={() => setTab("router")}>
+            Ham Router
+          </div>
+        )}
       </div>
 
       <div className="tabbody">
@@ -226,12 +237,25 @@ export default function App() {
             ports={ports}
             audioDevices={audioDevices}
             errors={errors}
-            advertising={advertising}
+            lanPlayers={lanPlayers}
             onPair={onPair}
           />
         )}
-        {tab === "router" && (
-          <RouterTab rules={forwardRules} flexEnabled={flexEnabled} connected={connection.state === "connected"} />
+        {tab === "router" && !routerStatus.espActive && (
+          <RouterTab
+            rules={forwardRules}
+            flexEnabled={flexEnabled}
+            connected={connection.state === "connected"}
+            routerAvailable={routerStatus.available}
+          />
+        )}
+        {tab === "router" && routerStatus.espActive && (
+          <div className="panel">
+            <h3>Ham Router unavailable</h3>
+            <p style={{ color: "var(--text-dim)", fontSize: 13, marginBottom: 0 }}>
+              W1VE ESP32 Player connections carry CW only. Disconnect it before using forwarding or FlexRadio discovery.
+            </p>
+          </div>
         )}
       </div>
 

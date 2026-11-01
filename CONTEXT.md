@@ -1,6 +1,6 @@
 # W1VE Keyer Suite — Working Context
 
-**Last updated:** 30 October 2026.
+**Last updated:** 31 October 2026.
 **Purpose:** operational handoff for the unified W1VE Keyer desktop suite. Use `git status -sb`
 and `git log -1 --oneline` for the authoritative branch and commit state.
 
@@ -90,6 +90,23 @@ straight-key and paddle wiring diagrams, instructions, and click-to-zoom images.
 app's `web/public/` directory. The standalone Keyer wording points back to its **Serial Ports**
 controls; networked Player wording points to **Keying Output**.
 
+### Settings persistence
+
+Every operator-adjustable setting is saved on change and restored at startup, on Windows and Linux.
+
+| App | File | What is restored |
+|---|---|---|
+| W1VE Keyer | `settings.json` (`keyer_controller.rs` `Settings`) | keyer, sidetone, lines, all ports |
+| Remote Keyer Operator / Router Keyer | `client.json`, `Config.keyer` + `Config.transport` | WPM, weight, mode, paddle reverse, tone Hz/volume, audio device, paddle/logger(/keying) ports, LAN/WAN, relay, last WAN token (`pairing_code`) |
+| Remote Keyer Player / Router Player | `server.json` / `station.json`, `Config.station` + `transport` | keying/logger ports, key/PTT lines, PTT hang, callsign, label, LAN/WAN, relay, WAN token |
+
+`KeyerSettings` fields are all `Option` with `serde(default)`, so older files load with app
+defaults. Saved ports are reopened at startup; a missing device reports "not available" and keeps
+the selection. A USB unplug while running (`reconcile_ports`) still clears and saves that port as
+`(None)`. Macros live in WebView `localStorage` (`wrk.macros` / Router key). Do not lock
+`config` twice inside one `emit(...)` expression: the temporary guard lives to the end of the
+statement and deadlocks.
+
 ---
 
 ## 3. Native shell, splash, About, and menu
@@ -110,6 +127,11 @@ Every desktop binary has the same shell conventions:
   transparent until `ui_ready`; other platforms hide it during setup. `ui_ready` restores opacity
   or shows/focuses the completed UI. This prevents an unfinished startup frame while allowing
   WebKitGTK to load.
+- **Windows startup (no white flash):** each app has a `tauri.windows.conf.json` overlay that
+  creates the main window with `"visible": false` and `"backgroundColor": "#0f1115"`. A
+  configured-visible window is shown before `setup` can hide it, which painted a bare white
+  WebView2 surface for about a second. The overlay is a JSON merge patch, so it repeats the full
+  `app.windows` entry; keep it in sync with `tauri.conf.json`.
 - **Linux geometry:** GTK geometry hints keep the native splash at exactly 300×168 rather than its
   default 200-pixel height floor.
 
@@ -206,35 +228,48 @@ Use `cargo xwin build --release --target x86_64-pc-windows-msvc --features custo
 Windows Tauri binaries. The local Windows Visual Studio installation is unreliable for full Rust
 linking; use macpro rather than relying on it.
 
-### Verified for this change
+### ESP32 Player hardware workflow
+
+The ESP32 firmware is the explicit hardware-target exception to the desktop Rust build-box rule:
+use the local Windows ESP-IDF installation for ESP32-S3 firmware builds and COM-port operations.
+The current `macpro` build box does not have ESP-IDF installed.
+
+| Item | Verified value |
+|---|---|
+| ESP-IDF tools home | `E:\Espressif` |
+| ESP-IDF | `E:\Espressif\frameworks\esp-idf-v6.1` |
+| ESP-IDF Python environment | `E:\Espressif\python_env\idf6.1_py3.13_env` |
+| Firmware project | `w1ve-player-esp32` |
+| Target | `esp32s3` |
+| Attached board | `COM13` — USB VID `303A`, PID `1001` |
+
+Start a PowerShell firmware shell with:
+
+```powershell
+$env:IDF_TOOLS_PATH = 'E:\Espressif'
+$env:IDF_PYTHON_ENV_PATH = 'E:\Espressif\python_env\idf6.1_py3.13_env'
+& 'E:\Espressif\frameworks\esp-idf-v6.1\export.ps1'
+```
+
+From `w1ve-player-esp32`, use `idf.py build` to build and `idf.py -p COM13 flash` to write the
+attached board. Recheck that COM13 is the intended ESP32-S3 before flashing. Flashing changes
+hardware state, so run it only after the user explicitly approves that action.
+
+### Verified for the W1VE v2 Player change
 
 | Check | Result |
 |---|---|
-| `rwk-core` tests | 315 library tests plus 12, 2 (one ignored), and 3 additional test groups passed |
-| `rwk-app` tests | 17 passed |
-| `wk-app` tests | 4 passed |
-| `wrk-app` tests | 10 passed |
-| Web builds | all three Vite bundles passed |
-| Linux releases | all seven release binaries built |
-| Windows builds | all seven `x86_64-pc-windows-msvc` release binaries built |
-| Windows UI Automation | exact titles, headers, tabs/diagrams, menus/About, and pairing-first layouts verified |
-| Linux Xvfb/Openbox | exact titles, splash dimensions/fade, tabs/diagrams, menus/About, and pairing-first layouts verified |
+| `rwk-core` tests | 322 library tests plus 12, 2 (one ignored), and 3 additional integration-test groups passed on macpro |
+| Router `rwk-app` tests | 21 passed on macpro |
+| Focused `wrk-app` tests | 17 passed on macpro |
+| Web builds | focused Remote Keyer and Router Vite production bundles passed on macpro |
+| Linux releases | `w1ve-krr`, `w1ve-krp`, `w1ve-remote-keyer`, and `w1ve-remote-keyer-player` built on macpro |
+| Windows releases | the same four `x86_64-pc-windows-msvc` executables built with `cargo xwin` on macpro |
+| ESP32 Player firmware | current W1VE v2 firmware built locally with ESP-IDF 6.1; it has not been flashed to COM13 |
 
-Verified release copies are intentionally untracked under `dist-exe/windows/` and
-`dist-exe/linux/`. The canonical files are:
-
-```text
-rwk                 rwk.exe
-rwk-relay           rwk-relay.exe
-w1ve-keyer          w1ve-keyer.exe
-w1ve-remote-keyer   w1ve-remote-keyer.exe
-w1ve-remote-keyer-player  w1ve-remote-keyer-player.exe
-w1ve-krr            w1ve-krr.exe
-w1ve-krp            w1ve-krp.exe
-```
-
-Copied artifacts were SHA-256 checked against macpro build outputs. Windows and Linux UI review
-captures are local `shots-*` artifacts and are not source.
+The current verified W1VE v2 desktop release copies are intentionally untracked under
+`dist-exe/w1ve-v2/linux/` and `dist-exe/w1ve-v2/windows/`. Their SHA-256 hashes match the
+macpro build outputs.
 
 ---
 
@@ -256,5 +291,100 @@ captures are local `shots-*` artifacts and are not source.
 | Router UIs | `rwk-app/web/src/App.jsx`, `StationApp.jsx`, `KeyerTab.jsx` |
 | Shared diagram UI pattern | each app's `web/src/ConnectionsTab.jsx` |
 | Native menus/splash/GTK fade | each app's `src/lib.rs` |
+| ESP Player protocol, transport, and setup UI | `w1ve-player-esp32/PROTOCOL.md`, `main/player_transport.c`, `main/player_web.c`, `main/web/index.html` |
+| ESP Player local build/flash environment | `E:\Espressif` (`IDF_TOOLS_PATH`), ESP-IDF v6.1; attached ESP32-S3 on `COM13` |
 | Router local build/capture scripts | `tools/build-station.sh`, `tools/capture-*.ps1`, `tools/measure-splash.ps1` |
 | Relay deployment | `linux/rwk-relay/`, `windows/rwk-relay/deploy.ps1` |
+
+
+---
+
+## 7. W1VE v2 LAN Player transport
+
+**Current design, confirmed 31 October 2026:** radio-site Players advertise their availability.
+Operating-position Keyers browse the LAN list and explicitly choose one. This applies to desktop
+Players, the **W1VE ESP32 Player**, W1VE Remote Keyer, and W1VE Remote Keyer Router.
+
+- Desktop Players advertise `RWKP` v2 beacons. A selected operating Keyer initiates the direct
+  WireGuard connection. Router desktop Players advertise both CW and Router capability.
+- W1VE ESP32 Players advertise W1VE v2 type-1 records from UDP 4995 to discovery port 4994.
+  A Keyer may run one bounded, paced `/24` type-10 unicast discovery pass when cross-band Wi-Fi
+  suppresses broadcast. The Keyer sends type 2; the selected Player returns type 3.
+- The W1VE v2 session key is
+  `SHA-256("W1VE-SESSION-v2" | player_id | keyer_id | initiator_nonce | responder_nonce)`.
+  Authenticated type-4 edge frames, type-6/7 PING/PONG, and type-8 unpair use a 64-packet replay
+  window. The sender serializes envelopes and terminates before sequence rollover.
+- ESP CW is strictly Keyer → Player. The Keyer re-sends the latest complete `RWK-PADDLE` frame at
+  250 ms intervals. PING/PONG runs independently every second and ends a session after three
+  missed matching PONGs. Only a valid full type-4 frame refreshes the ESP's 1500 ms asserted-KEY
+  lease.
+- The focused Client owns and waits for its cancelled edge drain before sending ESP unpair, so a
+  queued type-4 frame cannot start after the operator presses Stop. `EdgeSession` also drops
+  buffered callbacks at detach and includes a regression test.
+- Router ESP selection is CW-only. It does not start a WireGuard `Session`, control link,
+  forwarding, Flex discovery, or Router UI controls.
+- ESP browser sidetone and Web Audio are removed. GPIO KEY/PTT and the optional LED are the
+  activity confirmation. The ESP Player web UI only provides configuration, status, logs, and
+  local Disconnect.
+- ESP web live updates: ESP-IDF v6.1 completes the `/ws` handshake without calling the URI
+  handler, so the page sends a `hello` text frame on open and `player_web.c` registers the
+  client from that frame. The page also polls `/api/status` every 2 s while the socket is down.
+- LAN Player display fields are UTF-8-safe at the core 32-byte wire limit. A multi-byte character
+  is never split into an invalid advertisement.
+- The desktop UI lists **W1VE ESP32 Player** entries alongside desktop Players. Busy ESP32 Players
+  cannot be selected. WAN remains the existing relay/shared-token flow and is not used by ESP32.
+
+### Live LAN facts
+
+- ESP32-S3 MAC: `1c:db:d4:4d:3a:40`; known station IP before the v2 flash: `192.168.88.130`.
+- PC station IP: `192.168.88.215`; both devices use the `W1VE Maine` SSID, with the PC on 5 GHz
+  and ESP on 2.4 GHz.
+- Same-subnet unicast works. Limited and directed IPv4 broadcasts are suppressed between those
+  bands, which is why v2 Keyers use bounded type-10 unicast fallback queries.
+- First-boot/recovery setup AP remains `W1VE-Player-XXXX` at `192.168.4.1`. The current firmware
+  binds raw W1VE discovery, pairing, and session sockets only to the joined non-overlapping
+  station subnet, not directly to the setup AP subnet.
+
+### Current validation and handoff
+
+- `common/rwk-core/src/engine/esp_player.rs` contains W1VE v2 advertisement, pairing, envelope,
+  reordering, counter-exhaustion, and cross-language HMAC test coverage.
+- `common/rwk-core/src/engine/edge_session.rs` contains shared FIFO, latest-frame refresh, first
+  frame, and detach-cancellation regression coverage.
+- `w1ve-player-esp32/tools/verify_esp_player.py` defaults to no-CW discovery/pairing/ping/replay/
+  safe-unpair checks. With `--esp`, it starts with a direct type-10 query so it also works on the
+  known cross-band broadcast-suppressed Wi-Fi path. `--exercise-cw` is an explicit
+  controlled-hardware test only.
+- The latest W1VE v2 ESP-IDF image (`0xDC280`, with the `/ws` hello registration fix) was built
+  and flashed to COM13; live pushes of paired/peer status to an open page were verified. After the Wi-Fi
+  event-stack correction, `http://192.168.88.130/api/status` stays reachable with
+  `networkConnected: true`, `transportAvailable: true`, and safe inactive KEY/PTT output.
+- The live default no-CW ESP diagnostic passed against `192.168.88.130`: direct query/reply,
+  Keyer-initiated pairing, bidirectional matching PING/PONG, bounded reordering, replayed-unpair
+  rejection, and safe type-8 unpair.
+- Current desktop v2 releases are staged at `dist-exe/w1ve-v2/` (not tracked in git). The
+  1 November 2026 builds of `w1ve-remote-keyer`, `w1ve-remote-keyer-player`, `w1ve-krr`, and
+  `w1ve-krp` (Windows and Linux) include the Windows UDP 10054 discovery fix, the no-white-flash
+  window overlay, and full settings persistence. `w1ve-keyer` needed no persistence change.
+  The operator confirmed all apps working on 1 November 2026.
+- Windows build rule: run `npm run build` in each app's `web/` immediately before
+  `cargo xwin build`. Tauri embeds `web/dist`, and a stale bundle produced a window that never
+  called `ui_ready`.
+- The Windows discovery sweep treats UDP `WSAECONNRESET` (10054) from an ICMP
+  port-unreachable reply as a transient negative result, not a browser failure.
+- Launch the staged Windows Keyer and Player binaries manually to verify the Player-selection UI.
+  Do not run the `--exercise-cw` diagnostic unless the radio connection is safe for controlled
+  key/PTT output.
+
+### Open decision: serial port unplug
+
+`reconcile_ports` (all apps) clears a vanished serial selection to `(None)` and saves it, so an
+unplugged USB adapter must be re-selected. Remembering the selection and reopening it on re-plug
+was offered and not yet chosen.
+
+### Deferred security decision
+
+The setup AP still uses its existing fixed provisioning password. It cannot directly carry raw
+W1VE keying traffic because station-only sockets are enforced, but an AP client can still change
+station Wi-Fi configuration. A per-device setup credential or a post-provisioning management
+restriction remains deferred by the user while the current trusted-LAN/no-PIN flow is evaluated.

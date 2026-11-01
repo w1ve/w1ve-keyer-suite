@@ -1,12 +1,12 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { stationApi as api } from "./station-api.js";
 import TransportSlider from "./TransportSlider.jsx";
 import RadarSweep from "./RadarSweep.jsx";
 
-// The Station body: keying status (KEY/PTT and the fail-safe banner), keying output (the rig's
-// serial port, its key and PTT lines, the PTT hang, and the logger's WinKeyer COM port), the
-// port-forward table the Operator pushes (read-only), and the pairing panel. Nothing here is
-// gated on a keying port: with none selected the KEY/PTT LEDs still follow the Client.
+// The desktop Player body: keying status (KEY/PTT and the fail-safe banner), keying output (the
+// rig's serial port, its key and PTT lines, the PTT hang, and the logger's WinKeyer COM port),
+// the port-forward table the Keyer pushes (read-only), and WAN/LAN pairing controls. In LAN mode
+// this Player owns its identity, advertises RWKP v2, and waits for the operating Keyer.
 export default function StationTab({
   settings,
   setSettings,
@@ -14,7 +14,7 @@ export default function StationTab({
   keyDown,
   pttOn,
   lastFailSafe,
-  lanPeers,
+  advertising,
   ports,
   errors,
   rules,
@@ -22,21 +22,12 @@ export default function StationTab({
 }) {
   const running = connection.state === "connected";
   const connecting = connection.state === "connecting";
-  const [pickedKey, setPickedKey] = useState("");
   // The PTT hang is bound when a pairing starts, so it is locked while linked. Ports and lines
   // take effect at once.
   const hangLocked = running || connecting;
   const pttNone = settings.pttLine === "none";
   const hangDisabled = hangLocked || pttNone;
-
-  // Keep the picked keyer valid as the live list changes.
-  useEffect(() => {
-    if (pickedKey && !lanPeers.some((p) => p.key === pickedKey)) {
-      setPickedKey(lanPeers[0]?.key || "");
-    } else if (!pickedKey && lanPeers.length > 0) {
-      setPickedKey(lanPeers[0].key);
-    }
-  }, [lanPeers, pickedKey]);
+  const playerName = [settings.callsign.trim(), settings.keyerId.trim()].filter(Boolean).join("-") || "(unnamed Player)";
 
   return (
     <div className="tabbody">
@@ -190,11 +181,10 @@ export default function StationTab({
               </label>
               <TransportSlider
                 value={settings.transport}
-                disabled={running || connecting}
+                disabled={running || connecting || advertising}
                 onChange={(t) => {
                   setSettings((s) => ({ ...s, transport: t }));
                   api.setTransport(t);
-                  if (t === "lan") api.lanBrowse();
                 }}
               />
             </div>
@@ -233,37 +223,46 @@ export default function StationTab({
               </>
             ) : (
               <>
-                <div className="field" style={{ marginBottom: 0, minWidth: 220 }}>
-                  <label>Available keyers</label>
-                  <select value={pickedKey} disabled={running || connecting} onChange={(e) => setPickedKey(e.target.value)}>
-                    {lanPeers.length === 0 && <option value="">(searching…)</option>}
-                    {lanPeers.map((p) => (
-                      <option key={p.key} value={p.key}>
-                        {p.name}
-                      </option>
-                    ))}
-                  </select>
+                <div className="field" style={{ marginBottom: 0 }}>
+                  <label>Player callsign</label>
+                  <input
+                    type="text"
+                    value={settings.callsign}
+                    placeholder="Player callsign"
+                    disabled={running || connecting || advertising}
+                    onChange={(e) => {
+                      setSettings((s) => ({ ...s, callsign: e.target.value }));
+                      api.setCallsign(e.target.value);
+                    }}
+                    style={{ width: 140 }}
+                  />
+                </div>
+                <div className="field" style={{ marginBottom: 0 }}>
+                  <label>Player ID</label>
+                  <input
+                    type="text"
+                    value={settings.keyerId}
+                    placeholder="20m, etc."
+                    disabled={running || connecting || advertising}
+                    onChange={(e) => {
+                      setSettings((s) => ({ ...s, keyerId: e.target.value }));
+                      api.setKeyerId(e.target.value);
+                    }}
+                    style={{ width: 120 }}
+                  />
                 </div>
                 <div style={{ alignSelf: "flex-end" }}>
-                  <button onClick={() => api.lanBrowse()} disabled={running || connecting}>
-                    Refresh
-                  </button>
-                </div>
-                <div style={{ alignSelf: "flex-end" }}>
-                  {running || connecting ? (
-                    <button onClick={() => api.disconnect()} style={{ background: "#5a2d2d" }}>
-                      {connecting ? "Cancel" : "Stop"}
+                  {running || connecting || advertising ? (
+                    <button onClick={() => api.lanAdvertise(false)} style={{ background: "#5a2d2d" }}>
+                      {running ? "Unpair" : "Stop"}
                     </button>
                   ) : (
                     <button
-                      onClick={() => {
-                        const peer = lanPeers.find((p) => p.key === pickedKey);
-                        if (peer) api.connectLan(peer.key, peer.endpoint);
-                      }}
-                      disabled={!pickedKey}
+                      onClick={() => api.lanAdvertise(true)}
+                      disabled={!settings.callsign.trim()}
                       style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
                     >
-                      Connect
+                      Advertise
                     </button>
                   )}
                 </div>
@@ -279,7 +278,9 @@ export default function StationTab({
           <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0, marginTop: 8 }}>
             {settings.transport === "wan"
               ? "Start and give the token to the Client. Pair first, then choose the keying port and PTT line. A keying port is optional — without one the KEY LED still follows the Client."
-              : "Pick a keyer advertising on your LAN, then Connect. Choose the keying port after you pair. No relay, no internet."}
+              : advertising
+                ? `Advertising as ${playerName}. Select this desktop Player from the Keyer on the same LAN.`
+                : "Enter this Player's callsign and optional ID, then Advertise. The Keyer selects the Player and initiates the direct tunnel. No relay, no internet."}
           </p>
         </div>
       </div>

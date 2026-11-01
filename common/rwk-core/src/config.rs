@@ -212,6 +212,53 @@ pub struct Config {
     /// LAN beacon advertises `callsign-keyer_id`. Empty when unset.
     #[serde(default)]
     pub keyer_id: String,
+    /// Last selected pairing transport (`"wan"` or `"lan"`). `None` ⇒ the app default.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// Operating-position keyer settings (speed, sidetone, input ports). Absent in a Station
+    /// config. Every field is optional so an older file, or a field the app has never written,
+    /// falls back to that app's default instead of failing to load.
+    #[serde(default)]
+    pub keyer: KeyerSettings,
+}
+
+/// Operating-position persisted settings: the keyer, sidetone, and the local input/output
+/// ports. Shared by W1VE Remote Keyer and the Router's Keyer so both remember every UI setting.
+///
+/// `audio_device` keeps the UI's three-way meaning: `None` = system default output, `Some("")` =
+/// sidetone off, `Some(name)` = that device.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyerSettings {
+    /// Keyer speed in WPM.
+    #[serde(default)]
+    pub wpm: Option<u32>,
+    /// Keyer weight percentage.
+    #[serde(default)]
+    pub weight: Option<u32>,
+    /// Keyer mode as the UI name (`"iambicB"`, `"iambicA"`, `"ultimatic"`, `"bug"`, `"straight"`).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Whether the paddle dit/dah contacts are reversed.
+    #[serde(default)]
+    pub paddle_reverse: Option<bool>,
+    /// Sidetone frequency in Hz.
+    #[serde(default)]
+    pub tone_hz: Option<i32>,
+    /// Sidetone volume, 0..=100.
+    #[serde(default)]
+    pub tone_volume: Option<u32>,
+    /// Sidetone output device (see the type docs for the `None` / empty-string meaning).
+    #[serde(default)]
+    pub audio_device: Option<String>,
+    /// Serial port the paddle contacts are read from.
+    #[serde(default)]
+    pub paddle_port: Option<String>,
+    /// Serial port a logger sends WinKeyer protocol on.
+    #[serde(default)]
+    pub logger_port: Option<String>,
+    /// Serial port that keys a local radio alongside the remote one.
+    #[serde(default)]
+    pub keying_port: Option<String>,
 }
 
 /// Station-only persisted settings: the serial keying output and the optional logger
@@ -269,6 +316,8 @@ impl Config {
             station: StationSettings::default(),
             callsign: String::new(),
             keyer_id: String::new(),
+            transport: None,
+            keyer: KeyerSettings::default(),
         })
     }
 
@@ -466,6 +515,40 @@ mod tests {
             back.identity.public_key_base64().unwrap(),
             config.identity.public_key_base64().unwrap()
         );
+    }
+
+    #[test]
+    fn keyer_settings_and_transport_round_trip() {
+        let mut config = Config::new(Role::Client).unwrap();
+        config.transport = Some("lan".into());
+        config.keyer = KeyerSettings {
+            wpm: Some(31),
+            weight: Some(55),
+            mode: Some("ultimatic".into()),
+            paddle_reverse: Some(true),
+            tone_hz: Some(720),
+            tone_volume: Some(40),
+            audio_device: Some(String::new()),
+            paddle_port: Some("COM7".into()),
+            logger_port: Some("COM8".into()),
+            keying_port: Some("COM9".into()),
+        };
+        let back = Config::from_json(&config.to_json().unwrap()).unwrap();
+        assert_eq!(back.transport.as_deref(), Some("lan"));
+        assert_eq!(back.keyer, config.keyer);
+    }
+
+    #[test]
+    fn a_config_without_keyer_settings_still_loads() {
+        // Files written before `keyer` / `transport` existed must keep loading with defaults.
+        let mut value: serde_json::Value =
+            serde_json::from_str(&Config::new(Role::Client).unwrap().to_json().unwrap()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("keyer");
+        object.remove("transport");
+        let back = Config::from_json(&value.to_string()).unwrap();
+        assert_eq!(back.keyer, KeyerSettings::default());
+        assert_eq!(back.transport, None);
     }
 
     #[test]

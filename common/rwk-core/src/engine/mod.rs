@@ -7,6 +7,8 @@
 //! * [`debounce`] — per-contact paddle debounce.
 //! * [`paddle`] — the live paddle keyer: contacts → timed CW edges with iambic memory.
 //! * [`edge_sender`] — Client-side orchestrator: edge events → redundant `RWK-PADDLE` frames.
+//! * [`edge_session`] — the pairing-scoped ordered CW edge sender and carrier seam.
+//! * [`esp_player`] — trusted-LAN W1VE v2 ESP32 Player discovery and CW session carrier.
 //! * [`edge_station`] — Station-side bridge: tunnel edge datagrams → the replay driver.
 //! * [`audio`] — the keyed-sine sidetone generator and its cpal output stream.
 //! * [`network`] — native UDP edge transport and port forwarding (no sidecar).
@@ -30,6 +32,7 @@ pub mod debounce;
 pub mod edge_sender;
 pub mod edge_session;
 pub mod edge_station;
+pub mod esp_player;
 pub mod flex_discovery;
 pub mod lan_discovery;
 pub mod logger_host;
@@ -64,6 +67,7 @@ pub use tunnel::{connect, Connected, Path, StaticIdentity, TunnelPacket, TunnelP
 pub use edge_sender::EdgeSender;
 pub use edge_session::EdgeSession;
 pub use edge_station::{pump_edges, tunnel_replayer};
+pub use esp_player::{EspPlayerAdvertisement, EspPlayerBrowser, EspPlayerSession};
 pub use keying_arbiter::{
     KeySource, KeyingArbiter, LineObserver, LineUpdate, LocalKeyHandle, RemoteKeyingOutput,
 };

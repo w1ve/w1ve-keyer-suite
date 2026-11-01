@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>W1VE ESP32 Player</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--panel2:#1e222b;--border:#2a2f3a;--text:#e6e8ec;--dim:#9aa0ab;--accent:#4ea1ff;--good:#3ddc84;--warn:#ffcf5c;--bad:#ff5c5c;font-family:Segoe UI,system-ui,sans-serif;color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-size:14px}.app{max-width:920px;margin:auto;min-height:100vh;display:flex;flex-direction:column}.status{display:flex;gap:10px;align-items:center;padding:12px;border-bottom:1px solid var(--border);background:#12151b}.status strong{color:var(--accent)}.grow{flex:1}.dot{font-size:18px}.tabs{display:flex;gap:2px;padding:10px 12px 0;border-bottom:1px solid var(--border)}.tab{border:1px solid var(--border);border-bottom:0;border-radius:8px 8px 0 0;padding:8px 16px;background:var(--panel);color:var(--dim);cursor:pointer}.tab.active{background:var(--panel2);color:var(--text);border-color:#2b6cb0}.body{padding:12px;overflow:auto}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px}.panel h3{margin:0 0 10px;color:var(--dim);font-size:13px;text-transform:uppercase;letter-spacing:.04em}.field{margin:8px 0}.field label{display:block;color:var(--dim);font-size:12px;margin-bottom:4px}input,select,button{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:8px;width:100%}button{width:auto;cursor:pointer}button:disabled{opacity:.55;cursor:default}button.primary{background:#2b6cb0;border-color:var(--accent)}button.warn{background:#5a2d2d}.row{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.row>.field{flex:1;min-width:130px}.state{font-weight:700}.key{color:var(--bad)}.ptt{color:var(--warn)}.ok{color:var(--good)}.hint{font-size:12px;color:var(--dim);line-height:1.45}.hidden{display:none}.log{height:300px;overflow:auto;background:#0d1015;border:1px solid var(--border);border-radius:6px;padding:8px;font:12px Consolas,monospace;white-space:pre-wrap}.log .warn{color:var(--warn)}.log .error{color:var(--bad)}@media(max-width:650px){.grid{grid-template-columns:1fr}.body{padding:8px}.panel{padding:10px}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="status"><strong>W1VE ESP32 Player</strong><span class="grow"></span><span id="netDot" class="dot">●</span><span id="link">Starting…</span><span id="keyState"></span><span id="pttState"></span></div>
+  <div class="tabs"><button class="tab active" data-tab="main">Main</button><button class="tab" data-tab="connections">Connections</button><button class="tab" data-tab="log">Log</button></div>
+
+  <section id="main" class="body">
+    <div class="panel">
+      <h3>ESP32 Player setup</h3>
+      <div class="row">
+        <div class="field"><label>Player name</label><input id="deviceName" maxlength="32"></div>
+        <div class="field"><label>Home Wi-Fi</label><select id="wifiSsid"><option value="">Select or scan a network…</option></select></div>
+        <div class="field"><label>Wi-Fi password</label><input id="wifiPassword" type="password" autocomplete="current-password"></div>
+      </div>
+      <div class="row"><button id="scan">Scan Wi-Fi</button><button id="save" class="primary">Save and join network</button></div>
+      <p class="hint">First boot: connect to <b id="setupSsid">W1VE-Player</b> using the setup password printed on the serial console. The setup page remains available at <code>192.168.4.1</code>.</p>
+    </div>
+
+    <div class="panel">
+      <h3>Player availability</h3>
+      <div class="row">
+        <div class="field"><label>LAN state</label><span id="playerState" class="state">Advertising</span></div>
+        <div class="field"><label>Connected Keyer</label><span id="peerState" class="state">—</span></div>
+        <div class="field"><label>PING</label><span id="pingState" class="state">—</span></div>
+        <button id="disconnectPlayer" class="warn">Disconnect</button>
+      </div>
+      <p id="disconnectReason" class="hint">This Player advertises itself on the LAN. Choose it from W1VE Remote Keyer or W1VE Remote Keyer Router.</p>
+    </div>
+
+    <div class="grid">
+      <div class="panel">
+        <h3>Keying status</h3>
+        <p>Network: <span id="networkState" class="state">—</span></p>
+        <p>KEY: <span id="keyText" class="state">Up</span></p>
+        <p>PTT: <span id="pttText" class="state">Off</span></p>
+        <p class="hint">Only authenticated current-plus-history CW edge frames can drive KEY/PTT. The selected Keyer repeats its latest complete frame; the Player imposes a 1500 ms lease on asserted KEY. Configured GPIO outputs and the optional white LED confirm accepted keying.</p>
+      </div>
+      <div class="panel">
+        <h3>GPIO keying output</h3>
+        <div class="row"><div class="field"><label>KEY GPIO</label><select id="keyGpio"></select></div><div class="field"><label>PTT GPIO</label><select id="pttGpio"></select></div><div class="field"><label>PTT hang: <span id="hangText">200</span> ms</label><input id="pttHang" type="range" min="75" max="600" step="5"></div></div>
+        <div class="row"><label class="hint"><input id="keyLow" type="checkbox"> KEY active low</label><label class="hint"><input id="pttLow" type="checkbox"> PTT active low</label></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>RGB status LED</h3>
+      <div class="row"><div class="field"><label>WS2812 GPIO</label><select id="rgbGpio"></select></div></div>
+      <label class="hint"><input id="rgbEnabled" type="checkbox"> Enable addressable RGB LED</label>
+      <p class="hint">Red: no Wi-Fi. Green: paired. White: accepted key-down. GPIO 48 is the generic ESP32-S3 default.</p>
+    </div>
+  </section>
+
+  <section id="connections" class="body hidden">
+    <div class="panel"><h3>Radio connections</h3><p class="hint">Use transistor, optocoupler, or a rated relay interface between the ESP32 GPIO and radio KEY/PTT inputs. Do not connect a radio key line directly to an ESP32 pin.</p></div>
+    <div class="panel"><h3>LAN Player discovery</h3><p>The W1VE ESP32 Player advertises itself only on its joined home Wi-Fi station subnet. The setup access point remains for configuration but cannot discover, pair, or carry raw W1VE keying. On a W1VE Remote Keyer or W1VE Remote Keyer Router, choose this Player from the available Player list. WAN pairing is not supported by this Player.</p></div>
+    <div class="panel"><h3>KEY and PTT safety</h3><p>W1VE ESP32 Player accepts only endpoint-pinned, session-verified CW frames. The selected Keyer repeats its latest complete frame for loss recovery. The Player imposes a 1500 ms lease on asserted KEY and releases KEY/PTT on unpair, missed frame refresh, or local configuration change. Configured GPIO outputs and the optional white LED confirm accepted activity.</p></div>
+  </section>
+
+  <section id="log" class="body hidden"><div class="panel"><h3>ESP32 Player actions</h3><label class="hint"><input id="logsEnabled" type="checkbox"> Stream action log to this browser</label><button id="clearLog" style="float:right">Clear display</button><div id="logLines" class="log"></div></div></section>
+</div>
+
+<script>
+const safePins=[1,2,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,21,38,47,48];
+const $=id=>document.getElementById(id);let status={};
+function options(select,allowNone=false){select.innerHTML=allowNone?'<option value="-1">(None)</option>':'';safePins.forEach(pin=>select.add(new Option('GPIO '+pin,pin)))}
+options($('keyGpio'));options($('pttGpio'),true);options($('rgbGpio'),true);
+function setValue(id,value){if(value!==undefined&&value!==null)$(id).value=value}
+function render(next){status=next;$('setupSsid').textContent=next.setupSsid||'W1VE-Player';$('deviceName').value=next.deviceName||'';setValue('keyGpio',next.keyGpio);setValue('pttGpio',next.pttGpio);setValue('rgbGpio',next.rgbGpio);setValue('pttHang',next.pttHangMs);$('keyLow').checked=!!next.keyActiveLow;$('pttLow').checked=!!next.pttActiveLow;$('rgbEnabled').checked=!!next.rgbEnabled;$('logsEnabled').checked=!!next.logsEnabled;$('hangText').textContent=next.pttHangMs||200;const network=next.networkConnected?'Connected '+(next.ip||''):'Not connected',transportAvailable=!!next.transportAvailable;$('networkState').textContent=network;$('networkState').className='state '+(next.networkConnected?'ok':'key');$('playerState').textContent=next.paired?'Connected':transportAvailable?'Advertising':'LAN unavailable';$('playerState').className='state '+(next.paired?'ok':transportAvailable?'':'key');$('peerState').textContent=next.paired?(next.peer||'Keyer'):'—';$('pingState').textContent=next.paired?`RTT ${next.rttMs??'—'} ms${next.missedPings?`, ${next.missedPings} missed`:''}`:'—';$('pingState').className='state '+(next.paired?'ok':'');$('disconnectPlayer').disabled=!next.paired;$('disconnectReason').textContent=next.disconnectReason||(transportAvailable?'This Player advertises itself on the LAN. Choose it from W1VE Remote Keyer or W1VE Remote Keyer Router.':'Raw W1VE Player traffic is disabled until a non-overlapping home Wi-Fi station subnet is available.');$('keyText').textContent=next.keyDown?'Down':'Up';$('keyText').className='state '+(next.keyDown?'key':'');$('pttText').textContent=next.pttOn?'On':'Off';$('pttText').className='state '+(next.pttOn?'ptt':'');$('link').textContent=next.keyDown?'Keying':next.paired?'Paired':transportAvailable?'Advertising':next.networkConnected?'LAN unavailable':'Configuration mode';$('netDot').style.color=next.keyDown?'#fff':next.paired?'#3ddc84':transportAvailable?'#4ea1ff':next.networkConnected?'#ffcf5c':'#ff5c5c';$('keyState').textContent=next.keyDown?'KEY':' ';$('pttState').textContent=next.pttOn?'PTT':' '}
+function log(level,message){const element=$('logLines'),line=document.createElement('div');line.className=level;line.textContent=new Date().toLocaleTimeString()+' '+level.toUpperCase()+'  '+message;element.append(line);while(element.children.length>100)element.firstChild.remove();element.scrollTop=element.scrollHeight}
+async function load(){render(await (await fetch('/api/status')).json());const logs=await (await fetch('/api/logs')).json();logs.forEach(entry=>log(entry.level,entry.message))}
+async function scan(){const networks=await (await fetch('/api/wifi-scan')).json(),select=$('wifiSsid'),old=select.value,saved=status.wifiSsid||'',wanted=old||saved;select.innerHTML='<option value="">Select a network…</option>';if(saved&&!networks.some(network=>network.ssid===saved))select.add(new Option(`${saved} (saved network)`,saved));networks.forEach(network=>select.add(new Option(network.ssid+' ('+network.rssi+' dBm)',network.ssid)));select.value=wanted}
+async function save(){const savedSsid=status.wifiSsid||'',requestedSsid=$('wifiSsid').value.trim(),password=$('wifiPassword').value,body={deviceName:$('deviceName').value,keyGpio:+$('keyGpio').value,pttGpio:+$('pttGpio').value,rgbGpio:+$('rgbGpio').value,pttHangMs:+$('pttHang').value,keyActiveLow:$('keyLow').checked,pttActiveLow:$('pttLow').checked,rgbEnabled:$('rgbEnabled').checked,logsEnabled:$('logsEnabled').checked};if(requestedSsid&&requestedSsid!==savedSsid){if(!password){alert('Enter the password for the newly selected Wi-Fi network.');return}body.wifiSsid=requestedSsid;body.wifiPassword=password}else if(password){body.wifiPassword=password}const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok){alert(await response.text());return}render(await response.json());$('wifiPassword').value='';log('info','Configuration saved')}
+async function disconnectPlayer(){const response=await fetch('/api/player/disconnect',{method:'POST'});if(!response.ok){alert(await response.text());return}render(await response.json())}
+document.querySelectorAll('.tab').forEach(button=>button.onclick=()=>{document.querySelectorAll('.tab').forEach(tab=>tab.classList.remove('active'));document.querySelectorAll('section').forEach(section=>section.classList.add('hidden'));button.classList.add('active');$(button.dataset.tab).classList.remove('hidden')});$('scan').onclick=scan;$('save').onclick=save;$('disconnectPlayer').onclick=disconnectPlayer;$('clearLog').onclick=()=>$('logLines').replaceChildren();$('pttHang').oninput=()=>{$('hangText').textContent=$('pttHang').value};let ws;setInterval(()=>{if(!ws||ws.readyState!==WebSocket.OPEN)fetch('/api/status').then(response=>response.json()).then(render).catch(()=>{})},2000);function socket(){ws=new WebSocket(`ws://${location.host}/ws`);ws.onopen=()=>ws.send('hello');ws.onmessage=event=>{const message=JSON.parse(event.data);if(message.type==='status')render(message.status);if(message.type==='log')log(message.level,message.message)};ws.onclose=()=>setTimeout(socket,1500)}load().then(scan).catch(error=>log('error',error.message));socket();
+</script>
+</body>
+</html>

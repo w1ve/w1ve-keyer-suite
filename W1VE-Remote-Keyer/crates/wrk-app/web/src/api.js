@@ -27,10 +27,9 @@ export const clientApi = {
   abortSend: () => invoke("c_abort_send"),
   connect: (token) => invoke("c_connect", { token }),
   disconnect: () => invoke("c_disconnect"),
-  // LAN (operating-position advertises itself)
-  setCallsign: (callsign) => invoke("c_set_callsign", { callsign }),
-  setKeyerId: (keyerId) => invoke("c_set_keyer_id", { keyerId }),
-  lanAdvertise: (on) => invoke("c_lan_advertise", { on }),
+  // LAN: the operating Keyer browses desktop and W1VE ESP32 Players, then initiates selection.
+  lanBrowse: () => invoke("c_lan_browse"),
+  connectLan: (selection) => invoke("c_connect_lan", { selection }),
 };
 
 export const serverApi = {
@@ -47,9 +46,10 @@ export const serverApi = {
   regenerateToken: () => invoke("s_regenerate_token"),
   listen: () => invoke("s_listen"),
   disconnect: () => invoke("s_disconnect"),
-  // LAN (radio-site browses + picks a keyer)
-  lanBrowse: () => invoke("s_lan_browse"),
-  connectLan: (key, endpoint) => invoke("s_connect_lan", { key, endpoint }),
+  // LAN: the desktop Player advertises and waits for the operating Keyer to initiate.
+  setCallsign: (callsign) => invoke("s_set_callsign", { callsign }),
+  setKeyerId: (keyerId) => invoke("s_set_keyer_id", { keyerId }),
+  lanAdvertise: (on) => invoke("s_lan_advertise", { on }),
 };
 
 // Shared window/splash bridge: both the Client and the Server binaries register these commands.

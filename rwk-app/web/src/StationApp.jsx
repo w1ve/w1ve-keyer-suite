@@ -63,14 +63,16 @@ const DEFAULT_SETTINGS = {
   pttLine: "rts",
   pttHangMs: 200,
   loggerPort: null,
+  callsign: "",
+  keyerId: "",
   relay: "",
   pairingCode: "",
   transport: "wan",
 };
 
-// The Station application shell: a compact window with a Main tab (keying, forwards, pairing) and
-// a Log tab. The header shows the link state and the bottom strip shows KEY and PTT on both tabs.
-// It shares the `rwk://event` stream with the Client.
+// The Station application shell: a compact desktop Player window with a Main tab (keying,
+// forwarding status, and Player advertisement/pairing), Connections, and Log tabs. The header
+// and bottom strip show the current link, KEY, and PTT state.
 export default function StationApp() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [connection, setConnection] = useState({ state: "disconnected", path: "none" });
@@ -78,7 +80,7 @@ export default function StationApp() {
   const [keyDown, setKeyDown] = useState(false);
   const [pttOn, setPttOn] = useState(false);
   const [lastFailSafe, setLastFailSafe] = useState(null);
-  const [lanPeers, setLanPeers] = useState([]);
+  const [advertising, setAdvertising] = useState(false);
   const [ports, setPorts] = useState([]);
   const [errors, setErrors] = useState({}); // control -> short red message
   const [rules, setRules] = useState([]); // port forwards pushed from the Operator (read-only)
@@ -141,6 +143,8 @@ export default function StationApp() {
             pttLine: ev.ptt_line,
             pttHangMs: ev.ptt_hang_ms ?? DEFAULT_SETTINGS.pttHangMs,
             loggerPort: ev.logger_port ?? null,
+            callsign: ev.callsign ?? "",
+            keyerId: ev.keyer_id ?? "",
             relay: ev.relay ?? "",
             pairingCode: ev.pairing_code ?? "",
             transport: ev.transport ?? "wan",
@@ -158,8 +162,8 @@ export default function StationApp() {
             setErrors((e) => ({ ...e, [ev.control]: ev.message || undefined }));
           }
           break;
-        case "lanPeers":
-          setLanPeers(ev.peers || []);
+        case "advertising":
+          setAdvertising(ev.active);
           break;
         case "connection":
           setConnection({ state: ev.state, path: ev.path });
@@ -260,7 +264,7 @@ export default function StationApp() {
           keyDown={keyDown}
           pttOn={pttOn}
           lastFailSafe={lastFailSafe}
-          lanPeers={lanPeers}
+          advertising={advertising}
           ports={ports}
           errors={errors}
           rules={rules}

@@ -1,4 +1,4 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { api } from "./api.js";
 import TransportSlider from "./TransportSlider.jsx";
 import RadarSweep from "./RadarSweep.jsx";
@@ -39,16 +39,42 @@ function loadMacros() {
   return DEFAULT_MACROS;
 }
 
-// The Client's keyer body: keyer settings, inputs, sidetone, CW macros, and the pairing panel
-// (WAN token or LAN advertise). State lives in App; this renders it and sends commands.
-export default function KeyerTab({ settings, setSettings, connection, ports, audioDevices, errors, advertising, onPair }) {
+// The Client's keyer body: keyer settings, inputs, sidetone, CW macros, and a pairing panel that
+// either uses the existing WAN token flow or browses/selects a LAN Player. State lives in App.
+export default function KeyerTab({ settings, setSettings, connection, ports, audioDevices, errors, lanPlayers, onPair }) {
   const [token, setToken] = useState("");
   const [typeAhead, setTypeAhead] = useState("");
   const [macros, setMacros] = useState(loadMacros);
   const [editing, setEditing] = useState(false);
+  const [pickedPlayer, setPickedPlayer] = useState("");
 
   const paired = connection.state === "connected";
   const connecting = connection.state === "connecting";
+
+  // Pre-fill the remembered WAN code, but never overwrite what the operator is typing.
+  useEffect(() => {
+    if (settings.pairingCode) setToken((current) => current || settings.pairingCode);
+  }, [settings.pairingCode]);
+
+  // Keep the selected tagged Player valid as advertisements expire or refresh.
+  useEffect(() => {
+    if (pickedPlayer && !lanPlayers.some((player) => playerSelectionKey(player) === pickedPlayer)) {
+      setPickedPlayer(lanPlayers[0] ? playerSelectionKey(lanPlayers[0]) : "");
+    } else if (!pickedPlayer && lanPlayers.length > 0) {
+      setPickedPlayer(playerSelectionKey(lanPlayers[0]));
+    }
+  }, [lanPlayers, pickedPlayer]);
+
+  // Start discovery whenever the idle Keyer is in LAN mode. The backend owns cancellation and
+  // validates a selection from this list rather than trusting a browser-provided endpoint.
+  useEffect(() => {
+    if (settings.transport === "lan" && !paired && !connecting) {
+      api.browseLanPlayers().catch(() => {});
+    }
+  }, [settings.transport, paired, connecting]);
+
+  const selectedPlayer = lanPlayers.find((player) => playerSelectionKey(player) === pickedPlayer);
+  const selectedEspBusy = selectedPlayer?.playerType === "esp32Player" && selectedPlayer.busy;
 
   // Audio selection model: settings.audioDevice is null (follow system default), "" (off), or a
   // device name. When null, show the actual default device by name so the user sees what they
@@ -327,46 +353,40 @@ export default function KeyerTab({ settings, setSettings, connection, ports, aud
             </>
           ) : (
             <>
-              <div className="field" style={{ marginBottom: 0 }}>
-                <label>Station Callsign</label>
-                <input
-                  type="text"
-                  value={settings.callsign}
-                  placeholder="Station Callsign"
+              <div className="field" style={{ marginBottom: 0, minWidth: 260 }}>
+                <label>Available Players</label>
+                <select
+                  value={pickedPlayer}
                   disabled={paired || connecting}
-                  onChange={(e) => {
-                    setSettings((s) => ({ ...s, callsign: e.target.value }));
-                    api.setCallsign(e.target.value);
-                  }}
-                  style={{ width: 130 }}
-                />
+                  onChange={(e) => setPickedPlayer(e.target.value)}
+                >
+                  {lanPlayers.length === 0 && <option value="">(searching…)</option>}
+                  {lanPlayers.map((player) => (
+                    <option key={playerSelectionKey(player)} value={playerSelectionKey(player)}>
+                      {playerLabel(player)}
+                    </option>
+                  ))}
+                </select>
               </div>
-              <div className="field" style={{ marginBottom: 0 }}>
-                <label>Keyer ID</label>
-                <input
-                  type="text"
-                  value={settings.keyerId}
-                  placeholder="Keyer ID (20m, etc.)"
-                  disabled={paired || connecting}
-                  onChange={(e) => {
-                    setSettings((s) => ({ ...s, keyerId: e.target.value }));
-                    api.setKeyerId(e.target.value);
-                  }}
-                  style={{ width: 150 }}
-                />
+              <div style={{ alignSelf: "flex-end" }}>
+                <button onClick={() => api.browseLanPlayers().catch(() => {})} disabled={paired || connecting}>
+                  Refresh
+                </button>
               </div>
-              <div>
+              <div style={{ alignSelf: "flex-end" }}>
                 {paired || connecting ? (
-                  <button onClick={() => api.lanAdvertise(false)} style={{ background: "#5a2d2d" }}>
-                    {connecting ? "Stop" : "Unpair"}
+                  <button onClick={() => api.disconnect()} style={{ background: "#5a2d2d" }}>
+                    {connecting ? "Cancel" : "Unpair"}
                   </button>
                 ) : (
                   <button
-                    onClick={() => api.lanAdvertise(true)}
-                    disabled={!settings.callsign.trim()}
+                    onClick={() =>
+                      selectedPlayer && api.connectLanPlayer(selectedPlayer.playerType, selectedPlayer.id).catch(() => {})
+                    }
+                    disabled={!selectedPlayer || selectedEspBusy}
                     style={{ background: "var(--accent-dim)", borderColor: "var(--accent)" }}
                   >
-                    Advertise
+                    Connect
                   </button>
                 )}
               </div>
@@ -381,9 +401,8 @@ export default function KeyerTab({ settings, setSettings, connection, ports, aud
         </div>
         {settings.transport === "lan" && (
           <p style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 0, marginTop: 8 }}>
-            {advertising
-              ? `Advertising as ${lanName(settings)} — pick this keyer on the Player.`
-              : "Enter your callsign (and an optional ID), then Advertise so the Player can find and pick this keyer. No relay, no internet."}
+            Browse and select a desktop Player for direct CW and, when it advertises Router capability,
+            Ham Router services. A W1VE ESP32 Player is CW-only and cannot be selected while busy.
           </p>
         )}
       </div>
@@ -402,12 +421,17 @@ export default function KeyerTab({ settings, setSettings, connection, ports, aud
   );
 }
 
-// The display name a keyer advertises: callsign-keyerId (or just callsign).
-function lanName(settings) {
-  const c = (settings.callsign || "").trim();
-  const id = (settings.keyerId || "").trim();
-  if (c && id) return `${c}-${id}`;
-  return c || id || "(unnamed)";
+// A stable tagged selection value is sent back to Rust, which revalidates it against its live
+// browser registry rather than accepting an endpoint from the webview.
+function playerSelectionKey(player) {
+  return `${player.playerType}:${player.id}`;
+}
+
+function playerLabel(player) {
+  if (player.playerType === "esp32Player") {
+    return `W1VE ESP32 Player — ${player.name} (${player.id})${player.busy ? " (busy)" : ""}`;
+  }
+  return `${player.name}${player.router_capable ? "" : " (CW only)"}`;
 }
 
 function PortSelect({ label, value, ports, error, onChange }) {

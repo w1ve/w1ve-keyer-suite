@@ -1,0 +1,17 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "W1VE Remote Keyer",
+        "width": 760,
+        "height": 560,
+        "minWidth": 680,
+        "minHeight": 480,
+        "resizable": true,
+        "backgroundColor": "#0f1115",
+        "visible": false
+      }
+    ]
+  }
+}
