@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "W1VE Remote Keyer Player",
+  "identifier": "com.w1ve.remotekeyer.player",
+  "mainBinaryName": "w1ve-remote-keyer-player",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "W1VE Remote Keyer Player",
+        "width": 760,
+        "height": 560,
+        "minWidth": 680,
+        "minHeight": 480,
+        "resizable": true,
+        "visible": true
+      }
+    ]
+  },
+  "bundle": {
+    "shortDescription": "Remote keyer radio-site player",
+    "longDescription": "W1VE Remote Keyer Player: the radio-site end of a W1VE Remote Keyer pair. It receives keying from the operator and keys the radio with replay fail-safe."
+  }
+}

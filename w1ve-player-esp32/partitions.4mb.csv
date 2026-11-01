@@ -1,0 +1,6 @@
+# 4 MB flash layout for the W1VE ESP32 Player.
+# The app image is ~0.9 MB, so a single ~1.9 MB factory app fits comfortably with no OTA.
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  0x1C0000,

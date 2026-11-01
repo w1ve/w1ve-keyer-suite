@@ -1,0 +1,6 @@
+# 16 MB flash layout for the W1VE ESP32 Player (matches the historical partitions.csv).
+# Single factory app. No OTA for v0.1.
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  0x1C0000,

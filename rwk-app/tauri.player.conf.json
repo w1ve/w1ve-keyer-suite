@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "W1VE Remote Keyer Router Player",
+  "identifier": "com.w1ve.rwk.player",
+  "mainBinaryName": "w1ve-krp",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "W1VE Remote Keyer Router Player",
+        "backgroundColor": "#0f1115",
+        "visible": true,
+        "width": 512,
+        "height": 700,
+        "minWidth": 480,
+        "minHeight": 560,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "shortDescription": "Remote keyer router radio-site player",
+    "longDescription": "W1VE Remote Keyer Router Player: the compact radio-site monitor that receives keying from a W1VE Remote Keyer Router operator and keys the radio."
+  }
+}

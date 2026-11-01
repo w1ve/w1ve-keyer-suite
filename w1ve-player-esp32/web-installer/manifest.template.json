@@ -1,0 +1,14 @@
+{
+  "name": "W1VE ESP32 Player (__FLASH__)",
+  "version": "0.1.0",
+  "home_assistant_domain": null,
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "firmware.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

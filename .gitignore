@@ -4,7 +4,8 @@
 **/node_modules
 **/web/dist
 **/gen/schemas
-Cargo.lock
+# Cargo.lock is intentionally tracked for all workspaces so tagged release builds are
+# reproducible (CI builds from pinned dependency versions, not whatever resolves that day).
 
 # ─── Developer planning notes — NOT for the public repo ──────────
 # These are internal working documents (e.g. the macOS build/rent plan and its provisioning
@@ -14,6 +15,26 @@ docs/mac/
 *.plan.md
 PLAN-*.md
 *-PLAN.md
+
+# ─── Local build / capture material — NOT for the public repo ────
+# Verified release copies, run logs, UI captures, and local-only helper scripts. These are
+# produced during local builds and verification and are intentionally untracked (see CONTEXT.md).
+dist-exe/
+dist-win/
+shots/
+shots-*/
+shots[0-9]*/
+rwk-app/dist-local/
+**/_check*
+**/_about_test*
+_test_esp_ui.ps1
+# Root capture PNGs (documentation images live elsewhere; these are local captures).
+/about.png
+/sample_about.png
+/station-about.png
+/station-about2.png
+/paddle-image.png
+/straightkey-image.png
 
 # ─── Editor / OS cruft ───────────────────────────────────────────
 .DS_Store

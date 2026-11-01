@@ -36,6 +36,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Remote keyer router operator/player",
+    "longDescription": "W1VE Remote Keyer Router: a remote Morse code (CW) keyer with ham-router forwarding and Flex support, paired with a Player at the radio site.",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
   }
 }

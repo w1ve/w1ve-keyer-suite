@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>W1VE ESP32 Player — Firmware Installer</title>
+  <!-- ESP Web Tools: flashes an ESP32 straight from the browser over USB (Chrome/Edge). -->
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; min-height: 100vh;
+      background: #0f1115; color: #e6e8eb;
+      font: 16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      display: flex; justify-content: center;
+    }
+    main { max-width: 720px; padding: 2.5rem 1.5rem 4rem; width: 100%; }
+    h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+    .sub { color: #9aa3ad; margin: 0 0 2rem; }
+    .card {
+      background: #171a1f; border: 1px solid #262b33; border-radius: 12px;
+      padding: 1.25rem 1.5rem; margin: 0 0 1rem;
+      display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+    }
+    .card h2 { font-size: 1.1rem; margin: 0; }
+    .card p { margin: .2rem 0 0; color: #9aa3ad; font-size: .9rem; }
+    esp-web-install-button { --esp-tools-button-color: #0f1115; }
+    esp-web-install-button[install-unsupported] { display: none; }
+    .unsupported {
+      display: none; background: #2a1d1d; border: 1px solid #5a2d2d;
+      border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1.5rem; color: #f0c0c0;
+    }
+    ol { color: #c7ccd2; }
+    code { background: #22262d; padding: .1rem .35rem; border-radius: 4px; }
+    footer { margin-top: 2.5rem; color: #6b7480; font-size: .85rem; }
+    a { color: #6ea8fe; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>W1VE ESP32 Player</h1>
+    <p class="sub">Flash the Player firmware to an ESP32-S3 board directly from your browser.</p>
+
+    <div class="unsupported" id="unsupported">
+      Your browser can't talk to USB serial devices. Open this page in
+      <strong>Chrome</strong> or <strong>Edge</strong> on a desktop computer.
+    </div>
+
+    <div class="card">
+      <div>
+        <h2>4 MB board</h2>
+        <p>Most common low-cost ESP32-S3 modules.</p>
+      </div>
+      <esp-web-install-button manifest="firmware/4MB/manifest.json">
+        <button slot="activate">Install (4 MB)</button>
+      </esp-web-install-button>
+    </div>
+
+    <div class="card">
+      <div>
+        <h2>8 MB board</h2>
+        <p>Mid-range ESP32-S3 modules.</p>
+      </div>
+      <esp-web-install-button manifest="firmware/8MB/manifest.json">
+        <button slot="activate">Install (8 MB)</button>
+      </esp-web-install-button>
+    </div>
+
+    <div class="card">
+      <div>
+        <h2>16 MB board</h2>
+        <p>DevKit-C and other 16 MB modules.</p>
+      </div>
+      <esp-web-install-button manifest="firmware/16MB/manifest.json">
+        <button slot="activate">Install (16 MB)</button>
+      </esp-web-install-button>
+    </div>
+
+    <h3 style="margin-top:2rem">How to flash</h3>
+    <ol>
+      <li>Connect the ESP32-S3 to this computer with a USB data cable.</li>
+      <li>Pick the card that matches your board's flash size, then click <strong>Install</strong>.</li>
+      <li>Choose the board's serial port in the browser prompt. If no port appears, hold
+          <code>BOOT</code>, tap <code>RESET</code>, release <code>BOOT</code>, then try again.</li>
+      <li>Let the flash finish. The board reboots into the setup access point
+          <code>W1VE-Player-XXXX</code>.</li>
+    </ol>
+    <p style="color:#9aa3ad">Not sure of your flash size? A fresh install erases the chip; picking
+       a layout larger than the physical flash will fail safely at flash time, so start with the
+       smaller option if unsure.</p>
+
+    <footer>
+      W1VE Keyer Suite &middot; firmware built by GitHub Actions &middot;
+      <a href="https://github.com/w1ve/w1ve-keyer-suite">source</a>
+    </footer>
+  </main>
+
+  <script>
+    // Surface a clear message on browsers without Web Serial (Safari, Firefox, mobile).
+    if (!('serial' in navigator)) {
+      document.getElementById('unsupported').style.display = 'block';
+    }
+  </script>
+</body>
+</html>

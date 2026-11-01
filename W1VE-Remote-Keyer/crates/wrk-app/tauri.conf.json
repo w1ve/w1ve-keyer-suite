@@ -35,6 +35,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Remote CW keyer operator/player",
+    "longDescription": "W1VE Remote Keyer: a paired Morse code (CW) keyer. The operator sends keying to a remote Player at the radio site over a secure link.",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
   }
 }
