@@ -125,6 +125,34 @@ jobs:
         working-directory: ${{ matrix.product.workspace }}/${{ matrix.product.web }}
         run: npm ci && npm run build
 
+      # For a universal macOS build, Tauri's bundler copies EVERY [[bin]] the crate declares
+      # into the .app, not just mainBinaryName. The paired crates (wrk-app, rwk-app) have a
+      # second binary (the Player/Operator sibling) that the universal build would not have
+      # produced, so the bundler fails with "Failed to copy binary ... does not exist".
+      # Pre-build BOTH binaries for BOTH arches and lipo them into the universal output dir so
+      # every declared binary exists before bundling. No-op for the single-binary wk-app.
+      - name: Pre-build universal binaries
+        working-directory: ${{ matrix.product.workspace }}
+        run: |
+          set -euo pipefail
+          cargo build --release --features custom-protocol --target aarch64-apple-darwin
+          cargo build --release --features custom-protocol --target x86_64-apple-darwin
+          uni="target/universal-apple-darwin/release"
+          mkdir -p "$uni"
+          # lipo every real executable the crate produced (w1ve-*, no extension) into the
+          # universal dir. Skip .d/.dSYM artifacts; only operate on Mach-O executables.
+          for arm in target/aarch64-apple-darwin/release/w1ve-*; do
+            [ -f "$arm" ] && [ -x "$arm" ] || continue
+            case "$arm" in *.*) continue;; esac
+            file "$arm" | grep -q 'Mach-O' || continue
+            name=$(basename "$arm")
+            intel="target/x86_64-apple-darwin/release/$name"
+            if [ -f "$intel" ]; then
+              lipo -create "$arm" "$intel" -output "$uni/$name"
+              echo "lipo: $name"
+            fi
+          done
+
       # Two build paths. When the APPLE_CERTIFICATE secret is present, build signed +
       # notarized; otherwise build unsigned. Passing empty Apple env vars makes the Tauri
       # bundler try (and fail) to codesign with a blank certificate, so the signing env is
