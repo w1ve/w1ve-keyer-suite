@@ -6,7 +6,7 @@ GitHub Release, plus a Docker image and a browser-based ESP32 flasher.
 
 ## What ships
 
-| Product | Windows x64 | macOS (arm64 + x64) | Linux x64 | Raspberry Pi (arm64) | Android | ESP32-S3 |
+| Product | Windows x64 | macOS (universal) | Linux x64 | Raspberry Pi (arm64) | Android | ESP32-S3 |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | W1VE Keyer | `.exe` | `.dmg` | `.deb` + `.AppImage` | `.deb` + `.AppImage` | — | — |
 | W1VE Remote Keyer | `.exe` | `.dmg` | `.deb` + `.AppImage` | `.deb` + `.AppImage` | Phase 2 | — |

@@ -1,6 +1,6 @@
 name: Release desktop apps
 
-# Builds all five desktop products for Windows-x64, macOS (arm64 + x64), Linux-x64
+# Builds all five desktop products for Windows-x64, macOS (universal arm64 + x64), Linux-x64
 # (.deb + .AppImage), and Raspberry Pi (Linux arm64, .deb + .AppImage), then attaches
 # every artifact to a single GitHub Release.
 #
@@ -90,7 +90,7 @@ jobs:
   # Signing/notarization secrets are optional: absent -> unsigned .dmg.
   # ---------------------------------------------------------------------------
   macos:
-    name: macOS ${{ matrix.target.arch }} — ${{ matrix.product.name }}
+    name: macOS universal — ${{ matrix.product.name }}
     runs-on: macos-latest
     # Secrets can't be used in a step `if:`, but they can in env. Capture whether an Apple
     # signing cert is configured once here; the build steps gate on this env value.
@@ -99,9 +99,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - { arch: "arm64", triple: "aarch64-apple-darwin" }
-          - { arch: "x64",   triple: "x86_64-apple-darwin" }
+        # One universal (arm64 + x64) .dmg per product. A single macOS job per product keeps
+        # the macOS runner queue small enough to avoid cancellations under GitHub's limited
+        # macOS concurrency, and gives users one .dmg that runs on both Intel and Apple Silicon.
         product:
           - { name: "W1VE Keyer",                     workspace: "W1VE-Keyer",        confdir: "crates/wk-app",  web: "crates/wk-app/web", config: "", slug: "w1ve-keyer" }
           - { name: "W1VE Remote Keyer",              workspace: "W1VE-Remote-Keyer", confdir: "crates/wrk-app", web: "crates/wrk-app/web", config: "tauri.operator.conf.json", slug: "w1ve-remote-keyer" }
@@ -112,7 +112,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target.triple }}
+          # Universal builds need both architecture targets installed.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ matrix.product.workspace }}
@@ -142,7 +143,7 @@ jobs:
           projectPath: ${{ matrix.product.workspace }}/${{ matrix.product.confdir }}
           args: >-
             ${{ matrix.product.config != '' && format('--config {0}', matrix.product.config) || '' }}
-            --target ${{ matrix.target.triple }}
+            --target universal-apple-darwin
             --bundles dmg
 
       - name: Build + bundle (unsigned)
@@ -152,7 +153,7 @@ jobs:
           projectPath: ${{ matrix.product.workspace }}/${{ matrix.product.confdir }}
           args: >-
             ${{ matrix.product.config != '' && format('--config {0}', matrix.product.config) || '' }}
-            --target ${{ matrix.target.triple }}
+            --target universal-apple-darwin
             --bundles dmg
 
       - name: Collect dmg
@@ -160,12 +161,12 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/dist"
           find . -path "*/release/bundle/dmg/*.dmg" -print0 | while IFS= read -r -d '' f; do
-            cp "$f" "$GITHUB_WORKSPACE/dist/${{ matrix.product.slug }}-${{ matrix.target.arch }}.dmg"
+            cp "$f" "$GITHUB_WORKSPACE/dist/${{ matrix.product.slug }}-universal.dmg"
           done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.target.arch }}-${{ matrix.product.slug }}
+          name: macos-universal-${{ matrix.product.slug }}
           path: dist/*.dmg
 
   # ---------------------------------------------------------------------------
