@@ -92,6 +92,10 @@ jobs:
   macos:
     name: macOS ${{ matrix.target.arch }} — ${{ matrix.product.name }}
     runs-on: macos-latest
+    # Secrets can't be used in a step `if:`, but they can in env. Capture whether an Apple
+    # signing cert is configured once here; the build steps gate on this env value.
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -125,7 +129,7 @@ jobs:
       # bundler try (and fail) to codesign with a blank certificate, so the signing env is
       # only present on the signed path.
       - name: Build + bundle (signed)
-        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        if: ${{ env.HAS_APPLE_CERT == 'true' }}
         uses: tauri-apps/tauri-action@v0
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -142,7 +146,7 @@ jobs:
             --bundles dmg
 
       - name: Build + bundle (unsigned)
-        if: ${{ secrets.APPLE_CERTIFICATE == '' }}
+        if: ${{ env.HAS_APPLE_CERT != 'true' }}
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: ${{ matrix.product.workspace }}/${{ matrix.product.confdir }}
