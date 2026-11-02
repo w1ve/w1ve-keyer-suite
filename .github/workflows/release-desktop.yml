@@ -337,4 +337,5 @@ jobs:
         with:
           files: all-artifacts/*
           body_path: docs/release-notes.md
+          prerelease: true
           fail_on_unmatched_files: false
