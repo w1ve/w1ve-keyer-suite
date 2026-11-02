@@ -120,17 +120,30 @@ jobs:
         working-directory: ${{ matrix.product.workspace }}/${{ matrix.product.web }}
         run: npm ci && npm run build
 
-      - name: Build + bundle (Tauri)
+      # Two build paths. When the APPLE_CERTIFICATE secret is present, build signed +
+      # notarized; otherwise build unsigned. Passing empty Apple env vars makes the Tauri
+      # bundler try (and fail) to codesign with a blank certificate, so the signing env is
+      # only present on the signed path.
+      - name: Build + bundle (signed)
+        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
         uses: tauri-apps/tauri-action@v0
         env:
-          # Apple signing + notarization. Set these as repo secrets to produce
-          # Gatekeeper-clean .dmg files. If unset, tauri-action builds unsigned.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: ${{ matrix.product.workspace }}/${{ matrix.product.confdir }}
+          args: >-
+            ${{ matrix.product.config != '' && format('--config {0}', matrix.product.config) || '' }}
+            --target ${{ matrix.target.triple }}
+            --bundles dmg
+
+      - name: Build + bundle (unsigned)
+        if: ${{ secrets.APPLE_CERTIFICATE == '' }}
+        uses: tauri-apps/tauri-action@v0
         with:
           projectPath: ${{ matrix.product.workspace }}/${{ matrix.product.confdir }}
           args: >-

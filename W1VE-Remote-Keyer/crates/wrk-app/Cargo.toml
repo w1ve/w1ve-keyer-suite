@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+# Required by `cargo tauri build` to pick a binary when the crate has more than one.
+# The Player bundle overrides this via `--bin` in CI (see the release workflow).
+default-run = "w1ve-remote-keyer"
 
 # The Client (operating position) binary: paddle/keyer + sends edges to the Server.
 [[bin]]
