@@ -5,6 +5,11 @@ import App from "./App.jsx";
 import StationApp from "./StationApp.jsx";
 import { APP_NAME_CLIENT, APP_NAME_STATION, APP_VERSION } from "./app-info.js";
 import "./styles.css";
+// Import the splash artwork through Vite so it resolves to a hashed asset URL. A root-relative
+// "/hero.png" from the public dir does not load in the separate splash WebviewWindow on Windows
+// (the secondary window's origin cannot reach the root path), which left the splash a blank dark
+// box. A Vite-imported asset URL resolves correctly in every window.
+import heroArt from "./assets/hero.png";
 
 // The splash popup loads this same entry point and shows the artwork alone, so it uses the asset
 // pipeline that is known to work (a standalone splash.html rendered as an empty window). The
@@ -33,7 +38,7 @@ function SplashArtwork() {
   return (
     <div style={{ position: "fixed", inset: 0, background: "#0d1721" }}>
       <img
-        src="/hero.png"
+        src={heroArt}
         alt=""
         style={{ display: "block", width: "100vw", height: "100vh" }}
       />

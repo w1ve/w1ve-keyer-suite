@@ -341,6 +341,10 @@ struct TcpEntry {
     /// Set once smoltcp reports the socket closed, so its FIN is forwarded exactly once by
     /// dropping the inbound sender.
     closed: bool,
+    /// Set once we have issued a smoltcp `close()` because the user dropped their send half.
+    /// Without this the peer never sees a FIN, so the other end's relay blocks forever and a
+    /// re-arming responder never accepts the next connection.
+    half_closed: bool,
 }
 
 /// Owns the [`NetStack`] and tunnel, and services every socket on one task.
@@ -440,6 +444,9 @@ impl NetDriver {
                 }
             }
             Command::ConnectTcp { remote, local_port, outbound, inbound, reply } => {
+                // A forward whose connection ended may not have been reaped yet; free its port
+                // first so a reused source/inner port is available.
+                self.reap_closed_tcp();
                 let handle = self.stack.open_tcp();
                 match self.stack.tcp_connect(handle, remote, local_port) {
                     Ok(()) => {
@@ -452,6 +459,7 @@ impl NetDriver {
                                 inbound,
                                 established: false,
                                 closed: false,
+                                half_closed: false,
                                 pending: Vec::new(),
                             },
                         );
@@ -463,6 +471,9 @@ impl NetDriver {
                 }
             }
             Command::ListenTcp { port, outbound, inbound, reply } => {
+                // Free any finished socket still bound to this port before re-listening, so the
+                // responder's re-armed listener can accept the next connection.
+                self.reap_closed_tcp();
                 let handle = self.stack.open_tcp();
                 match self.stack.tcp_listen(handle, port) {
                     Ok(()) => {
@@ -475,6 +486,7 @@ impl NetDriver {
                                 inbound,
                                 established: false,
                                 closed: false,
+                                half_closed: false,
                                 pending: Vec::new(),
                             },
                         );
@@ -495,10 +507,49 @@ impl NetDriver {
         self.stack.poll();
         self.pump_udp();
         self.pump_tcp();
+        // Free fully-closed TCP sockets so their inner port can be listened on (or dialed)
+        // again. Without this a responder's re-armed listener on the same port is dead, which
+        // is why only the first forwarded connection ever worked.
+        self.reap_closed_tcp();
         // smoltcp may have more to emit after the pumps queued sends; poll once more so those
         // segments are framed in this pass rather than waiting for the next wake.
         self.stack.poll();
         self.flush_outbound().await;
+    }
+
+    /// Removes TCP sockets that are finished, freeing their ports.
+    ///
+    /// A socket is finished when either the stack has fully closed it (the `closed` flag set by
+    /// [`pump_tcp`] once an established socket went inactive and can no longer receive), or the
+    /// user dropped its side (the outbound channel is closed) and the socket is no longer
+    /// active. A still-connecting socket (not yet established) is never reaped, so a slow
+    /// handshake is not mistaken for a dead connection.
+    fn reap_closed_tcp(&mut self) {
+        // Collect the candidate (id, handle, closed-flag, established-flag, user-gone) tuples
+        // first, so the immutable reads do not clash with the `&mut self.stack` borrow needed
+        // to inspect each socket's activity below.
+        let candidates: Vec<(usize, crate::engine::netstack::TcpHandle, bool, bool, bool)> = self
+            .tcp
+            .iter()
+            .map(|(id, entry)| {
+                (*id, entry.handle, entry.closed, entry.established, entry.outbound.is_closed())
+            })
+            .collect();
+        let mut done = Vec::new();
+        for (id, handle, closed, established, user_gone) in candidates {
+            let active = self.stack.tcp(handle).is_active();
+            // Reap a socket the stack finished (established then inactive, or already flagged
+            // closed), or one whose user dropped its side and is no longer active. Never reap a
+            // socket still mid-handshake (not established and still active).
+            let stack_done = closed || (established && !active);
+            if stack_done || (user_gone && !active) {
+                done.push((id, handle));
+            }
+        }
+        for (id, handle) in done {
+            self.tcp.remove(&id);
+            self.stack.close_tcp(handle);
+        }
     }
 
     /// Releases UDP sockets whose user side has gone, so their ports can be bound again.
@@ -551,9 +602,18 @@ impl NetDriver {
     /// Moves bytes between each TCP socket and its channels, and forwards a close.
     fn pump_tcp(&mut self) {
         for entry in self.tcp.values_mut() {
-            // User -> stack: queue what the user sent, then write while the send buffer has room.
-            while let Ok(data) = entry.outbound.try_recv() {
-                entry.pending.extend_from_slice(&data);
+            // Drain the user's queued sends. `try_recv` returns `Disconnected` once the user
+            // dropped their send half — remember that so we can half-close the socket below.
+            let mut user_send_closed = false;
+            loop {
+                match entry.outbound.try_recv() {
+                    Ok(data) => entry.pending.extend_from_slice(&data),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        user_send_closed = true;
+                        break;
+                    }
+                }
             }
             while !entry.pending.is_empty() {
                 match self.stack.tcp_send(entry.handle, &entry.pending) {
@@ -571,6 +631,17 @@ impl NetDriver {
                         break;
                     }
                 }
+            }
+            // When the user's send half is gone and everything queued has been handed to the
+            // stack, half-close the socket so a FIN crosses to the peer. Without this the far
+            // end's relay never sees end-of-stream: its `recv` blocks forever, a re-arming
+            // responder never accepts the next connection, and only the first forward worked.
+            if user_send_closed && !entry.half_closed && entry.pending.is_empty() {
+                let socket = self.stack.tcp(entry.handle);
+                if socket.may_send() {
+                    socket.close();
+                }
+                entry.half_closed = true;
             }
             // Stack -> user: hand up whatever can be read.
             loop {

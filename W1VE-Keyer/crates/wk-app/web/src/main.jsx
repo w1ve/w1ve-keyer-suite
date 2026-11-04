@@ -4,6 +4,10 @@ import { invoke } from "@tauri-apps/api/core";
 import App from "./App.jsx";
 import { APP_NAME, APP_VERSION } from "./app-info.js";
 import "./styles.css";
+// Vite-imported splash artwork. A root-relative "/splash-hero.png" from the public dir does not
+// load in the separate splash WebviewWindow on Windows, leaving the splash a blank dark box; the
+// bundled asset URL resolves in every window.
+import heroArt from "./assets/splash-hero.png";
 
 // The splash popup loads this same entry point and shows the artwork alone. The window is
 // identified by its Tauri label — "splash" — set by the window builder in src/lib.rs (a
@@ -16,7 +20,7 @@ function SplashArtwork() {
   return (
     <div style={{ position: "fixed", inset: 0, background: "#0d1721" }}>
       <img
-        src="/splash-hero.png"
+        src={heroArt}
         alt=""
         style={{ display: "block", width: "100vw", height: "100vh" }}
       />

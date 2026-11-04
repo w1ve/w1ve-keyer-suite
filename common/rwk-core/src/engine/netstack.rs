@@ -331,6 +331,16 @@ impl NetStack {
         let _ = self.sockets.remove(handle.0);
     }
 
+    /// Releases a TCP socket, freeing its port for a later [`listen`](Self::tcp_listen) or
+    /// [`connect`](Self::tcp_connect).
+    ///
+    /// Without this, a closed forward connection's socket lingers in the set still bound to
+    /// its port, so the Station responder's re-armed `listen_tcp` on the same port cannot
+    /// accept the next connection — the bug where only the first forwarded connection worked.
+    pub fn close_tcp(&mut self, handle: TcpHandle) {
+        let _ = self.sockets.remove(handle.0);
+    }
+
     /// Opens an unconnected TCP socket, for either [`listen`](Self::tcp_listen) or
     /// [`connect`](Self::tcp_connect).
     #[must_use]

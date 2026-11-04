@@ -289,7 +289,13 @@ impl StationTcpResponder {
     }
 }
 
-/// Pumps a netstack TCP connection and a host-OS stream both ways until either closes.
+/// Pumps a netstack TCP connection and a host-OS stream both ways until *either* closes.
+///
+/// A `select!` rather than a `join!`: when one direction ends (the tunnel peer closed, or the
+/// LAN device closed), the other is dropped rather than left to block forever. Waiting for both
+/// with `join!` deadlocked a half-closed connection — e.g. an echo/command service that never
+/// closes its side — so the responder never returned here and never re-armed for the next
+/// connection. That was the bug where only the first forwarded connection worked.
 async fn relay_conn_to_host(conn: crate::engine::netstack_driver::TcpConn, host: TcpStream) {
     let (sender, mut receiver) = conn.split();
     let (mut host_read, mut host_write) = host.into_split();
@@ -317,7 +323,12 @@ async fn relay_conn_to_host(conn: crate::engine::netstack_driver::TcpConn, host:
             }
         }
     };
-    tokio::join!(down, up);
+    // Whichever direction finishes first ends the relay; dropping the other future cancels it
+    // so a one-sided close cannot wedge the connection open.
+    tokio::select! {
+        () = down => {}
+        () = up => {}
+    }
 }
 
 /// The Station end of a UDP forward: relay datagrams arriving on the tunnel's inner address to
@@ -524,5 +535,143 @@ mod tests {
 
         tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    /// Reproduces the shipped Router topology end to end: the Client's `TunnelTcpForward` on a
+    /// host port, carried over the tunnel to the Station's real `StationTcpResponder`, which
+    /// dials a loopback TCP echo server (standing in for VSPE on 127.0.0.1:PORT at the radio
+    /// site). This is the path the operator's software actually uses — the existing
+    /// `tcp_forward_bridges_a_host_connection_to_a_tunnel_socket` test bypasses the responder
+    /// with a bare `listen_tcp`, so it never covered this.
+    #[tokio::test]
+    async fn station_responder_relays_to_a_loopback_target_over_the_tunnel() {
+        let (client, station) = linked().await;
+
+        // The radio-site service: a loopback TCP echo server, like VSPE on 127.0.0.1.
+        let radio = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let radio_addr = radio.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut s, _)) = radio.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 64];
+                        loop {
+                            match s.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if s.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    break;
+                }
+            }
+        });
+
+        // The Station end: the REAL responder, listening on inner port 5555 and dialing the
+        // loopback echo (the target the operator typed as 127.0.0.1).
+        let (s_tx, s_rx) = watch::channel(false);
+        let responder = StationTcpResponder::new(station, 5555, radio_addr);
+        let s_task = tokio::spawn(responder.run(s_rx));
+
+        // The Client end: a host listener bridged to the Station's inner (10.0.0.2:5555).
+        let forward = TunnelTcpForward::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            client,
+            (IpAddr::V4(STATION_IP), 5555),
+        )
+        .await
+        .unwrap();
+        let local = forward.local_addr().unwrap();
+        let (c_tx, c_rx) = watch::channel(false);
+        let c_task = tokio::spawn(forward.run(c_rx));
+
+        // The operator's software connects to the host forward and must be echoed by the
+        // loopback service at the radio site, across the tunnel.
+        let mut app = TcpStream::connect(local).await.unwrap();
+        app.write_all(b"cq de w1ve").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(8), app.read(&mut buf))
+            .await
+            .expect("echo did not return across the tunnel")
+            .unwrap();
+        assert_eq!(&buf[..n], b"cq de w1ve");
+
+        s_tx.send(true).unwrap();
+        c_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), s_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), c_task).await;
+    }
+
+    /// A SECOND connection through the same responder must also work — the responder re-arms a
+    /// fresh `listen_tcp` after each connection, and the driver must have reaped the previous
+    /// (now-closed) inner TCP socket so the port can be listened on again.
+    #[tokio::test]
+    async fn station_responder_accepts_a_second_connection_after_the_first_closes() {
+        let (client, station) = linked().await;
+
+        let radio = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let radio_addr = radio.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                match radio.accept().await {
+                    Ok((mut s, _)) => {
+                        let mut buf = [0u8; 64];
+                        if let Ok(n) = s.read(&mut buf).await {
+                            let _ = s.write_all(&buf[..n]).await;
+                            let _ = s.flush().await;
+                        }
+                        // Drop the connection so the next one is fresh.
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let (s_tx, s_rx) = watch::channel(false);
+        let responder = StationTcpResponder::new(station, 5556, radio_addr);
+        let s_task = tokio::spawn(responder.run(s_rx));
+
+        let forward = TunnelTcpForward::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            client.clone(),
+            (IpAddr::V4(STATION_IP), 5556),
+        )
+        .await
+        .unwrap();
+        let local = forward.local_addr().unwrap();
+        let (c_tx, c_rx) = watch::channel(false);
+        let c_task = tokio::spawn(forward.run(c_rx));
+
+        // Two sequential connections through the same forward+responder.
+        for attempt in [b"first ".to_vec(), b"second".to_vec()] {
+            let mut app = None;
+            for _ in 0..50 {
+                if let Ok(s) = TcpStream::connect(local).await {
+                    app = Some(s);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let mut app = app.expect("could not reach the client forward");
+            app.write_all(&attempt).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = tokio::time::timeout(Duration::from_secs(8), app.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("no echo for {:?} across the tunnel", String::from_utf8_lossy(&attempt)))
+                .unwrap();
+            assert_eq!(&buf[..n], &attempt[..]);
+            drop(app);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        s_tx.send(true).unwrap();
+        c_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), s_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), c_task).await;
     }
 }

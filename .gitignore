@@ -36,6 +36,9 @@ _test_esp_ui.ps1
 /paddle-image.png
 /straightkey-image.png
 
+# ─── Marketing landing page (built/deployed separately, not part of the repo) ───
+web-landing/
+
 # ─── Editor / OS cruft ───────────────────────────────────────────
 .DS_Store
 Thumbs.db
