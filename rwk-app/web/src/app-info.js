@@ -3,4 +3,4 @@
 // is common.
 export const APP_NAME_CLIENT = "W1VE Remote Keyer Router";
 export const APP_NAME_STATION = "W1VE Remote Keyer Router Player";
-export const APP_VERSION = "0.1.0";
+export const APP_VERSION = "0.1.1";

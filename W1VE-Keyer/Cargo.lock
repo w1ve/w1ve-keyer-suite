@@ -3047,7 +3047,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rwk-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "boringtun",
  "cpal",
@@ -5070,7 +5070,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wk-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gtk",
  "rwk-core",
