@@ -1,0 +1,12 @@
+[package]
+name = "rwk_keyer"
+version = "0.1.0"
+edition = "2021"
+
+# A real RWK Keyer (Client role) built on the suite's own rwk-core: it pairs through the relay and
+# sends CW edge frames over WireGuard, exactly as the desktop Remote Keyer does. Used to prove the
+# ESP32 WAN transport interoperates with genuine suite code, not a reimplementation.
+[dependencies]
+# When this project lives in the w1ve-keyer-suite repo, the shared core is a few levels up.
+rwk-core = { path = "../../../common/rwk-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }

@@ -1,0 +1,19 @@
+# ESP-IDF build artefacts
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# Local toolchain (ESP-IDF + Python + esp32c6 toolchain), installed by tools/setup-idf.sh
+.toolchain/
+install.log
+
+# Editors
+.vscode/
+.idea/
+*.swp
+# Host and interop test build artefacts (sources are tracked, outputs are not)
+tests/host/test_rwk
+tests/interop/wg_peer
+tests/interop/*/target/

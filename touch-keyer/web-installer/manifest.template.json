@@ -1,0 +1,14 @@
+{
+  "name": "W1VE Touch Keyer",
+  "version": "__VERSION__",
+  "home_assistant_domain": null,
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C6",
+      "parts": [
+        { "path": "firmware.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

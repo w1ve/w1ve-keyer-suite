@@ -1,8 +1,12 @@
-name: Release ESP32 Player firmware
+name: Release ESP32 firmware
 
-# Builds the W1VE ESP32 Player firmware for 4 MB, 8 MB, and 16 MB flash sizes, produces a
-# single merged flashable image per size, and publishes an ESP Web Tools install page to
-# GitHub Pages so operators can flash a board from Chrome/Edge over USB.
+# Builds the two ESP32 firmwares in the suite and publishes them together:
+#   * W1VE ESP32 Player (esp32s3) for 4 MB, 8 MB, and 16 MB flash sizes, in w1ve-player-esp32/
+#   * W1VE Touch Keyer (esp32c6, 8 MB) in touch-keyer/
+# Each produces a single merged flashable image, all are attached to the GitHub Release, and one
+# ESP Web Tools site is deployed to GitHub Pages: the Player installer at the root and the Touch
+# Keyer installer under /touch-keyer/. A single pages job keeps the one Pages site consistent
+# (two separate deploy-pages calls would race and clobber each other).
 #
 # Triggered by a version tag (v0.1.0, v0.2.0, ...). Also runnable on demand to test.
 
@@ -22,8 +26,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build firmware (${{ matrix.flash }} flash)
+  # ─── W1VE ESP32 Player (esp32s3), one build per flash size ───────────────────────────────────
+  build-player:
+    name: Build Player firmware (${{ matrix.flash }} flash)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -98,26 +103,81 @@ jobs:
           name: esp32-${{ matrix.flash }}
           path: esp32-dist/${{ matrix.flash }}
 
-  # Attach every merged image to the GitHub Release (tag builds only).
+  # ─── W1VE Touch Keyer (esp32c6, 8 MB) ────────────────────────────────────────────────────────
+  build-touch-keyer:
+    name: Build Touch Keyer firmware (esp32c6, 8 MB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tracked sdkconfig.defaults already targets esp32c6 at 8 MB with the custom partition
+      # table, so no per-build overlay is needed. Remove any stray generated sdkconfig.
+      - name: Clean generated config
+        working-directory: touch-keyer
+        run: rm -f sdkconfig
+
+      - name: Build with ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3     # matches the project's local toolchain (v5.3.4)
+          target: esp32c6
+          path: touch-keyer
+
+      - name: Merge flashable image
+        working-directory: touch-keyer
+        run: |
+          pip install --quiet esptool
+          outdir="$GITHUB_WORKSPACE/touch-keyer-dist"
+          mkdir -p "$outdir"
+          python -m esptool --chip esp32c6 merge_bin \
+            --flash_mode dio --flash_freq 80m --flash_size 8MB \
+            -o "$outdir/w1ve-touch-keyer-8MB-merged.bin" \
+            0x0     build/bootloader/bootloader.bin \
+            0x8000  build/partition_table/partition-table.bin \
+            0x10000 build/w1ve-touch-keyer.bin
+          cp build/bootloader/bootloader.bin "$outdir/"
+          cp build/partition_table/partition-table.bin "$outdir/"
+          cp build/w1ve-touch-keyer.bin "$outdir/"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: touch-keyer-firmware
+          path: touch-keyer-dist
+
+  # ─── Attach every merged image (both products) to the GitHub Release (tag builds only) ───────
   release:
-    needs: build
+    needs: [build-player, build-touch-keyer]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: esp32-*
           path: esp32-dist
           merge-multiple: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: touch-keyer-firmware
+          path: touch-keyer-dist
       - name: Attach firmware to release
         uses: softprops/action-gh-release@v2
         with:
+          # The Touch Keyer documentation rides along as the release notes body; the Player
+          # firmware and both products' images are attached as assets.
+          body_path: touch-keyer/docs/release-notes.md
+          append_body: true
           files: |
             esp32-dist/**/w1ve-esp32-player-*-merged.bin
+            touch-keyer-dist/w1ve-touch-keyer-8MB-merged.bin
+            touch-keyer/README.md
+            touch-keyer/CONTEXT.md
+            touch-keyer/WAN.md
 
-  # Build and deploy the ESP Web Tools install page to GitHub Pages.
+  # ─── One Pages deploy for both installers: Player at the root, Touch Keyer under /touch-keyer/ ─
   pages:
-    needs: build
+    needs: [build-player, build-touch-keyer]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -127,11 +187,17 @@ jobs:
           pattern: esp32-*
           path: downloaded
           merge-multiple: false
-      - name: Assemble web installer
+      - uses: actions/download-artifact@v4
+        with:
+          name: touch-keyer-firmware
+          path: downloaded-touch-keyer
+      - name: Assemble web installers
         run: |
           site="$GITHUB_WORKSPACE/_site"
+          version="${GITHUB_REF_NAME#v}"
+
+          # ── ESP32 Player at the site root (unchanged layout) ──
           mkdir -p "$site/firmware/4MB" "$site/firmware/8MB" "$site/firmware/16MB"
-          # The merged image lives at offset 0x0, so the manifest references a single part.
           cp downloaded/esp32-4MB/w1ve-esp32-player-4MB-merged.bin   "$site/firmware/4MB/firmware.bin"
           cp downloaded/esp32-8MB/w1ve-esp32-player-8MB-merged.bin   "$site/firmware/8MB/firmware.bin"
           cp downloaded/esp32-16MB/w1ve-esp32-player-16MB-merged.bin "$site/firmware/16MB/firmware.bin"
@@ -140,6 +206,13 @@ jobs:
             sed "s/__FLASH__/$s/g" w1ve-player-esp32/web-installer/manifest.template.json \
               > "$site/firmware/$s/manifest.json"
           done
+
+          # ── Touch Keyer under /touch-keyer/ ──
+          mkdir -p "$site/touch-keyer/firmware"
+          cp downloaded-touch-keyer/w1ve-touch-keyer-8MB-merged.bin "$site/touch-keyer/firmware/firmware.bin"
+          cp touch-keyer/web-installer/index.html "$site/touch-keyer/index.html"
+          sed "s/__VERSION__/${version}/g" touch-keyer/web-installer/manifest.template.json \
+            > "$site/touch-keyer/firmware/manifest.json"
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

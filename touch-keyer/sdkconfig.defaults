@@ -1,0 +1,34 @@
+CONFIG_IDF_TARGET="esp32c6"
+
+# 8 MB in-package flash on the ESP32-C6FH8; 1.5 MB app partition is ample for LVGL + fonts.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Single 160 MHz core: spend it on keyer timing and the display, not on debug noise.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# LVGL 8.4: 16-bit colour, partial buffers. Extra font sizes for the WPM readout.
+CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_USE_LOG=n
+
+# I2C touch at 400 kHz, new (5.2+) master driver.
+
+# Wi-Fi: station only, no SoftAP yet (the join page is a later slice).
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+CONFIG_HTTPD_WS_SUPPORT=y
+CONFIG_LWIP_MAX_SOCKETS=20
+# WAN transport (WireGuard-compatible): ChaCha20-Poly1305 for the handshake and data. Curve25519 is
+# already on; BLAKE2s is implemented in main/rwk because mbedTLS has none.
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y

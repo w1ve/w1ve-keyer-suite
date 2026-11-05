@@ -1,0 +1,41 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "board_display.c"
+        "board_touch.c"
+        "board_led.c"
+        "keyer.c"
+        "macro.c"
+        "ui.c"
+        "net.c"
+        "remote.c"
+        "wan.c"
+        "web.c"
+        "rwk/rwk_blake2s.c"
+        "rwk/rwk_edge.c"
+        "rwk/rwk_lineclaim.c"
+        "rwk/rwk_stun.c"
+        "rwk/rwk_jitter.c"
+        "rwk/rwk_wg.c"
+        "rwk/rwk_frame.c"
+        "rwk/rwk_inner.c"
+        "rwk/rwk_crypto_mbedtls.c"
+        "rwk/rwk_selftest.c"
+    INCLUDE_DIRS
+        "."
+        "include"
+    REQUIRES
+        driver
+        esp_lcd
+        esp_timer
+        esp_wifi
+        esp_netif
+        esp_http_server
+        lwip
+        nvs_flash
+        lvgl
+        mbedtls
+)
+
+# Firmware version string, set in the top-level CMakeLists.txt, available to the component sources.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE W1VE_FW_VERSION="${W1VE_FW_VERSION}")

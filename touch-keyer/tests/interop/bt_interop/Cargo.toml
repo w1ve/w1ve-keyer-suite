@@ -1,0 +1,8 @@
+[package]
+name = "bt_interop"
+version = "0.1.0"
+edition = "2021"
+
+# Independent WireGuard implementation (the one rwk-core uses) to prove the C core interoperates.
+[dependencies]
+boringtun = "=0.7.1"
